@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Debian & Ubuntu LTS VPS 通用初始化脚本 (稳健修正版)
-# 版本: 2.16-safe
+# Debian & Ubuntu LTS VPS 通用初始化脚本 (优化版)
+# 版本: 2.17-optimized
+# 描述: 移除了云厂商判断，并默认直接配置公共DNS，无需用户交互。
 # ==============================================================================
 set -e
 
@@ -21,15 +22,6 @@ handle_error() {
     echo -e "${RED}[ERROR] 脚本在第 $line_number 行执行失败 (退出码: $exit_code)${NC}"
     echo -e "${RED}[ERROR] 请检查错误信息、系统状态或网络连接。${NC}"
     exit $exit_code
-}
-
-# --- 云环境检测 ---
-is_known_cloud() {
-    [ -f /sys/hypervisor/uuid ] && [ "$(head -c 3 /sys/hypervisor/uuid 2>/dev/null)" = "ec2" ] && return 0
-    [ -f /sys/class/dmi/id/sys_vendor ] && grep -qi "Amazon\|Azure\|Oracle\|Google" /sys/class/dmi/id/sys_vendor 2>/dev/null && return 0
-    [ -f /sys/class/dmi/id/product_name ] && grep -qi "Amazon\|Azure\|Oracle\|Google" /sys/class/dmi/id/product_name 2>/dev/null && return 0
-    [ -f /etc/cloud/cloud.cfg ] && return 0
-    return 1
 }
 
 # --- IPv6 检测 ---
@@ -125,13 +117,7 @@ configure_swap() {
 
 # --- 配置DNS ---
 configure_dns() {
-    echo -e "\n${YELLOW}=============== 4. 配置 DNS (智能适配) ===============${NC}"
-
-    if is_known_cloud; then
-        echo -e "${GREEN}[INFO]${NC} 检测到已知云环境。"
-        read -p "是否覆盖为公共DNS(1.1.1.1, 8.8.8.8)？ [y/N]: " -r < /dev/tty
-        [[ ! $REPLY =~ ^[Yy]$ ]] && return
-    fi
+    echo -e "\n${YELLOW}=============== 4. 配置公共 DNS ===============${NC}"
 
     local has_ipv6_support=false
     if has_ipv6; then
@@ -203,7 +189,6 @@ set encoding=utf-8
 set mouse=a
 set nobackup
 set noswapfile
-set number
 EOF
         [ -d /root ] && echo "source /etc/vim/vimrc.local" > /root/.vimrc
         echo -e "${GREEN}[SUCCESS]${NC} ✅ Vim配置完成。"
