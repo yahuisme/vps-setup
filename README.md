@@ -11,8 +11,9 @@
 - 系统更新和清理
 
 # 一键脚本
-https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh
-
+```
+curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | bash
+```
 
 推荐配合 bin456789 DD 脚本食用
 
