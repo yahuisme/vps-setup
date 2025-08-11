@@ -17,17 +17,18 @@
 apt install curl -y
 ```
 
+Debian 用户使用：
+
+```
+curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | bash
+```
+
 Ubuntu 用户使用：
 
 ```
 curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | sudo bash
 ```
 
-Debian 用户使用：
-
-```
-curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | bash
-```
 
 推荐配合 bin456789 DD 脚本食用
 
