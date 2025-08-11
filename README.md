@@ -12,3 +12,15 @@
 
 # 一键脚本
 https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh
+
+
+推荐配合 bin456789 DD 脚本食用
+
+https://github.com/bin456789/reinstall
+
+一键 DD 脚本
+```
+curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh && bash reinstall.sh debian 13 --ssh-port 12345 --password woshimima && reboot
+```
+
+DD脚本的系统版本、 ssh 端口和 password 请自行修改
