@@ -2,11 +2,11 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.7
-# 更新日志 (v2.7):
-#   - [修正] 彻底重写 final_summary 的 DNS 获取逻辑。优先读取 systemd-resolved
-#     生成的底层 resolv.conf 文件，而不是解析人类可读的 status 输出，
-#     以彻底解决在某些环境下 DNS 显示重复的问题。
+# 版本: 2.11 (基于 V2.7)
+# 更新日志 (v2.11):
+#   - [回退与修复] 恢复至 V2.7 的 DNS 配置逻辑，放弃对 systemd-networkd 的修改。
+#   - [兼容性修正] 在 V2.7 的基础上，为传统DNS配置路径增加文件解锁功能，
+#     解决在无 systemd-resolved 的系统上因文件锁定导致的写入失败问题。
 #
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
@@ -163,6 +163,13 @@ EOF
         echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成。使用 'resolvectl status' 查看。"
     else
         echo -e "${BLUE}[INFO] 未检测到 systemd-resolved，使用传统方式覆盖 /etc/resolv.conf...${NC}"
+        
+        # 修正: 检查并移除可能由旧脚本添加的 immutable 锁
+        if lsattr /etc/resolv.conf 2>/dev/null | grep -q -- '-i-'; then
+            echo -e "${YELLOW}[WARN] 检测到 /etc/resolv.conf 文件被锁定，正在尝试解锁...${NC}"
+            chattr -i /etc/resolv.conf
+        fi
+
         cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
         cat > /etc/resolv.conf << 'EOF'
 # Configured by script
@@ -171,8 +178,7 @@ nameserver 8.8.8.8
 nameserver 2606:4700:4700::1111
 nameserver 2001:4860:4860::8888
 EOF
-        echo -e "${GREEN}[SUCCESS]${NC} ✅ Debian DNS 配置完成 (传统方式)。"
-        echo -e "${YELLOW}[WARN] 此方式可能被网络服务覆盖。如需持久化，请修改网络管理工具(如 ifupdown)的配置。${NC}"
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (传统方式)。"
     fi
 }
 
@@ -236,16 +242,12 @@ final_summary() {
     echo "  - Swap大小: $(free -h | grep Swap | awk '{print $2}')"
     
     local dns_servers=""
-    # 修正: 采用更可靠的方式获取DNS信息
     if systemctl is-active --quiet systemd-resolved && [ -r /run/systemd/resolve/resolv.conf ]; then
-        # 优先读取 systemd-resolved 生成的 resolv.conf，这是最准确的源
         dns_servers=$(grep '^nameserver' /run/systemd/resolve/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     else
-        # 后备方案: 读取传统的 /etc/resolv.conf
         dns_servers=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     fi
     
-    # 清理行尾可能多余的空格
     dns_servers=$(echo "$dns_servers" | sed 's/ *$//')
 
     echo "  - DNS服务器: ${dns_servers:-"未配置或未知"}"
