@@ -2,7 +2,11 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.3
+# 版本: 2.5
+# 更新日志 (v2.5):
+#   - [调整] 根据用户反馈，移除顶部可配置参数，恢复为硬编码配置。
+#   - [调整] 移除Vim配置中的 set number，取消默认显示行号。
+#
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
 #   - 智能识别系统并采用最佳配置方案 (特别是DNS)
@@ -84,18 +88,22 @@ configure_hostname() {
         echo -e "${BLUE}[INFO] 保持当前主机名。${NC}"
     fi
     
-    sed -i '/^127\.0\.1\.1/d' /etc/hosts 2>/dev/null || true
-    printf "%-15s %s\n" "127.0.1.1" "$FINAL_HOSTNAME" >> /etc/hosts
+    # 更新 /etc/hosts, 避免 sudo 出现 "unable to resolve host" 警告
+    if grep -q "127.0.1.1" /etc/hosts; then
+        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$FINAL_HOSTNAME/g" /etc/hosts
+    else
+        echo "127.0.1.1    $FINAL_HOSTNAME" >> /etc/hosts
+    fi
 }
 
 # 配置时区和BBR (非交互)
 configure_timezone_and_bbr() {
     echo -e "\n${YELLOW}=============== 2. 配置时区和BBR ===============${NC}"
-    { 
+    {  
         timedatectl set-timezone Asia/Hong_Kong
         echo -e "${GREEN}[SUCCESS]${NC} ✅ 时区已设置为 Asia/Hong_Kong"
     } &
-    { 
+    {  
       cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -109,16 +117,17 @@ EOF
 # 配置Swap (非交互)
 configure_swap() {
     echo -e "\n${YELLOW}=============== 3. 配置 Swap (1GB) ===============${NC}"
+    if free | awk '/^Swap:/ {exit $2==0?1:0}'; then
+        echo -e "${BLUE}[INFO] 检测到已存在 Swap，跳过此步骤。${NC}"
+        return 0
+    fi
+    
     echo -e "${BLUE}[INFO] 正在配置 1024MB Swap...${NC}"
     if [ -f /swapfile ]; then swapoff /swapfile &>/dev/null || true; rm -f /swapfile; fi
     
-    if fallocate -l 1G /swapfile &>/dev/null; then
-        :
-    else
-        dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none || {
-            echo -e "${RED}[ERROR] 创建 Swap 文件失败。${NC}"; return 1;
-        }
-    fi
+    fallocate -l 1G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none || {
+        echo -e "${RED}[ERROR] 创建 Swap 文件失败。${NC}"; return 1;
+    }
 
     chmod 600 /swapfile; mkswap /swapfile >/dev/null; swapon /swapfile
     if ! grep -q "/swapfile" /etc/fstab; then echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi
@@ -130,7 +139,7 @@ configure_dns() {
     echo -e "\n${YELLOW}=============== 4. 配置 DNS (智能适配) ===============${NC}"
 
     if is_known_cloud; then
-        echo -e "${GREEN}[INFO]${NC} ✅ 检测到已知云环境，跳过DNS修改。"
+        echo -e "${GREEN}[INFO]${NC} ✅ 检测到已知云环境，为确保网络稳定，跳过DNS修改。"
         return
     fi
     
@@ -140,20 +149,23 @@ configure_dns() {
         return
     fi
 
-    if [ "$ID" = "ubuntu" ]; then
-        echo -e "${BLUE}[INFO] 检测到 Ubuntu，使用 systemd-resolved 配置DNS...${NC}"
-        if ! grep -q "^#*DNS=" /etc/systemd/resolved.conf; then
-            echo -e "\n# Added by script\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888" >> /etc/systemd/resolved.conf
-        else
-            sed -i 's/^#*DNS=.*/DNS=1.1.1.1 8.8.8.8/' /etc/systemd/resolved.conf
-            sed -i 's/^#*FallbackDNS=.*/FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888/' /etc/systemd/resolved.conf
-        fi
+    # 优先使用 systemd-resolved (Ubuntu 默认, Debian 11+ 也常用)
+    if systemctl is-active --quiet systemd-resolved; then
+        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务，使用 resolvectl 配置DNS...${NC}"
+        
+        # 写入 drop-in 配置文件，这是更推荐的方式
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888
+EOF
         
         systemctl restart systemd-resolved
-        echo -e "${GREEN}[SUCCESS]${NC} ✅ Ubuntu DNS 配置完成。使用 'resolvectl status' 查看。"
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成。使用 'resolvectl status' 查看。"
     else
-        echo -e "${BLUE}[INFO] 检测到 Debian，使用传统方式覆盖 /etc/resolv.conf...${NC}"
-        if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
+        # 传统方式，用于没有 systemd-resolved 的老系统 (如 Debian 10)
+        echo -e "${BLUE}[INFO] 未检测到 systemd-resolved，使用传统方式覆盖 /etc/resolv.conf...${NC}"
         cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
         cat > /etc/resolv.conf << 'EOF'
 # Configured by script
@@ -162,18 +174,15 @@ nameserver 8.8.8.8
 nameserver 2606:4700:4700::1111
 nameserver 2001:4860:4860::8888
 EOF
-        if chattr +i /etc/resolv.conf 2>/dev/null; then
-            echo -e "${GREEN}[SUCCESS]${NC} ✅ Debian DNS配置完成并已锁定。"
-        else
-            echo -e "${YELLOW}[WARN] 无法锁定DNS配置文件。${NC}"
-        fi
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ Debian DNS 配置完成 (传统方式)。"
+        echo -e "${YELLOW}[WARN] 此方式可能被网络服务覆盖。如需持久化，请修改网络管理工具(如 ifupdown)的配置。${NC}"
     fi
 }
 
 # 安装工具和Vim配置
 install_tools_and_vim() {
     echo -e "\n${YELLOW}=============== 5. 安装常用工具和配置Vim ===============${NC}"
-    local packages_to_install="sudo wget zip vim"
+    local packages_to_install="sudo wget zip vim curl"
     
     echo -e "${BLUE}[INFO] 更新软件包列表...${NC}"
     apt-get update -qq || { echo -e "${RED}[ERROR] 软件包列表更新失败。${NC}"; return 1; }
@@ -181,7 +190,8 @@ install_tools_and_vim() {
     echo -e "${BLUE}[INFO] 正在安装: $packages_to_install${NC}"
     if ! apt-get install -y $packages_to_install >/dev/null 2>&1; then
         echo -e "${YELLOW}[WARN] 软件包安装失败，正在尝试修复并重试...${NC}"
-        apt-get -f install -y && apt-get install -y $packages_to_install || echo -e "${RED}[ERROR] 工具安装失败。${NC}"
+        apt-get --fix-broken install -y >/dev/null 2>&1
+        apt-get install -y $packages_to_install >/dev/null 2>&1 || echo -e "${RED}[ERROR] 工具安装失败。${NC}"
     fi
     echo -e "${GREEN}[SUCCESS]${NC} ✅ 常用工具安装完成。"
 
@@ -191,15 +201,18 @@ install_tools_and_vim() {
 syntax on
 set nocompatible
 set backspace=indent,eol,start
-set number ruler showcmd
+set ruler showcmd
 set hlsearch incsearch autoindent
 set tabstop=4 shiftwidth=4
 set encoding=utf-8 fileencodings=utf-8,gbk,gb18030
 set mouse=a nobackup noswapfile
 EOF
-        mkdir -p /root && cat > /root/.vimrc << 'EOF'
+        # 为 root 用户也创建配置
+        if [ -d /root ]; then
+             cat > /root/.vimrc << 'EOF'
 source /etc/vim/vimrc.local
 EOF
+        fi
         echo -e "${GREEN}[SUCCESS]${NC} ✅ Vim配置完成。"
     fi
 }
@@ -208,7 +221,7 @@ EOF
 update_and_cleanup() {
     echo -e "\n${YELLOW}=============== 6. 系统更新和清理 ===============${NC}"
     echo -e "${BLUE}[INFO] 执行系统完整升级... (这可能需要几分钟)${NC}"
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" || echo -e "${YELLOW}[WARN] 系统升级过程出现非致命错误。${NC}"
+    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" --allow-downgrades --allow-remove-essential --allow-change-held-packages || echo -e "${YELLOW}[WARN] 系统升级过程出现非致命错误。${NC}"
     
     echo -e "${BLUE}[INFO] 移除无用依赖并清理缓存...${NC}"
     apt-get autoremove --purge -y &>/dev/null
@@ -223,9 +236,17 @@ final_summary() {
     echo "配置摘要："
     echo "  - 主机名: $(hostname)"
     echo "  - 时区: $(timedatectl show --property=Timezone --value)"
-    echo "  - BBR状态: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo "  - BBR状态: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未检测到')"
     echo "  - Swap大小: $(free -h | grep Swap | awk '{print $2}')"
-    echo "  - DNS服务器: $(grep nameserver /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')"
+    
+    local dns_servers
+    if command -v resolvectl &> /dev/null && systemctl is-active --quiet systemd-resolved; then
+        dns_servers=$(resolvectl status | grep 'Current DNS' | awk '{for (i=4; i<=NF; i++) printf $i " "}')
+    else
+        dns_servers=$(grep nameserver /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
+    fi
+    echo "  - DNS服务器: ${dns_servers:-"未配置或未知"}"
+    
     echo -e "\n总执行时间: ${SECONDS} 秒"
 }
 
