@@ -2,11 +2,9 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.12
-# 更新日志 (v2.12):
-#   - [优化] 新增IPv6环境检测功能。现在只在系统具备有效IPv6连接时，
-#     才会添加IPv6的DNS服务器地址，使配置更干净、严谨。
-#   - [修正] 恢复至 V2.7 的 DNS 配置逻辑，并集成解锁功能。
+# 版本: 2.14
+# 更新日志 (v2.14):
+#   - [调整] 根据用户要求，移除重启前的3秒等待，改为立即重启。
 #
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
@@ -157,11 +155,9 @@ configure_dns() {
 
     # 根据IPv6环境，准备不同的DNS配置
     local v6_dns_part_resolved=""
-    local v6_dns_part_traditional=""
     if has_ipv6; then
         echo -e "${BLUE}[INFO] 检测到IPv6连接，将同时配置IPv6 DNS。${NC}"
         v6_dns_part_resolved="FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888"
-        v6_dns_part_traditional="nameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888"
     else
         echo -e "${YELLOW}[WARN] 未检测到IPv6连接，仅配置IPv4 DNS。${NC}"
     fi
@@ -170,6 +166,7 @@ configure_dns() {
         echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务，正在写入配置...${NC}"
         
         mkdir -p /etc/systemd/resolved.conf.d
+        # 使用heredoc，如果v6_dns_part_resolved为空，则不会添加该行
         cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
 [Resolve]
 DNS=1.1.1.1 8.8.8.8
@@ -187,8 +184,20 @@ EOF
         fi
 
         cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-        # 使用 printf 而不是 echo 来处理可能的多行 v6 配置
-        printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n%s\n" "$v6_dns_part_traditional" > /etc/resolv.conf
+        
+        # 修正: 使用更可靠的 cat 命令来写入文件
+        cat > /etc/resolv.conf << EOF
+# Configured by script
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+
+        if has_ipv6; then
+            cat >> /etc/resolv.conf << EOF
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
+EOF
+        fi
         
         echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (传统方式)。"
     fi
@@ -286,8 +295,7 @@ main() {
     echo
     read -p "是否立即重启系统以确保所有配置生效？ [Y/n] 默认 Y: " -r < /dev/tty
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        echo -e "${BLUE}[INFO] 系统将在 3 秒后重启...${NC}"
-        sleep 3
+        echo -e "${BLUE}[INFO] 正在立即重启系统...${NC}"
         reboot
     else
         echo -e "${BLUE}[INFO] 配置完成，建议稍后手动重启 (sudo reboot)。${NC}"
