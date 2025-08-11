@@ -2,9 +2,11 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.6
-# 更新日志 (v2.6):
-#   - [修正] 修复 final_summary 中获取 DNS 的逻辑，避免因多网卡导致 DNS 地址重复显示的问题。
+# 版本: 2.7
+# 更新日志 (v2.7):
+#   - [修正] 彻底重写 final_summary 的 DNS 获取逻辑。优先读取 systemd-resolved
+#     生成的底层 resolv.conf 文件，而不是解析人类可读的 status 输出，
+#     以彻底解决在某些环境下 DNS 显示重复的问题。
 #
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
@@ -87,7 +89,6 @@ configure_hostname() {
         echo -e "${BLUE}[INFO] 保持当前主机名。${NC}"
     fi
     
-    # 更新 /etc/hosts, 避免 sudo 出现 "unable to resolve host" 警告
     if grep -q "127.0.1.1" /etc/hosts; then
         sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$FINAL_HOSTNAME/g" /etc/hosts
     else
@@ -148,11 +149,9 @@ configure_dns() {
         return
     fi
 
-    # 优先使用 systemd-resolved (Ubuntu 默认, Debian 11+ 也常用)
     if systemctl is-active --quiet systemd-resolved; then
         echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务，使用 resolvectl 配置DNS...${NC}"
         
-        # 写入 drop-in 配置文件，这是更推荐的方式
         mkdir -p /etc/systemd/resolved.conf.d
         cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << 'EOF'
 [Resolve]
@@ -163,7 +162,6 @@ EOF
         systemctl restart systemd-resolved
         echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成。使用 'resolvectl status' 查看。"
     else
-        # 传统方式，用于没有 systemd-resolved 的老系统 (如 Debian 10)
         echo -e "${BLUE}[INFO] 未检测到 systemd-resolved，使用传统方式覆盖 /etc/resolv.conf...${NC}"
         cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
         cat > /etc/resolv.conf << 'EOF'
@@ -206,7 +204,6 @@ set tabstop=4 shiftwidth=4
 set encoding=utf-8 fileencodings=utf-8,gbk,gb18030
 set mouse=a nobackup noswapfile
 EOF
-        # 为 root 用户也创建配置
         if [ -d /root ]; then
              cat > /root/.vimrc << 'EOF'
 source /etc/vim/vimrc.local
@@ -238,13 +235,19 @@ final_summary() {
     echo "  - BBR状态: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未检测到')"
     echo "  - Swap大小: $(free -h | grep Swap | awk '{print $2}')"
     
-    local dns_servers
-    if command -v resolvectl &> /dev/null && systemctl is-active --quiet systemd-resolved; then
-        # 修正: 明确获取 DNS Servers 列表, 而不是 Current DNS Server, 并只取第一行结果避免多网卡重复
-        dns_servers=$(resolvectl status | grep 'DNS Servers:' | awk '{for (i=3; i<=NF; i++) printf $i " "}' | head -n 1)
+    local dns_servers=""
+    # 修正: 采用更可靠的方式获取DNS信息
+    if systemctl is-active --quiet systemd-resolved && [ -r /run/systemd/resolve/resolv.conf ]; then
+        # 优先读取 systemd-resolved 生成的 resolv.conf，这是最准确的源
+        dns_servers=$(grep '^nameserver' /run/systemd/resolve/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     else
-        dns_servers=$(grep nameserver /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
+        # 后备方案: 读取传统的 /etc/resolv.conf
+        dns_servers=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     fi
+    
+    # 清理行尾可能多余的空格
+    dns_servers=$(echo "$dns_servers" | sed 's/ *$//')
+
     echo "  - DNS服务器: ${dns_servers:-"未配置或未知"}"
     
     echo -e "\n总执行时间: ${SECONDS} 秒"
@@ -255,7 +258,6 @@ main() {
     trap 'handle_error ${LINENO}' ERR
     SECONDS=0 
     
-    # 在主函数开头加载一次 os-release，以便后续函数使用
     if [ -f /etc/os-release ]; then source /etc/os-release; else echo "错误: 无法找到 /etc/os-release"; exit 1; fi
     
     pre_flight_checks
