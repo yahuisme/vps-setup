@@ -12,6 +12,10 @@
 
 # 一键脚本
 ```
+apt install curl -y
+```
+
+```
 curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | bash
 ```
 
