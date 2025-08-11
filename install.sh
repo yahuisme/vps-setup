@@ -205,7 +205,7 @@ EOF
 # 简化的工具安装和Vim配置
 install_tools_and_vim() {
     echo -e "\n${YELLOW}=============== 5. 安装常用工具和配置Vim ===============${NC}"
-    local packages="sudo wget zip vim curl"
+    local packages="sudo wget zip vim"
     
     echo -e "${BLUE}[INFO] 更新软件包列表...${NC}"
     apt-get update -qq || { echo -e "${RED}[ERROR] 软件包列表更新失败。${NC}"; return 1; }
