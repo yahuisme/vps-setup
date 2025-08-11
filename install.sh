@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# Debian 11/12/13 VPS 简化便捷版初始化脚本
-# 版本: 2.2
+# Debian & Ubuntu LTS VPS 通用初始化脚本
+# 版本: 2.3
 # 特性:
+#   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
+#   - 智能识别系统并采用最佳配置方案 (特别是DNS)
 #   - 最小化交互，自动化执行
-#   - 支持 Debian 11, 12, 13
 #   - 云环境智能感知
 #   - 完整的错误处理和彩色输出
 # ==============================================================================
@@ -47,13 +48,20 @@ pre_flight_checks() {
         echo -e "${RED}[ERROR] 此脚本需要 root 权限运行。${NC}"; exit 1
     fi
 
-    if [ -f /etc/os-release ]; then
-        source /etc/os-release
-        if [[ "$ID" != "debian" || ! "$VERSION_ID" =~ ^(11|12|13) ]]; then
-            echo -e "${YELLOW}[WARN] 此脚本主要为 Debian 11/12/13 设计，当前系统为 $PRETTY_NAME。可能会有兼容性问题。${NC}"
-        fi
+    local supported=false
+    if [ "$ID" = "debian" ] && [[ "$VERSION_ID" =~ ^(10|11|12|13) ]]; then
+        supported=true
+    elif [ "$ID" = "ubuntu" ] && [[ "$VERSION_ID" =~ ^(20.04|22.04|24.04) ]]; then
+        supported=true
     fi
-    echo -e "${GREEN}[SUCCESS]${NC} ✅ 预检查完成。"
+
+    if [ "$supported" = "false" ]; then
+        echo -e "${YELLOW}[WARN] 此脚本为 Debian 10-13 或 Ubuntu 20.04-24.04 LTS 设计，当前系统为 $PRETTY_NAME。${NC}"
+        read -p "是否强制继续? [y/N] " -r < /dev/tty
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "操作已取消。"; exit 0; fi
+    fi
+
+    echo -e "${GREEN}[SUCCESS]${NC} ✅ 预检查完成。系统: $PRETTY_NAME"
 }
 
 # 配置主机名 (保留交互)
@@ -76,7 +84,6 @@ configure_hostname() {
         echo -e "${BLUE}[INFO] 保持当前主机名。${NC}"
     fi
     
-    # 确保 /etc/hosts 同步
     sed -i '/^127\.0\.1\.1/d' /etc/hosts 2>/dev/null || true
     printf "%-15s %s\n" "127.0.1.1" "$FINAL_HOSTNAME" >> /etc/hosts
 }
@@ -106,7 +113,7 @@ configure_swap() {
     if [ -f /swapfile ]; then swapoff /swapfile &>/dev/null || true; rm -f /swapfile; fi
     
     if fallocate -l 1G /swapfile &>/dev/null; then
-        : # 使用 fallocate 快速创建
+        :
     else
         dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none || {
             echo -e "${RED}[ERROR] 创建 Swap 文件失败。${NC}"; return 1;
@@ -118,30 +125,47 @@ configure_swap() {
     echo -e "${GREEN}[SUCCESS]${NC} ✅ 1GB Swap 配置完成。"
 }
 
-# 配置DNS (保留交互)
+# 配置DNS (兼容Debian和Ubuntu)
 configure_dns() {
-    echo -e "\n${YELLOW}=============== 4. 配置 DNS ===============${NC}"
+    echo -e "\n${YELLOW}=============== 4. 配置 DNS (智能适配) ===============${NC}"
+
     if is_known_cloud; then
-        echo -e "${GREEN}[INFO]${NC} ✅ 检测到已知云环境，为确保网络兼容性，跳过DNS修改。"
+        echo -e "${GREEN}[INFO]${NC} ✅ 检测到已知云环境，跳过DNS修改。"
+        return
+    fi
+    
+    read -p "是否将DNS修改为公共DNS(1.1.1.1, 8.8.8.8)？ [Y/n] 默认 Y: " -r < /dev/tty
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo -e "${BLUE}[INFO] 已取消DNS修改。${NC}"
+        return
+    fi
+
+    if [ "$ID" = "ubuntu" ]; then
+        echo -e "${BLUE}[INFO] 检测到 Ubuntu，使用 systemd-resolved 配置DNS...${NC}"
+        if ! grep -q "^#*DNS=" /etc/systemd/resolved.conf; then
+            echo -e "\n# Added by script\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888" >> /etc/systemd/resolved.conf
+        else
+            sed -i 's/^#*DNS=.*/DNS=1.1.1.1 8.8.8.8/' /etc/systemd/resolved.conf
+            sed -i 's/^#*FallbackDNS=.*/FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888/' /etc/systemd/resolved.conf
+        fi
+        
+        systemctl restart systemd-resolved
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ Ubuntu DNS 配置完成。使用 'resolvectl status' 查看。"
     else
-        read -p "是否将DNS修改为公共DNS(1.1.1.1, 8.8.8.8)并锁定？ [Y/n] 默认 Y: " -r < /dev/tty
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
-            cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-            cat > /etc/resolv.conf << 'EOF'
+        echo -e "${BLUE}[INFO] 检测到 Debian，使用传统方式覆盖 /etc/resolv.conf...${NC}"
+        if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
+        cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+        cat > /etc/resolv.conf << 'EOF'
 # Configured by script
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 nameserver 2606:4700:4700::1111
 nameserver 2001:4860:4860::8888
 EOF
-            if chattr +i /etc/resolv.conf 2>/dev/null; then
-                echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS配置完成并已锁定。"
-            else
-                echo -e "${YELLOW}[WARN] 无法锁定DNS配置文件，配置可能被重置。${NC}"
-            fi
+        if chattr +i /etc/resolv.conf 2>/dev/null; then
+            echo -e "${GREEN}[SUCCESS]${NC} ✅ Debian DNS配置完成并已锁定。"
         else
-            echo -e "${BLUE}[INFO] 已取消DNS修改。${NC}"
+            echo -e "${YELLOW}[WARN] 无法锁定DNS配置文件。${NC}"
         fi
     fi
 }
@@ -195,7 +219,7 @@ update_and_cleanup() {
 # 显示最终摘要
 final_summary() {
     echo -e "\n${YELLOW}===================== 配置完成 =====================${NC}"
-    echo -e "${GREEN}[SUCCESS]${NC} 🎉 Debian VPS 初始化配置圆满完成！\n"
+    echo -e "${GREEN}[SUCCESS]${NC} 🎉 系统初始化配置圆满完成！\n"
     echo "配置摘要："
     echo "  - 主机名: $(hostname)"
     echo "  - 时区: $(timedatectl show --property=Timezone --value)"
@@ -209,6 +233,9 @@ final_summary() {
 main() {
     trap 'handle_error ${LINENO}' ERR
     SECONDS=0 
+    
+    # 在主函数开头加载一次 os-release，以便后续函数使用
+    if [ -f /etc/os-release ]; then source /etc/os-release; else echo "错误: 无法找到 /etc/os-release"; exit 1; fi
     
     pre_flight_checks
     configure_hostname
