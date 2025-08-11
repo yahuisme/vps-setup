@@ -2,11 +2,10 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.7
-# 更新日志 (v2.7):
-#   - [修正] 彻底重写 final_summary 的 DNS 获取逻辑。优先读取 systemd-resolved
-#     生成的底层 resolv.conf 文件，而不是解析人类可读的 status 输出，
-#     以彻底解决在某些环境下 DNS 显示重复的问题。
+# 版本: 2.8
+# 更新日志 (v2.8):
+#   - [修正] 在 systemd-resolved 的配置文件中增加 "Domains=~."，
+#     强制使用脚本指定的DNS并赋予其最高优先级，以解决其与DHCP提供的DNS合并导致重复的问题。
 #
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
@@ -157,6 +156,7 @@ configure_dns() {
 [Resolve]
 DNS=1.1.1.1 8.8.8.8
 FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888
+Domains=~.
 EOF
         
         systemctl restart systemd-resolved
@@ -236,16 +236,12 @@ final_summary() {
     echo "  - Swap大小: $(free -h | grep Swap | awk '{print $2}')"
     
     local dns_servers=""
-    # 修正: 采用更可靠的方式获取DNS信息
     if systemctl is-active --quiet systemd-resolved && [ -r /run/systemd/resolve/resolv.conf ]; then
-        # 优先读取 systemd-resolved 生成的 resolv.conf，这是最准确的源
         dns_servers=$(grep '^nameserver' /run/systemd/resolve/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     else
-        # 后备方案: 读取传统的 /etc/resolv.conf
         dns_servers=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     fi
     
-    # 清理行尾可能多余的空格
     dns_servers=$(echo "$dns_servers" | sed 's/ *$//')
 
     echo "  - DNS服务器: ${dns_servers:-"未配置或未知"}"
