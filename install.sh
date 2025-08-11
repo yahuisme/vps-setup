@@ -2,10 +2,9 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.5
-# 更新日志 (v2.5):
-#   - [调整] 根据用户反馈，移除顶部可配置参数，恢复为硬编码配置。
-#   - [调整] 移除Vim配置中的 set number，取消默认显示行号。
+# 版本: 2.6
+# 更新日志 (v2.6):
+#   - [修正] 修复 final_summary 中获取 DNS 的逻辑，避免因多网卡导致 DNS 地址重复显示的问题。
 #
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
@@ -241,7 +240,8 @@ final_summary() {
     
     local dns_servers
     if command -v resolvectl &> /dev/null && systemctl is-active --quiet systemd-resolved; then
-        dns_servers=$(resolvectl status | grep 'Current DNS' | awk '{for (i=4; i<=NF; i++) printf $i " "}')
+        # 修正: 明确获取 DNS Servers 列表, 而不是 Current DNS Server, 并只取第一行结果避免多网卡重复
+        dns_servers=$(resolvectl status | grep 'DNS Servers:' | awk '{for (i=3; i<=NF; i++) printf $i " "}' | head -n 1)
     else
         dns_servers=$(grep nameserver /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
     fi
