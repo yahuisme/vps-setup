@@ -2,11 +2,11 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 2.11 (基于 V2.7)
-# 更新日志 (v2.11):
-#   - [回退与修复] 恢复至 V2.7 的 DNS 配置逻辑，放弃对 systemd-networkd 的修改。
-#   - [兼容性修正] 在 V2.7 的基础上，为传统DNS配置路径增加文件解锁功能，
-#     解决在无 systemd-resolved 的系统上因文件锁定导致的写入失败问题。
+# 版本: 2.12
+# 更新日志 (v2.12):
+#   - [优化] 新增IPv6环境检测功能。现在只在系统具备有效IPv6连接时，
+#     才会添加IPv6的DNS服务器地址，使配置更干净、严谨。
+#   - [修正] 恢复至 V2.7 的 DNS 配置逻辑，并集成解锁功能。
 #
 # 特性:
 #   - 兼容 Debian 10-13 和 Ubuntu 20.04-24.04 LTS
@@ -44,6 +44,12 @@ is_known_cloud() {
     [ -f /sys/class/dmi/id/product_name ] && grep -qi "Google" /sys/class/dmi/id/product_name && return 0
     [ -f /sys/class/dmi/id/chassis_asset_tag ] && grep -qi "OracleCloud" /sys/class/dmi/id/chassis_asset_tag && return 0
     return 1
+}
+
+# IPv6 环境检测
+has_ipv6() {
+    # 通过检查是否存在默认IPv6路由来判断
+    ip -6 route show | grep -q 'default'
 }
 
 # 系统预检
@@ -149,14 +155,25 @@ configure_dns() {
         return
     fi
 
+    # 根据IPv6环境，准备不同的DNS配置
+    local v6_dns_part_resolved=""
+    local v6_dns_part_traditional=""
+    if has_ipv6; then
+        echo -e "${BLUE}[INFO] 检测到IPv6连接，将同时配置IPv6 DNS。${NC}"
+        v6_dns_part_resolved="FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888"
+        v6_dns_part_traditional="nameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888"
+    else
+        echo -e "${YELLOW}[WARN] 未检测到IPv6连接，仅配置IPv4 DNS。${NC}"
+    fi
+
     if systemctl is-active --quiet systemd-resolved; then
-        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务，使用 resolvectl 配置DNS...${NC}"
+        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务，正在写入配置...${NC}"
         
         mkdir -p /etc/systemd/resolved.conf.d
-        cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << 'EOF'
+        cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
 [Resolve]
 DNS=1.1.1.1 8.8.8.8
-FallbackDNS=2606:4700:4700::1111 2001:4860:4860::8888
+${v6_dns_part_resolved}
 EOF
         
         systemctl restart systemd-resolved
@@ -164,20 +181,15 @@ EOF
     else
         echo -e "${BLUE}[INFO] 未检测到 systemd-resolved，使用传统方式覆盖 /etc/resolv.conf...${NC}"
         
-        # 修正: 检查并移除可能由旧脚本添加的 immutable 锁
         if lsattr /etc/resolv.conf 2>/dev/null | grep -q -- '-i-'; then
             echo -e "${YELLOW}[WARN] 检测到 /etc/resolv.conf 文件被锁定，正在尝试解锁...${NC}"
             chattr -i /etc/resolv.conf
         fi
 
         cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-        cat > /etc/resolv.conf << 'EOF'
-# Configured by script
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-nameserver 2606:4700:4700::1111
-nameserver 2001:4860:4860::8888
-EOF
+        # 使用 printf 而不是 echo 来处理可能的多行 v6 配置
+        printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n%s\n" "$v6_dns_part_traditional" > /etc/resolv.conf
+        
         echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (传统方式)。"
     fi
 }
