@@ -10,7 +10,7 @@ set -e
 # ==============================================================================
 # --- 用户配置区 (请在此处修改以自定义脚本行为) ---
 # ==============================================================================
-# 时区, 例如 "Asia/Shanghai", "Asia/Hong_Kong", "UTC", "America/New_York"
+# 时区, 例如 "Asia/Shanghai", "Asia/Hong_Kong", "America/New_York", "America/Los_Angeles", "Europe/London", "UTC", "GMT"
 TIMEZONE="Asia/Hong_Kong"
 
 # Swap 大小 (MB)。设置为 0 表示不创建。
