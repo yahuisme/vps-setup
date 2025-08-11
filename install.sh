@@ -182,7 +182,7 @@ else
 fi
 
 echo -e "${BLUE}[INFO] 安装常用工具... (预计 20 秒)${NC}"
-packages="sudo curl wget zip vim"
+packages="sudo wget zip vim"
 failed_packages=""
 skip_vim_config=false
 for package in $packages; do
@@ -270,7 +270,7 @@ echo "   当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "   拥塞控制: $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | cut -d= -f2 | tr -d ' ')"
 echo "   Swap 大小: $(free -h | grep Swap | awk '{print $2}')"
 echo "   DNS服务器: $(grep nameserver /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')"
-echo "   已安装工具: sudo curl wget zip vim"
+echo "   已安装工具: sudo wget zip vim"
 echo "   系统状态: 已更新到最新版本并清理缓存"
 echo "   总执行时间: 约 $(( SECONDS / 60 ))分$(( SECONDS % 60 ))秒"
 
