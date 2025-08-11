@@ -1,5 +1,7 @@
 # debian-setup
-提升 Debian 原版系统使用便捷性一键设置
+提升 Debian 系原版系统使用便捷性一键设置
+
+脚本支持 Debian 10-13 和 Ubuntu 20.04, 22.04, 24.04
 
 # 一键自动配置
 - 主机名配置
@@ -14,6 +16,14 @@
 ```
 apt install curl -y
 ```
+
+Ubuntu 用户使用：
+
+```
+curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | sudo bash
+```
+
+Debian 用户使用：
 
 ```
 curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | bash
