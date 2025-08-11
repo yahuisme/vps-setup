@@ -79,11 +79,11 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         echo -e "${BLUE}[INFO] 设置主机名为: $NEW_HOSTNAME${NC}"
         hostnamectl set-hostname "$NEW_HOSTNAME"
         
-        # --- [修正] 更新 /etc/hosts 的方法 ---
+        # --- [修正] 更新 /etc/hosts 的方法以实现空格对齐 ---
         # 1. 为防止意外格式或重复，先删除任何以 127.0.1.1 开头的旧行
         sed -i '/^127\.0\.1\.1/d' /etc/hosts 2>/dev/null || true
-        # 2. 使用 printf 添加新的、格式正确的行
-        printf "127.0.1.1\t%s\n" "$NEW_HOSTNAME" >> /etc/hosts
+        # 2. 使用 printf 添加新的、列对齐的行
+        printf "%-15s %s\n" "127.0.1.1" "$NEW_HOSTNAME" >> /etc/hosts
         
         echo -e "${GREEN}[SUCCESS]${NC} ✅ 主机名已更新为: $NEW_HOSTNAME"
     fi
