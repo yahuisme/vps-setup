@@ -68,28 +68,39 @@ echo "   可用磁盘: $(df -h / | awk 'NR==2 {print $4}')"
 echo -e "${BLUE}[INFO] 预检查完成${NC}"
 
 
-# --- 主机名配置 ---
+# --- 主机名配置 (逻辑修正) ---
 echo
 echo -e "${YELLOW}=============== 配置主机名 ===============${NC}"
-echo "当前主机名: $(hostname)"
+CURRENT_HOSTNAME=$(hostname)
+echo "当前主机名: $CURRENT_HOSTNAME"
 read -p "是否需要修改主机名？ [y/N] 默认：N  " -r < /dev/tty
+
+FINAL_HOSTNAME=""
+
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     read -p "请输入新的主机名: " NEW_HOSTNAME < /dev/tty
     if [ -n "$NEW_HOSTNAME" ]; then
         echo -e "${BLUE}[INFO] 设置主机名为: $NEW_HOSTNAME${NC}"
         hostnamectl set-hostname "$NEW_HOSTNAME"
-        
-        # --- [修正] 更新 /etc/hosts 的方法以实现空格对齐 ---
-        # 1. 为防止意外格式或重复，先删除任何以 127.0.1.1 开头的旧行
-        sed -i '/^127\.0\.1\.1/d' /etc/hosts 2>/dev/null || true
-        # 2. 使用 printf 添加新的、列对齐的行
-        printf "%-15s %s\n" "127.0.1.1" "$NEW_HOSTNAME" >> /etc/hosts
-        
-        echo -e "${GREEN}[SUCCESS]${NC} ✅ 主机名已更新为: $NEW_HOSTNAME"
+        FINAL_HOSTNAME="$NEW_HOSTNAME"
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ 主机名已更新为: $FINAL_HOSTNAME"
+    else
+        echo -e "${YELLOW}[WARN] 未输入新主机名，将保持当前主机名。${NC}"
+        FINAL_HOSTNAME="$CURRENT_HOSTNAME"
     fi
 else
-    echo -e "${BLUE}[INFO] 保持当前主机名: $(hostname)${NC}"
+    echo -e "${BLUE}[INFO] 保持当前主机名: $CURRENT_HOSTNAME${NC}"
+    FINAL_HOSTNAME="$CURRENT_HOSTNAME"
 fi
+
+# 统一更新 /etc/hosts，确保其与最终主机名一致
+echo -e "${BLUE}[INFO] 正在同步 /etc/hosts 文件与主机名 ($FINAL_HOSTNAME)...${NC}"
+# 1. 删除旧行，防止重复或格式错误
+sed -i '/^127\.0\.1\.1/d' /etc/hosts 2>/dev/null || true
+# 2. 添加新的、格式正确的行
+printf "%-15s %s\n" "127.0.1.1" "$FINAL_HOSTNAME" >> /etc/hosts
+echo -e "${GREEN}[SUCCESS]${NC} ✅ /etc/hosts 文件已同步。"
+
 echo -e "${BLUE}[INFO] 主机名配置完成${NC}"
 
 
