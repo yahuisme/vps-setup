@@ -26,7 +26,7 @@ handle_error() {
 # --- 云环境检测 ---
 is_known_cloud() {
     [ -f /sys/hypervisor/uuid ] && [ "$(head -c 3 /sys/hypervisor/uuid 2>/dev/null)" = "ec2" ] && return 0
-    [ -f /sys/class/dmi/id/sys_vendor ] && grep -qi "Amazon\|Microsoft\|Oracle\|Google\|DigitalOcean" /sys/class/dmi/id/sys_vendor 2>/dev/null && return 0
+    [ -f /sys/class/dmi/id/sys_vendor ] && grep -qi "Amazon\|Microsoft\|Oracle\|Google" /sys/class/dmi/id/sys_vendor 2>/dev/null && return 0
     [ -f /sys/class/dmi/id/product_name ] && grep -qi "Google\|Amazon" /sys/class/dmi/id/product_name 2>/dev/null && return 0
     [ -f /etc/cloud/cloud.cfg ] && return 0
     return 1
