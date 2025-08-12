@@ -169,38 +169,56 @@ configure_swap() {
 
 # --- 配置DNS ---
 configure_dns() {
-    echo -e "\n${YELLOW}=============== 4. 配置公共 DNS ===============${NC}"
+    echo -e "\n${YELLOW}=============== 4. 配置公共 DNS (智能模式) ===============${NC}"
 
-    local has_ipv6_support=false
-    if has_ipv6; then
-        echo -e "${BLUE}[INFO] 检测到IPv6连接，将同时配置IPv6 DNS。${NC}"
-        has_ipv6_support=true
-    else
-        echo -e "${YELLOW}[WARN] 未检测到IPv6连接，仅配置IPv4 DNS。${NC}"
+    local has_ipv6_support=false
+    if has_ipv6; then
+        echo -e "${BLUE}[INFO] 检测到IPv6连接，将同时配置IPv6 DNS。${NC}"
+        has_ipv6_support=true
+    else
+        echo -e "${YELLOW}[WARN] 未检测到IPv6连接，仅配置IPv4 DNS。${NC}"
+    fi
+
+    # 优先级 1: 检查并配置 systemd-resolved (首选)
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务 (首选)，正在写入配置...${NC}"
+        mkdir -p /etc/systemd/resolved.conf.d
+        local dns_content="[Resolve]\nDNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4\n"
+        if [ "$has_ipv6_support" = "true" ]; then
+            dns_content+="FallbackDNS=$PRIMARY_DNS_V6 $SECONDARY_DNS_V6\n"
+        else
+            dns_content+="FallbackDNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4\n"
+        fi
+        echo -e "$dns_content" > /etc/systemd/resolved.conf.d/99-custom-dns.conf
+        systemctl restart systemd-resolved
+        resolvectl flush-caches 2>/dev/null || true
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (systemd-resolved)。"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[WARN] systemd-resolved 未激活，正在检测其他DNS管理器...${NC}"
+
+    # 优先级 2: 检查并配置 cloud-init
+    if [ -d /etc/cloud/ ] && grep -q -r "manage_resolv_conf: *true" /etc/cloud/ 2>/dev/null; then
+        echo -e "${BLUE}[INFO] 检测到 cloud-init 正在管理DNS，正在写入持久化配置...${NC}"
+        local cloud_config_file="/etc/cloud/cloud.cfg.d/99-custom-dns.cfg"
+        local cloud_dns_content="#cloud-config\nmanage_resolv_conf: true\nresolv_conf:\n  nameservers:\n    - '$PRIMARY_DNS_V4'\n    - '$SECONDARY_DNS_V4'\n"
+        if [ "$has_ipv6_support" = "true" ]; then
+            cloud_dns_content+="    - '$PRIMARY_DNS_V6'\n    - '$SECONDARY_DNS_V6'\n"
+        fi
+        echo -e "$cloud_dns_content" > "$cloud_config_file"
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (cloud-init)。"
+        echo -e "${YELLOW}[WARN] cloud-init 配置将在下次重启后完全生效。脚本最后会提示您重启。${NC}"
+        return 0
     fi
 
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务，正在写入配置...${NC}"
-        mkdir -p /etc/systemd/resolved.conf.d
-        if [ "$has_ipv6_support" = "true" ]; then
-            cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
-[Resolve]
-DNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4
-FallbackDNS=$PRIMARY_DNS_V6 $SECONDARY_DNS_V6
-EOF
-        else
-            cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
-[Resolve]
-DNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4
-FallbackDNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4
-EOF
-        fi
-        systemctl restart systemd-resolved
-        resolvectl flush-caches 2>/dev/null || true
-        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (systemd-resolved)。"
-    else
-        echo -e "${BLUE}[INFO] 使用传统方式覆盖 /etc/resolv.conf...${NC}"
-        chattr -i /etc/resolv.conf 2>/dev/null || true
+    # 优先级 3: 检查并配置 resolvconf
+    if command -v resolvconf >/dev/null; then
+        echo -e "${BLUE}[INFO] 检测到 resolvconf 正在管理DNS，正在写入配置...${NC}"
+        local head_file="/etc/resolvconf/resolv.conf.d/head"
+        # 清理旧的配置，防止重复
+        sed -i '/^nameserver/d' "$head_file" 2>/dev/null || true 
+        
         {
             echo "nameserver $PRIMARY_DNS_V4"
             echo "nameserver $SECONDARY_DNS_V4"
@@ -208,9 +226,25 @@ EOF
                 echo "nameserver $PRIMARY_DNS_V6"
                 echo "nameserver $SECONDARY_DNS_V6"
             }
-        } > /etc/resolv.conf
-        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (传统方式)。"
+        } >> "$head_file"
+        resolvconf -u
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (resolvconf)。"
+        return 0
     fi
+
+    # 优先级 4: 直接覆盖
+    echo -e "${YELLOW}[WARN] 未检测到特定的DNS管理器。将使用直接覆盖 /etc/resolv.conf 的最终方案。${NC}"
+    chattr -i /etc/resolv.conf 2>/dev/null || true # 尝试解锁，以防之前被锁过
+    {
+        echo "nameserver $PRIMARY_DNS_V4"
+        echo "nameserver $SECONDARY_DNS_V4"
+        [ "$has_ipv6_support" = "true" ] && {
+            echo "nameserver $PRIMARY_DNS_V6"
+            echo "nameserver $SECONDARY_DNS_V6"
+        }
+    } > /etc/resolv.conf
+    echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (直接覆盖)。"
+    echo -e "${YELLOW}[WARN] 此为标准覆盖操作。如遇DNS问题，请检查是否有其他服务(如DHCP客户端)正在管理此文件。${NC}"
 }
 
 # --- 安装工具和Vim ---
