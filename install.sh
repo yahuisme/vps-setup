@@ -169,32 +169,32 @@ configure_swap() {
 
 # --- 配置DNS ---
 configure_dns() {
-    echo -e "\n${YELLOW}=============== 4. 配置公共 DNS (智能模式) ===============${NC}"
+    echo -e "\n${YELLOW}=============== 4. 配置公共 DNS (智能模式) ===============${NC}"
 
-    local has_ipv6_support=false
-    if has_ipv6; then
-        echo -e "${BLUE}[INFO] 检测到IPv6连接，将同时配置IPv6 DNS。${NC}"
-        has_ipv6_support=true
-    else
-        echo -e "${YELLOW}[WARN] 未检测到IPv6连接，仅配置IPv4 DNS。${NC}"
-    fi
+    local has_ipv6_support=false
+    if has_ipv6; then
+        echo -e "${BLUE}[INFO] 检测到IPv6连接，将同时配置IPv6 DNS。${NC}"
+        has_ipv6_support=true
+    else
+        echo -e "${YELLOW}[WARN] 未检测到IPv6连接，仅配置IPv4 DNS。${NC}"
+    fi
 
     # 优先级 1: 检查并配置 systemd-resolved (首选)
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务 (首选)，正在写入配置...${NC}"
-        mkdir -p /etc/systemd/resolved.conf.d
-        local dns_content="[Resolve]\nDNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4\n"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        echo -e "${BLUE}[INFO] 检测到 systemd-resolved 服务 (首选)，正在写入配置...${NC}"
+        mkdir -p /etc/systemd/resolved.conf.d
+        local dns_content="[Resolve]\nDNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4\n"
         if [ "$has_ipv6_support" = "true" ]; then
             dns_content+="FallbackDNS=$PRIMARY_DNS_V6 $SECONDARY_DNS_V6\n"
         else
             dns_content+="FallbackDNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4\n"
         fi
         echo -e "$dns_content" > /etc/systemd/resolved.conf.d/99-custom-dns.conf
-        systemctl restart systemd-resolved
-        resolvectl flush-caches 2>/dev/null || true
-        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (systemd-resolved)。"
-        return 0
-    fi
+        systemctl restart systemd-resolved
+        resolvectl flush-caches 2>/dev/null || true
+        echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (systemd-resolved)。"
+        return 0
+    fi
 
     echo -e "${YELLOW}[WARN] systemd-resolved 未激活，正在检测其他DNS管理器...${NC}"
 
@@ -232,7 +232,7 @@ configure_dns() {
         return 0
     fi
 
-    # 优先级 4: 直接覆盖
+    # 优先级 4: 直接覆盖 (最终后备方案，无锁定)
     echo -e "${YELLOW}[WARN] 未检测到特定的DNS管理器。将使用直接覆盖 /etc/resolv.conf 的最终方案。${NC}"
     chattr -i /etc/resolv.conf 2>/dev/null || true # 尝试解锁，以防之前被锁过
     {
