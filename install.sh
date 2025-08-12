@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本 (专业增强版)
-# 版本: 2.18-pro
+# 版本: 2.19-pro
 # 描述: 集成可配置性、非交互模式、智能Swap和日志记录功能。
 # ==============================================================================
 set -e
@@ -15,7 +15,7 @@ TIMEZONE="Asia/Hong_Kong"
 
 # Swap 大小 (MB)。设置为 0 表示不创建。
 # 设置为 "auto"，脚本将智能分配 (内存<2G则设为等量, >=2G则设为2G)。
-SWAP_SIZE_MB="1024" 
+SWAP_SIZE_MB="1024"
 
 # 需要安装的常用工具包，用空格隔开
 INSTALL_PACKAGES="sudo wget zip vim"
@@ -56,7 +56,7 @@ has_ipv6() {
 # --- 系统预检 ---
 pre_flight_checks() {
     echo -e "${BLUE}[INFO] 正在执行系统预检查...${NC}"
-    
+
     local supported=false
     if [ "$ID" = "debian" ] && [[ "$VERSION_ID" =~ ^(10|11|12|13)$ ]]; then
         supported=true
@@ -67,7 +67,7 @@ pre_flight_checks() {
     if [ "$supported" = "false" ]; then
         echo -e "${YELLOW}[WARN] 此脚本为 Debian 10-13 或 Ubuntu 20.04-24.04 LTS 设计，当前系统为 $PRETTY_NAME。${NC}"
         if [ "$non_interactive" = "true" ]; then
-             echo -e "${YELLOW}[WARN] 在非交互模式下将强制继续。${NC}"
+            echo -e "${YELLOW}[WARN] 在非交互模式下将强制继续。${NC}"
         else
             read -p "是否强制继续? [y/N] " -r < /dev/tty
             [[ ! $REPLY =~ ^[Yy]$ ]] && echo "操作已取消。" && exit 0
@@ -102,13 +102,13 @@ configure_hostname() {
             echo -e "${BLUE}[INFO] 保持当前主机名。${NC}"
         fi
     fi
-    
+
     # 幂等性更新 /etc/hosts
     if ! grep -q "127.0.1.1\s\+$FINAL_HOSTNAME" /etc/hosts; then
         if grep -q "127.0.1.1" /etc/hosts; then
             sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$FINAL_HOSTNAME/g" /etc/hosts
         else
-            echo "127.0.1.1    $FINAL_HOSTNAME" >> /etc/hosts
+            echo -e "127.0.1.1\t$FINAL_HOSTNAME" >> /etc/hosts
         fi
     fi
 }
@@ -167,7 +167,7 @@ configure_swap() {
     fi
 }
 
-# --- 配置DNS ---
+# --- 配置DNS (智能判断版 - 无锁定) ---
 configure_dns() {
     echo -e "\n${YELLOW}=============== 4. 配置公共 DNS (智能模式) ===============${NC}"
 
@@ -202,9 +202,23 @@ configure_dns() {
     if [ -d /etc/cloud/ ] && grep -q -r "manage_resolv_conf: *true" /etc/cloud/ 2>/dev/null; then
         echo -e "${BLUE}[INFO] 检测到 cloud-init 正在管理DNS，正在写入持久化配置...${NC}"
         local cloud_config_file="/etc/cloud/cloud.cfg.d/99-custom-dns.cfg"
-        local cloud_dns_content="#cloud-config\nmanage_resolv_conf: true\nresolv_conf:\n  nameservers:\n    - '$PRIMARY_DNS_V4'\n    - '$SECONDARY_DNS_V4'\n"
+        local cloud_dns_content
+        cloud_dns_content=$(cat <<EOF
+#cloud-config
+manage_resolv_conf: true
+resolv_conf:
+  nameservers:
+    - '$PRIMARY_DNS_V4'
+    - '$SECONDARY_DNS_V4'
+EOF
+)
         if [ "$has_ipv6_support" = "true" ]; then
-            cloud_dns_content+="    - '$PRIMARY_DNS_V6'\n    - '$SECONDARY_DNS_V6'\n"
+            cloud_dns_content+=$(cat <<EOF
+
+    - '$PRIMARY_DNS_V6'
+    - '$SECONDARY_DNS_V6'
+EOF
+)
         fi
         echo -e "$cloud_dns_content" > "$cloud_config_file"
         echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (cloud-init)。"
@@ -217,8 +231,8 @@ configure_dns() {
         echo -e "${BLUE}[INFO] 检测到 resolvconf 正在管理DNS，正在写入配置...${NC}"
         local head_file="/etc/resolvconf/resolv.conf.d/head"
         # 清理旧的配置，防止重复
-        sed -i '/^nameserver/d' "$head_file" 2>/dev/null || true 
-        
+        sed -i '/^nameserver/d' "$head_file" 2>/dev/null || true
+
         {
             echo "nameserver $PRIMARY_DNS_V4"
             echo "nameserver $SECONDARY_DNS_V4"
@@ -246,6 +260,7 @@ configure_dns() {
     echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (直接覆盖)。"
     echo -e "${YELLOW}[WARN] 此为标准覆盖操作。如遇DNS问题，请检查是否有其他服务(如DHCP客户端)正在管理此文件。${NC}"
 }
+
 
 # --- 安装工具和Vim ---
 install_tools_and_vim() {
@@ -320,16 +335,16 @@ final_summary() {
 main() {
     trap 'handle_error ${LINENO}' ERR
     SECONDS=0
-    
+
     if [[ $EUID -ne 0 ]]; then
         echo -e "${RED}[ERROR] 此脚本需要 root 权限运行。${NC}" >&2
         exit 1
     fi
-    
+
     if [ "$1" = "--non-interactive" ]; then
         non_interactive=true
     fi
-    
+
     # 定义日志文件并重定向输出
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
     exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -340,7 +355,7 @@ main() {
     fi
 
     [ -f /etc/os-release ] && source /etc/os-release || { echo "错误: 无法找到 /etc/os-release"; exit 1; }
-    
+
     pre_flight_checks
     configure_hostname
     configure_timezone_and_bbr
@@ -349,7 +364,7 @@ main() {
     install_tools_and_vim
     update_and_cleanup
     final_summary
-    
+
     echo
     if [ "$non_interactive" = "true" ]; then
         echo -e "${BLUE}[INFO] 非交互模式：配置完成，正在自动重启系统...${NC}"
