@@ -2,8 +2,9 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本 (专业增强版)
-# 版本: 2.19-pro
+# 版本: 2.19-pro-fixed
 # 描述: 集成可配置性、非交互模式、智能Swap和日志记录功能。
+# 修复: Swap逻辑、DNS备份、磁盘空间检查
 # ==============================================================================
 set -e
 
@@ -51,6 +52,17 @@ handle_error() {
 has_ipv6() {
     ip -6 route show default 2>/dev/null | grep -q 'default' || \
     ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'
+}
+
+# --- 磁盘空间检查 ---
+check_disk_space() {
+    local required_mb=$1
+    local available_mb
+    available_mb=$(df /tmp | awk 'NR==2 {print int($4/1024)}')
+    if [ "$available_mb" -lt "$required_mb" ]; then
+        echo -e "${RED}[ERROR] 磁盘空间不足，需要 ${required_mb}MB，可用 ${available_mb}MB${NC}"
+        return 1
+    fi
 }
 
 # --- 系统预检 ---
@@ -154,8 +166,18 @@ configure_swap() {
         swap_to_create_mb=$SWAP_SIZE_MB
     fi
 
+    # 修复1: 磁盘空间检查
+    echo -e "${BLUE}[INFO] 检查磁盘空间...${NC}"
+    if ! check_disk_space "$((swap_to_create_mb + 100))"; then
+        return 1
+    fi
+
     echo -e "${BLUE}[INFO] 正在配置 ${swap_to_create_mb}MB Swap...${NC}"
-    [ -f /swapfile ] && swapoff /swapfile &>/dev/null || true && rm -f /swapfile
+    # 修复2: 修复Swap文件处理逻辑
+    if [ -f /swapfile ]; then
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+    fi
 
     if fallocate -l "${swap_to_create_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_to_create_mb" status=none 2>/dev/null; then
         chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
@@ -167,7 +189,7 @@ configure_swap() {
     fi
 }
 
-# --- 配置DNS (智能判断版 - 无锁定) ---
+# --- 配置DNS (智能判断版 - 带备份) ---
 configure_dns() {
     echo -e "\n${YELLOW}=============== 4. 配置公共 DNS (智能模式) ===============${NC}"
 
@@ -246,8 +268,15 @@ EOF
         return 0
     fi
 
-    # 优先级 4: 直接覆盖 (最终后备方案，无锁定)
+    # 优先级 4: 直接覆盖 (最终后备方案，增加备份)
     echo -e "${YELLOW}[WARN] 未检测到特定的DNS管理器。将使用直接覆盖 /etc/resolv.conf 的最终方案。${NC}"
+    
+    # 修复3: 备份原配置
+    if [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%s)
+        echo -e "${BLUE}[INFO] 已备份原 /etc/resolv.conf 文件${NC}"
+    fi
+    
     chattr -i /etc/resolv.conf 2>/dev/null || true # 尝试解锁，以防之前被锁过
     {
         echo "nameserver $PRIMARY_DNS_V4"
@@ -260,7 +289,6 @@ EOF
     echo -e "${GREEN}[SUCCESS]${NC} ✅ DNS 配置完成 (直接覆盖)。"
     echo -e "${YELLOW}[WARN] 此为标准覆盖操作。如遇DNS问题，请检查是否有其他服务(如DHCP客户端)正在管理此文件。${NC}"
 }
-
 
 # --- 安装工具和Vim ---
 install_tools_and_vim() {
