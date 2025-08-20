@@ -22,8 +22,8 @@ SWAP_SIZE_MB="1024"
 INSTALL_PACKAGES="sudo wget zip vim"
 
 # 自定义 DNS 服务器 (主要/备用)
-PRIMARY_DNS_V4="8.8.8.8"
-SECONDARY_DNS_V4="1.1.1.1"
+PRIMARY_DNS_V4="1.1.1.1"
+SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
 SECONDARY_DNS_V6="2001:4860:4860::8888"
 # ==============================================================================
