@@ -17,16 +17,8 @@
 apt install curl -y
 ```
 
-Debian 用户使用：
-
 ```
-curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | bash
-```
-
-Ubuntu 用户使用：
-
-```
-curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh | sudo bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh)
 ```
 
 
