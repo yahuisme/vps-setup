@@ -2,14 +2,21 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 4.1-pro
+# 版本: 4.4-pro
 # 描述: 集成参数化配置、动态BBR优化、Fail2ban防护、智能Swap和日志记录。
 # ==============================================================================
 set -e
 
 # --- 默认配置 ---
-TIMEZONE="Asia/Hong_Kong"
-SWAP_SIZE_MB="1024"
+# 自动检测时区，如果失败则回退到 UTC
+if command -v timedatectl &> /dev/null; then
+    DETECTED_TIMEZONE=$(timedatectl show --property=Timezone --value)
+    TIMEZONE=${DETECTED_TIMEZONE:-"UTC"}
+else
+    TIMEZONE="UTC"
+fi
+
+SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES="sudo wget zip vim"
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
@@ -37,6 +44,7 @@ non_interactive=false
 usage() {
     echo -e "${YELLOW}用法: $0 [选项]...${NC}"
     echo "  全功能初始化脚本，用于 Debian 和 Ubuntu LTS 系统。"
+    echo -e "  默认时区将自动检测，默认Swap将智能分配，您也可以通过参数手动指定。"
     echo
     echo -e "${BLUE}核心选项:${NC}"
     echo "  --hostname <name>         设置新的主机名 (例如: 'my-server')"
@@ -58,8 +66,8 @@ usage() {
     echo "  --non-interactive         以非交互模式运行，自动应答并重启"
     echo
     echo -e "${GREEN}示例:${NC}"
-    echo "  # 全功能优化，设置主机名，自动swap，并用fail2ban保护22和2222端口"
-    echo "  $0 --hostname \"web01\" --swap \"auto\" --bbr-optimized --fail2ban 2222"
+    echo "  # 全功能优化，设置主机名并用fail2ban保护22和2222端口 (Swap和时区自动配置)"
+    echo "  $0 --hostname \"web01\" --bbr-optimized --fail2ban 2222"
     exit 0
 }
 
@@ -153,6 +161,7 @@ configure_hostname() {
 # 3. 配置时区
 configure_timezone() {
     echo -e "\n${YELLOW}=============== 2. 配置时区 ===============${NC}"
+    echo -e "${BLUE}[INFO] 目标时区: ${TIMEZONE} (未指定时则为自动检测值)${NC}"
     timedatectl set-timezone "$TIMEZONE" 2>/dev/null && echo -e "${GREEN}[SUCCESS]${NC} ✅ 时区已设置为 $TIMEZONE"
 }
 
@@ -202,7 +211,7 @@ configure_optimized_bbr() {
         SOMAXCONN="65535"; NETDEV_BACKLOG="65535"; FILE_MAX="2097152"; CONNTRACK_MAX="1048576"; VM_TIER="高性能级(>2GB)"
     fi
     echo -e "${BLUE}[INFO] 已匹配优化配置: ${VM_TIER}${NC}"
-
+    
     local CONF_FILE="/etc/sysctl.d/99-bbr.conf"
     
     # 备份管理
@@ -263,9 +272,12 @@ configure_swap() {
     local swap_to_create_mb
     if [ "$SWAP_SIZE_MB" = "auto" ]; then
         mem_total_mb=$(($(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024))
+        # 智能规则：内存 < 2G，则Swap = 内存大小；内存 >= 2G，则Swap = 2G。
         if [ "$mem_total_mb" -lt 2048 ]; then swap_to_create_mb=$mem_total_mb; else swap_to_create_mb=2048; fi
         echo -e "${BLUE}[INFO] 自动计算Swap大小为 ${swap_to_create_mb}MB...${NC}"
-    else swap_to_create_mb=$SWAP_SIZE_MB; fi
+    else 
+        swap_to_create_mb=$SWAP_SIZE_MB
+    fi
 
     if ! check_disk_space "$((swap_to_create_mb + 100))"; then return 1; fi
     echo -e "${BLUE}[INFO] 正在配置 ${swap_to_create_mb}MB Swap...${NC}"
