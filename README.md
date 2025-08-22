@@ -16,16 +16,12 @@
 
 # 一键脚本
 ```
-apt install curl -y
-```
-
-```
-bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh)
+apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh)
 ```
 
 # 无交互自定义脚本
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh) \
+apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh) \
 --hostname "hostname" \
 --timezone "Asia/Hong_Kong" \
 --swap "1024" \
