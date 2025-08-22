@@ -107,7 +107,7 @@ handle_error() {
 has_ipv6() { ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'; }
 check_disk_space() {
     local required_mb=$1
-    local available_mb=$(df /tmp | awk 'NR==2 {print int($4/1024)}')
+    local available_mb=$(df / | awk 'NR==2 {print int($4/1024)}')
     if [ "$available_mb" -lt "$required_mb" ]; then
         echo -e "${RED}[ERROR] 磁盘空间不足，需要 ${required_mb}MB，可用 ${available_mb}MB${NC}"; return 1;
     fi
