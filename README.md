@@ -23,10 +23,23 @@ apt install curl -y
 bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh)
 ```
 
+# 无交互自定义脚本
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh) \
+--hostname "hostname" \
+--timezone "Asia/Hong_Kong" \
+--swap "1024" \
+--bbr-optimized \
+--ip-dns "94.140.14.14 94.140.15.15" \
+--ip6-dns "2a10:50c0::ad1:ff 2a10:50c0::ad2:ff" \
+--fail2ban 12345 \
+--non-interactive
+```
 
-推荐配合 bin456789 DD 脚本食用
+# 配合 bin456789 一键 DD 脚本
 
 https://github.com/bin456789/reinstall
+
 
 一键 DD 脚本
 ```
