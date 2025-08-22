@@ -478,9 +478,6 @@ main() {
     configure_hostname
     configure_timezone
     
-    # === 【关键修改】自动清理旧的优化配置文件（如果存在） ===
-    rm -f /etc/sysctl.d/99-bbr-optimized.conf
-    
     # BBR 逻辑判断
     if [ "$BBR_MODE" = "optimized" ]; then
         configure_optimized_bbr
