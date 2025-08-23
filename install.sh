@@ -2,8 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.3-final
-# 描述: 修正了帮助文档中的拼写错误，并增强了日志文件的安全性。
+# 版本: 5.4-final
 # ==============================================================================
 set -e
 set -o pipefail
@@ -190,8 +189,11 @@ check_disk_space() {
 pre_flight_checks() {
     echo -e "${BLUE}[INFO] 正在执行系统预检查...${NC}"
     local supported=false
+    if [ -f /etc/os-release ]; then source /etc/os-release; else echo "错误: /etc/os-release 未找到"; exit 1; fi
+    
     if [ "$ID" = "debian" ] && [[ "$VERSION_ID" =~ ^(10|11|12|13)$ ]]; then supported=true;
     elif [ "$ID" = "ubuntu" ] && [[ "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04)$ ]]; then supported=true; fi
+    
     if [ "$supported" = "false" ]; then
         echo -e "${YELLOW}[WARN] 此脚本为 Debian 10-13 或 Ubuntu 20.04-24.04 LTS 设计，当前系统为 $PRETTY_NAME。${NC}"
         if [ "$non_interactive" = "true" ]; then echo -e "${YELLOW}[WARN] 在非交互模式下将强制继续。${NC}";
@@ -560,18 +562,18 @@ main() {
     fi
 
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
-    # 使用 tee 来同时输出到屏幕和文件
-    exec > >(tee -a "${LOG_FILE}") 2>&1
-    # [Hardening] 增强日志文件安全性，只有root可读
+    
+    # [FIXED] 修正竞态条件：先创建文件，再设权限，最后重定向输出
+    touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
+    exec > >(tee -a "${LOG_FILE}") 2>&1
 
     echo -e "${BLUE}[INFO] 脚本启动于 $(date)。日志将记录到: ${LOG_FILE}${NC}"
     if [ "$non_interactive" = "true" ]; then echo -e "${BLUE}[INFO] 已启用非交互模式。${NC}"; fi
 
     # ---- 正式执行 ----
     SECONDS=0
-    [ -f /etc/os-release ] && source /etc/os-release || { echo "错误: /etc/os-release 未找到"; exit 1; }
-
+    
     pre_flight_checks
     install_tools_and_vim # 提前安装curl等工具，为主机名检测提供支持
     configure_hostname
