@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.9-optimized
+# 版本: 5.9-fixed
 # 描述: 在保持原有功能基础上，精简代码结构，提升执行效率
 # ==============================================================================
 set -euo pipefail
@@ -21,7 +21,7 @@ ENABLE_FAIL2BAN=false
 FAIL2BAN_EXTRA_PORT=""
 
 # --- 颜色和全局变量 ---
-readonly GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m' 
+readonly GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m' CYAN='\033[0;36m' NC='\033[0m'
 
 non_interactive=false
@@ -40,7 +40,7 @@ handle_error() {
     tput cnorm
     echo -e "\n${RED}[ERROR] 脚本在第 $line_number 行失败 (退出码: $exit_code)${NC}"
     [[ -n "$LOG_FILE" ]] && echo -e "${RED}完整日志: ${LOG_FILE}${NC}"
-    [[ $spinner_pid -ne 0 ]] && kill $spinner_pid 2>/dev/null || true
+    [[ $spinner_pid -ne 0 ]] && kill $spinner_pid 2>/dev/null
     exit $exit_code
 }
 
@@ -69,7 +69,7 @@ get_public_ipv4() {
     done
 }
 
-has_ipv6() { 
+has_ipv6() {
     ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'
 }
 
@@ -206,23 +206,23 @@ usage() {
 ${YELLOW}用法: $0 [选项]...${NC}
 
 ${BLUE}核心选项:${NC}
-  --hostname <name>        设置新的主机名
-  --timezone <tz>          设置时区 (默认: 自动检测)
-  --swap <size_mb>         设置 Swap 大小，'auto'/'0'
-  --ip-dns <'主 备'>       设置 IPv4 DNS (用引号)
-  --ip6-dns <'主 备'>      设置 IPv6 DNS (用引号)
+  --hostname <name>     设置新的主机名
+  --timezone <tz>       设置时区 (默认: 自动检测)
+  --swap <size_mb>      设置 Swap 大小，'auto'/'0'
+  --ip-dns <'主 备'>    设置 IPv4 DNS (用引号)
+  --ip6-dns <'主 备'>   设置 IPv6 DNS (用引号)
 
 ${BLUE}BBR 选项:${NC}
-  (默认)                   启用标准 BBR
-  --bbr-optimized          启用动态优化 BBR
-  --no-bbr                 禁用 BBR
+  (默认)                启用标准 BBR
+  --bbr-optimized       启用动态优化 BBR
+  --no-bbr              禁用 BBR
 
 ${BLUE}安全选项:${NC}
-  --fail2ban [port]        启用 Fail2ban，可选额外SSH端口
+  --fail2ban [port]     启用 Fail2ban，可选额外SSH端口
 
 ${BLUE}其他:${NC}
-  -h, --help               显示帮助
-  --non-interactive        非交互模式
+  -h, --help            显示帮助
+  --non-interactive     非交互模式
 
 ${GREEN}示例:${NC}
   bash $0 --bbr-optimized --fail2ban 2222
@@ -243,7 +243,7 @@ parse_args() {
             --no-bbr) BBR_MODE="none"; shift ;;
             --fail2ban)
                 ENABLE_FAIL2BAN=true
-                [[ -n "$2" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }
+                [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }
                 shift ;;
             --non-interactive) non_interactive=true; shift ;;
             *) echo -e "${RED}未知选项: $1${NC}"; usage ;;
@@ -509,7 +509,11 @@ configure_fail2ban() {
     local port_list="22"
     if [[ -n "$FAIL2BAN_EXTRA_PORT" ]]; then
         if [[ "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ && "$FAIL2BAN_EXTRA_PORT" -ge 1 && "$FAIL2BAN_EXTRA_PORT" -le 65535 ]]; then
-            [[ "$FAIL2BAN_EXTRA_PORT" != "22" ]] && port_list="22,$FAIL2BAN_EXTRA_PORT"
+            # --- FIX START ---
+            if [[ "$FAIL2BAN_EXTRA_PORT" != "22" ]]; then
+                 port_list="22,$FAIL2BAN_EXTRA_PORT"
+            fi
+            # --- FIX END ---
         else
             echo -e "${RED}无效端口号: $FAIL2BAN_EXTRA_PORT${NC}"
             return 1
@@ -591,7 +595,7 @@ main() {
     
     # 配置预览
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${CYAN}              VPS 初始化配置预览${NC}"
+    echo -e "${CYAN}               VPS 初始化配置预览${NC}"
     echo -e "${CYAN}=====================================================${NC}"
     
     # 主机名显示逻辑
@@ -612,7 +616,7 @@ main() {
     has_ipv6 && echo -e "  DNS(v6):     $PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
     
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-        local ports="22${FAIL2BAN_EXTRA_PORT:+,$FAIL2BAN_EXTRA_PORT}"
+        local ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
         echo -e "  Fail2ban:    ${GREEN}启用 (端口: $ports)${NC}"
     else
         echo -e "  Fail2ban:    ${RED}禁用${NC}"
@@ -625,7 +629,6 @@ main() {
         [[ $REPLY =~ ^[Nn]$ ]] && { echo "已取消"; exit 0; }
     fi
     
-
     
     # 设置日志
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
@@ -644,7 +647,7 @@ main() {
     configure_hostname
     configure_timezone
     configure_bbr
-    configure_swap  
+    configure_swap
     configure_dns
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
@@ -657,15 +660,17 @@ main() {
     
     # 重启确认
     echo -e "\n${BLUE}[INFO] 配置完成！建议重启以确保所有设置生效。${NC}"
-    [[ "$non_interactive" = "true" ]] && echo -e "${CYAN}[非交互模式] 需手动确认重启${NC}"
-    
-    read -p "立即重启? [Y/n] " -r < /dev/tty
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        echo -e "${BLUE}[INFO] 重启中...${NC}"
-        reboot
+    if [[ "$non_interactive" = "true" ]]; then
+        echo -e "${CYAN}[非交互模式] 需手动确认重启${NC}"
     else
-        echo -e "${GREEN}配置完成！请稍后手动重启：${NC}"
-        echo -e "${YELLOW}  sudo reboot${NC}"
+        read -p "立即重启? [Y/n] " -r < /dev/tty
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            echo -e "${BLUE}[INFO] 重启中...${NC}"
+            reboot
+        else
+            echo -e "${GREEN}配置完成！请稍后手动重启：${NC}"
+            echo -e "${YELLOW}  sudo reboot${NC}"
+        fi
     fi
 }
 
