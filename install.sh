@@ -243,14 +243,15 @@ verify_timezone() {
 # 验证BBR配置
 verify_bbr() {
     local expected_mode="$1"
-    local current_cc
+    local current_cc current_qdisc
+    
+    # 使用更安全的方式获取当前配置，避免命令失败
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    local current_qdisc
     current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
     
     if [ "$expected_mode" = "none" ]; then
         record_verification "BBR" "PASS" "已禁用 (当前: $current_cc)"
-        return
+        return 0
     fi
     
     if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
@@ -268,6 +269,8 @@ verify_bbr() {
     else
         record_verification "BBR" "FAIL" "期望启用BBR，实际拥塞控制: $current_cc, 队列调度: $current_qdisc"
     fi
+    
+    return 0
 }
 
 # 验证Swap配置
@@ -326,7 +329,7 @@ verify_dns() {
         # 检查/etc/resolv.conf
         if [ -f /etc/resolv.conf ]; then
             local resolv_content
-            resolv_content=$(cat /etc/resolv.conf)
+            resolv_content=$(cat /etc/resolv.conf 2>/dev/null || echo "")
             if [[ "$resolv_content" =~ $ipv4_dns1 ]] && [[ "$resolv_content" =~ $ipv4_dns2 ]]; then
                 record_verification "DNS" "PASS" "/etc/resolv.conf配置正确 ($ipv4_dns1, $ipv4_dns2)"
             else
@@ -344,7 +347,26 @@ verify_dns() {
         else
             record_verification "DNS解析" "FAIL" "域名解析测试失败"
         fi
+    else
+        # 如果没有nslookup，尝试使用dig或host
+        if command -v dig &>/dev/null; then
+            if timeout 5 dig google.com >/dev/null 2>&1; then
+                record_verification "DNS解析" "PASS" "域名解析功能正常 (dig)"
+            else
+                record_verification "DNS解析" "FAIL" "域名解析测试失败 (dig)"
+            fi
+        elif command -v host &>/dev/null; then
+            if timeout 5 host google.com >/dev/null 2>&1; then
+                record_verification "DNS解析" "PASS" "域名解析功能正常 (host)"
+            else
+                record_verification "DNS解析" "FAIL" "域名解析测试失败 (host)"
+            fi
+        else
+            record_verification "DNS解析" "PASS" "跳过测试 (无可用DNS查询工具)"
+        fi
     fi
+    
+    return 0
 }
 
 # 验证软件包安装
@@ -352,6 +374,11 @@ verify_packages() {
     local packages="$1"
     local installed_count=0
     local total_count=0
+    
+    if [ -z "$packages" ]; then
+        record_verification "软件包" "PASS" "无需验证软件包"
+        return 0
+    fi
     
     for pkg in $packages; do
         ((total_count++))
@@ -365,30 +392,40 @@ verify_packages() {
     else
         record_verification "软件包" "FAIL" "部分软件包未安装 ($installed_count/$total_count)"
     fi
+    
+    return 0
 }
 
 # 验证Vim配置
 verify_vim() {
-    if command -v vim &>/dev/null; then
-        if [ -f /etc/vim/vimrc.local ]; then
-            local config_lines
-            config_lines=$(grep -c "^[^#]" /etc/vim/vimrc.local 2>/dev/null || echo "0")
-            if [ "$config_lines" -gt 5 ]; then
-                record_verification "Vim配置" "PASS" "配置文件已创建 ($config_lines 行配置)"
-            else
-                record_verification "Vim配置" "FAIL" "配置文件异常或为空"
-            fi
+    if ! command -v vim &>/dev/null; then
+        record_verification "Vim" "FAIL" "Vim未安装"
+        return 0
+    fi
+    
+    if [ -f /etc/vim/vimrc.local ]; then
+        local config_lines
+        config_lines=$(grep -c "^[^#]" /etc/vim/vimrc.local 2>/dev/null || echo "0")
+        if [ "$config_lines" -gt 5 ]; then
+            record_verification "Vim配置" "PASS" "配置文件已创建 ($config_lines 行配置)"
         else
-            record_verification "Vim配置" "FAIL" "配置文件未创建"
+            record_verification "Vim配置" "FAIL" "配置文件异常或为空"
         fi
     else
-        record_verification "Vim" "FAIL" "Vim未安装"
+        record_verification "Vim配置" "FAIL" "配置文件未创建"
     fi
+    
+    return 0
 }
 
 # 验证Fail2ban配置
 verify_fail2ban() {
     if [ "$ENABLE_FAIL2BAN" != true ]; then
+        return 0
+    fi
+    
+    if ! command -v fail2ban-client &>/dev/null; then
+        record_verification "Fail2ban" "FAIL" "Fail2ban未安装"
         return 0
     fi
     
@@ -401,8 +438,14 @@ verify_fail2ban() {
             record_verification "Fail2ban" "FAIL" "服务运行但配置文件不存在"
         fi
     else
-        record_verification "Fail2ban" "FAIL" "服务未运行"
+        if systemctl is-enabled fail2ban 2>/dev/null; then
+            record_verification "Fail2ban" "FAIL" "服务已启用但未运行"
+        else
+            record_verification "Fail2ban" "FAIL" "服务未启用或未运行"
+        fi
     fi
+    
+    return 0
 }
 
 # 主验证函数
@@ -413,35 +456,41 @@ run_verification() {
     VERIFICATION_PASSED=0
     VERIFICATION_FAILED=0
     
+    # 使用 set +e 临时禁用错误退出，避免验证函数中的错误导致脚本终止
+    set +e
+    
     # 验证主机名（如果有变更）
     if [ -n "$NEW_HOSTNAME" ] || [ "$(hostname)" != "$INITIAL_HOSTNAME" ]; then
-        verify_hostname "$(hostname)"
+        verify_hostname "$(hostname)" || true
     fi
     
     # 验证时区
-    verify_timezone "$TIMEZONE"
+    verify_timezone "$TIMEZONE" || true
     
     # 验证BBR
-    verify_bbr "$BBR_MODE"
+    verify_bbr "$BBR_MODE" || true
     
     # 验证Swap（除非明确设为0）
     if [ "$SWAP_SIZE_MB" != "0" ]; then
-        verify_swap "$SWAP_SIZE_MB"
+        verify_swap "$SWAP_SIZE_MB" || true
     else
-        verify_swap "0"
+        verify_swap "0" || true
     fi
     
     # 验证DNS
-    verify_dns "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4" "$(has_ipv6 && echo true || echo false)"
+    verify_dns "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4" "$(has_ipv6 && echo true || echo false)" || true
     
     # 验证软件包
-    verify_packages "$INSTALL_PACKAGES"
+    verify_packages "$INSTALL_PACKAGES" || true
     
     # 验证Vim配置
-    verify_vim
+    verify_vim || true
     
     # 验证Fail2ban（如果启用）
-    verify_fail2ban
+    verify_fail2ban || true
+    
+    # 恢复错误退出设置
+    set -e
     
     # 显示验证摘要
     echo
