@@ -279,39 +279,48 @@ configure_hostname() {
     local current_hostname=$(hostname)
     echo -e "${BLUE}当前主机名: $current_hostname${NC}"
     local final_hostname="$current_hostname"
+    local hostname_changed=false
     
     if [[ -n "$NEW_HOSTNAME" ]]; then
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
             hostnamectl set-hostname "$NEW_HOSTNAME"
             final_hostname="$NEW_HOSTNAME"
+            hostname_changed=true
             echo -e "${BLUE}[INFO] 主机名设为: $NEW_HOSTNAME${NC}"
         else
             echo -e "${RED}[ERROR] 主机名格式不正确，保持不变${NC}"
+            NEW_HOSTNAME=""  # 清除无效的主机名设置
         fi
     elif [[ "$non_interactive" = "true" ]]; then
         local public_ip=$(get_public_ipv4)
         if [[ -n "$public_ip" ]]; then
             final_hostname="${public_ip//./-}"
             hostnamectl set-hostname "$final_hostname"
+            NEW_HOSTNAME="$final_hostname"  # 记录自动设置的主机名
+            hostname_changed=true
             echo -e "${GREEN}自动设置主机名: $final_hostname${NC}"
         fi
     elif [[ "$non_interactive" = "false" ]]; then
         read -p "修改主机名? [y/N] " -r < /dev/tty
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             read -p "输入新主机名: " new_name < /dev/tty
-            [[ -n "$new_name" && "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] && {
+            if [[ -n "$new_name" && "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
                 hostnamectl set-hostname "$new_name"
                 final_hostname="$new_name"
-            }
+                NEW_HOSTNAME="$new_name"  # 记录交互设置的主机名
+                hostname_changed=true
+            fi
         fi
     fi
     
-    # 更新 /etc/hosts
-    if ! grep -q "^127\.0\.1\.1.*$final_hostname" /etc/hosts; then
-        if grep -q "^127\.0\.1\.1" /etc/hosts; then
-            sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$final_hostname/" /etc/hosts
-        else
-            echo -e "127.0.1.1\t$final_hostname" >> /etc/hosts
+    # 更新 /etc/hosts (只在主机名变更时)
+    if [[ "$hostname_changed" = true ]]; then
+        if ! grep -q "^127\.0\.1\.1.*$final_hostname" /etc/hosts; then
+            if grep -q "^127\.0\.1\.1" /etc/hosts; then
+                sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$final_hostname/" /etc/hosts
+            else
+                echo -e "127.0.1.1\t$final_hostname" >> /etc/hosts
+            fi
         fi
     fi
     echo -e "${GREEN}✅ 主机名: $(hostname)${NC}"
