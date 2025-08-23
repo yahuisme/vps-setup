@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.6-final
+# 版本: 5.7-final
 # ==============================================================================
 set -e
 set -o pipefail
@@ -507,20 +507,32 @@ update_and_cleanup() {
 final_summary() {
     echo -e "\n${YELLOW}===================== 配置完成 =====================${NC}"
     echo -e "${GREEN}[SUCCESS]${NC} 🎉 系统初始化配置完成！\n"
-    echo "配置摘要："
-    echo "  - 主机名: $(hostname)"
-    echo "  - 时区: $(timedatectl show --property=Timezone --value 2>/dev/null || echo '未设置')"
-    local bbr_status
-    bbr_status=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    echo "  - BBR模式: ${BBR_MODE} (当前: ${bbr_status:-'未知'})"
-    echo "  - Swap大小: $(free -h | awk '/Swap/ {print $2}' || echo '未配置')"
+    
+    # [MODIFIED] 显示 "变更前 -> 变更后" 的对比摘要
+    echo "配置变更摘要："
+    echo "  - 主机名: ${INITIAL_HOSTNAME} -> $(hostname)"
+    
+    local final_timezone
+    final_timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "N/A")
+    echo "  - 时区: ${INITIAL_TIMEZONE} -> ${final_timezone}"
+    
+    local final_bbr_status
+    final_bbr_status=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
+    echo "  - BBR状态: ${INITIAL_BBR_STATUS} -> ${final_bbr_status} (目标模式: ${BBR_MODE})"
+    
+    local final_swap_size
+    final_swap_size=$(free -h | awk '/Swap/ {print $2}' || echo "0B")
+    # 如果初始swap为0，则显示为0B
+    echo "  - Swap大小: ${INITIAL_SWAP_SIZE:-0B} -> ${final_swap_size}"
+
     if $ENABLE_FAIL2BAN && systemctl is-active --quiet fail2ban; then
         local f2b_ports
         f2b_ports=$(grep -oP 'port\s*=\s*\K[0-9,]+' /etc/fail2ban/jail.local || echo "未知")
-        echo -e "  - Fail2ban: ${GREEN}已启用 (保护端口: ${f2b_ports})${NC}"
+        echo -e "  - Fail2ban: ${GREEN}未安装 -> 已启用 (保护端口: ${f2b_ports})${NC}"
     else
-        echo "  - Fail2ban: 未配置"
+        echo "  - Fail2ban: 未安装 -> 未配置"
     fi
+
     echo -e "\n总执行时间: ${SECONDS} 秒"
     echo -e "完整日志已保存至: ${LOG_FILE}"
 }
@@ -556,9 +568,15 @@ main() {
         [[ $REPLY =~ ^[Nn]$ ]] && { echo "操作已取消。"; exit 0; }
     fi
 
+    # [NEW] 在执行修改前，捕获系统初始状态
+    echo -e "${BLUE}[INFO] 正在记录系统初始状态以供最终摘要对比...${NC}"
+    readonly INITIAL_HOSTNAME=$(hostname)
+    readonly INITIAL_TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "N/A")
+    readonly INITIAL_SWAP_SIZE=$(free -h | awk '/Swap/ {print $2}')
+    readonly INITIAL_BBR_STATUS=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
+
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
     
-    # 修正竞态条件：先创建文件，再设权限，最后重定向输出
     touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
     exec > >(tee -a "${LOG_FILE}") 2>&1
