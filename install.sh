@@ -557,18 +557,29 @@ main() {
     echo -e "${CYAN}=====================================================${NC}"
     echo -e "${CYAN}              VPS 初始化配置预览${NC}"
     echo -e "${CYAN}=====================================================${NC}"
-    printf "  %-12s %s\n" "主机名:" "${NEW_HOSTNAME:-'自动设置 (非交互模式)'}"
-    printf "  %-12s %s\n" "时区:" "$TIMEZONE"
-    printf "  %-12s %s\n" "Swap:" "$SWAP_SIZE_MB"
-    printf "  %-12s %s\n" "BBR模式:" "$BBR_MODE"
-    printf "  %-12s %s\n" "DNS(v4):" "$PRIMARY_DNS_V4, $SECONDARY_DNS_V4"
-    has_ipv6 && printf "  %-12s %s\n" "DNS(v6):" "$PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
+    
+    # 主机名显示逻辑
+    local hostname_display
+    if [[ -n "$NEW_HOSTNAME" ]]; then
+        hostname_display="$NEW_HOSTNAME"
+    elif [[ "$non_interactive" = true ]]; then
+        hostname_display="自动设置 (基于公网IP)"
+    else
+        hostname_display="交互式设置"
+    fi
+    
+    echo -e "  主机名:      $hostname_display"
+    echo -e "  时区:        $TIMEZONE"
+    echo -e "  Swap:        $SWAP_SIZE_MB"
+    echo -e "  BBR模式:     $BBR_MODE"
+    echo -e "  DNS(v4):     $PRIMARY_DNS_V4, $SECONDARY_DNS_V4"
+    has_ipv6 && echo -e "  DNS(v6):     $PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
     
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         local ports="22${FAIL2BAN_EXTRA_PORT:+,$FAIL2BAN_EXTRA_PORT}"
-        printf "  %-12s %s\n" "Fail2ban:" "${GREEN}启用 (端口: $ports)${NC}"
+        echo -e "  Fail2ban:    ${GREEN}启用 (端口: $ports)${NC}"
     else
-        printf "  %-12s %s\n" "Fail2ban:" "${RED}禁用${NC}"
+        echo -e "  Fail2ban:    ${RED}禁用${NC}"
     fi
     echo -e "${CYAN}=====================================================${NC}"
     
