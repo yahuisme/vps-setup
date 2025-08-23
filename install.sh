@@ -661,17 +661,18 @@ main() {
     
     # 重启确认
     echo -e "\n${BLUE}[INFO] 配置完成！建议重启以确保所有设置生效。${NC}"
+    
     if [[ "$non_interactive" = "true" ]]; then
-        echo -e "${CYAN}[非交互模式] 需手动确认重启${NC}"
+        echo -e "${CYAN}[非交互模式] 脚本配置已完成。${NC}"
+    fi
+
+    read -p "立即重启? [Y/n] " -r < /dev/tty
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        echo -e "${BLUE}[INFO] 重启中...${NC}"
+        reboot
     else
-        read -p "立即重启? [Y/n] " -r < /dev/tty
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            echo -e "${BLUE}[INFO] 重启中...${NC}"
-            reboot
-        else
-            echo -e "${GREEN}配置完成！请稍后手动重启：${NC}"
-            echo -e "${YELLOW}  sudo reboot${NC}"
-        fi
+        echo -e "${GREEN}配置完成！请稍后手动重启：${NC}"
+        echo -e "${YELLOW}  sudo reboot${NC}"
     fi
 }
 
