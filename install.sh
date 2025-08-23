@@ -2,8 +2,8 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.1-final (Cleaned)
-# 描述: 集成参数化配置、动态BBR优化、Fail2ban防护、智能Swap、日志记录。
+# 版本: 5.3-final
+# 描述: 修正了帮助文档中的拼写错误，并增强了日志文件的安全性。
 # ==============================================================================
 set -e
 set -o pipefail
@@ -59,7 +59,7 @@ usage() {
     echo -e "${BLUE}BBR 模式选项 (三选一):${NC}"
     echo "  (默认)                   启用标准 BBR + FQ"
     echo "  --bbr-optimized          启用动态优化的 BBR (推荐)"
-    echo "  --no-bbr                  禁用 BBR 配置"
+    echo "  --no-bbr                 禁用 BBR 配置"
     echo
     echo -e "${BLUE}安全选项:${NC}"
     echo "  --fail2ban [port]        安装并配置 Fail2ban。可选提供一个额外要保护的SSH端口。"
@@ -69,21 +69,16 @@ usage() {
     echo "  --non-interactive        以非交互模式运行，自动应答并重启"
     echo
     echo -e "${GREEN}示例:${NC}"
-    echo "  # 全功能优化 (主机名、Swap、时区自动配置)，并用fail2ban保护22和2222端口"
-    echo "  bash $0 --bbr-optimized --fail2ban 2222"
+    echo "  # 全功能优化，并用fail2ban保护22和14444端口"
+    echo "  bash $0 --bbr-optimized --fail2ban 14444"
     exit 0
 }
 
-# 使用 getopt 进行更健壮的参数解析
+# 使用手动参数解析循环，以正确处理 --fail2ban 的可选参数
 parse_args() {
-    local temp
-    temp=$(getopt -o 'h' -l 'hostname:,timezone:,swap:,ip-dns:,ip6-dns:,bbr-optimized,no-bbr,fail2ban::,non-interactive,help' -n "$0" -- "$@")
-    if [ $? -ne 0 ]; then echo -e "${RED}参数解析错误...${NC}"; usage; fi
-    eval set -- "$temp"
-    unset temp
-
-    while true; do
-        case "$1" in
+    while [[ $# -gt 0 ]]; do
+        key="$1"
+        case $key in
             -h|--help) usage ;;
             --hostname) NEW_HOSTNAME="$2"; shift 2 ;;
             --timezone) TIMEZONE="$2"; shift 2 ;;
@@ -94,14 +89,19 @@ parse_args() {
             --no-bbr) BBR_MODE="none"; shift ;;
             --fail2ban)
                 ENABLE_FAIL2BAN=true
-                case "$2" in
-                    "") shift 2 ;;
-                    *)  FAIL2BAN_EXTRA_PORT=$2; shift 2 ;;
-                esac
+                # 检查下一个参数是否存在，并且不是一个以'-'开头的选项
+                if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+                    FAIL2BAN_EXTRA_PORT="$2"
+                    shift 2
+                else
+                    shift
+                fi
                 ;;
             --non-interactive) non_interactive=true; shift ;;
-            --) shift; break ;;
-            *) echo -e "${RED}内部错误！${NC}"; exit 1 ;;
+            *)
+              echo -e "${RED}错误: 未知选项 '$1'${NC}"
+              usage
+              ;;
         esac
     done
 }
@@ -155,8 +155,6 @@ stop_spinner() {
 get_public_ipv4() {
     local ip=""
     # 依次尝试多个服务和工具来获取公网IPv4地址
-    # curl -s: 静默模式; -4: 强制IPv4; --max-time 5: 超时5秒
-    # wget -qO-: 静默模式输出到标准输出; -4: 强制IPv4; --timeout=5: 超时5秒
     if command -v curl &>/dev/null; then
         ip=$(curl -s -4 --max-time 5 https://api.ipify.org) || \
         ip=$(curl -s -4 --max-time 5 https://ip.sb)
@@ -171,7 +169,6 @@ get_public_ipv4() {
     if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         echo "$ip"
     else
-        # 如果所有尝试都失败或返回内容不合法，则返回空
         echo ""
     fi
 }
@@ -563,7 +560,11 @@ main() {
     fi
 
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
+    # 使用 tee 来同时输出到屏幕和文件
     exec > >(tee -a "${LOG_FILE}") 2>&1
+    # [Hardening] 增强日志文件安全性，只有root可读
+    chmod 600 "${LOG_FILE}"
+
     echo -e "${BLUE}[INFO] 脚本启动于 $(date)。日志将记录到: ${LOG_FILE}${NC}"
     if [ "$non_interactive" = "true" ]; then echo -e "${BLUE}[INFO] 已启用非交互模式。${NC}"; fi
 
