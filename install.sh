@@ -97,7 +97,11 @@ record_verification() {
 # 统一验证函数，减少重复代码
 verify_config() {
     local component="$1" expected="$2" actual="$3" extra="${4:-}"
-    [[ "$actual" = "$expected" ]] && record_verification "$component" "PASS" "已设置为 '$actual' $extra" || record_verification "$component" "FAIL" "期望 '$expected'，实际 '$actual'"
+    if [[ "$actual" = "$expected" ]]; then
+        record_verification "$component" "PASS" "已设置为 '$actual' $extra"
+    else
+        record_verification "$component" "FAIL" "期望 '$expected'，实际 '$actual'"
+    fi
 }
 
 run_verification() {
@@ -111,12 +115,12 @@ run_verification() {
     # 验证主机名（只在用户指定了新主机名时验证）
     [[ -n "$NEW_HOSTNAME" ]] && {
         local current_hostname=$(hostname)
-        [[ "$current_hostname" = "$NEW_HOSTNAME" ]] && record_verification "主机名" "PASS" "已设置为 '$current_hostname'" || record_verification "主机名" "FAIL" "期望 '$NEW_HOSTNAME'，实际 '$current_hostname'"
+        verify_config "主机名" "$NEW_HOSTNAME" "$current_hostname"
     }
     
     # 验证时区
     local current_timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')
-    [[ "$current_timezone" = "$TIMEZONE" ]] && record_verification "时区" "PASS" "已设置为 '$current_timezone'" || record_verification "时区" "FAIL" "期望 '$TIMEZONE'，实际 '$current_timezone'"
+    verify_config "时区" "$TIMEZONE" "$current_timezone"
     
     # 验证BBR
     local current_cc current_qdisc
