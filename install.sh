@@ -108,11 +108,15 @@ run_verification() {
     VERIFICATION_FAILED=0
     set +e  # 临时禁用错误退出
     
-    # 验证主机名
-    [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
+    # 验证主机名（只在用户指定了新主机名时验证）
+    [[ -n "$NEW_HOSTNAME" ]] && {
+        local current_hostname=$(hostname)
+        [[ "$current_hostname" = "$NEW_HOSTNAME" ]] && record_verification "主机名" "PASS" "已设置为 '$current_hostname'" || record_verification "主机名" "FAIL" "期望 '$NEW_HOSTNAME'，实际 '$current_hostname'"
+    }
     
     # 验证时区
-    verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
+    local current_timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')
+    [[ "$current_timezone" = "$TIMEZONE" ]] && record_verification "时区" "PASS" "已设置为 '$current_timezone'" || record_verification "时区" "FAIL" "期望 '$TIMEZONE'，实际 '$current_timezone'"
     
     # 验证BBR
     local current_cc current_qdisc
@@ -140,11 +144,29 @@ run_verification() {
         [[ $current_swap_mb -gt 0 ]] && record_verification "Swap" "PASS" "${current_swap_mb}MB" || record_verification "Swap" "FAIL" "Swap未配置"
     fi
     
-    # 验证DNS (简化检查)
+    # 验证DNS (改进检查逻辑)
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]] && record_verification "DNS" "PASS" "systemd-resolved已配置" || record_verification "DNS" "FAIL" "DNS配置异常"
+        if [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]]; then
+            local dns_config=$(cat /etc/systemd/resolved.conf.d/99-custom-dns.conf 2>/dev/null)
+            if [[ "$dns_config" =~ $PRIMARY_DNS_V4 ]]; then
+                record_verification "DNS" "PASS" "systemd-resolved已配置"
+            else
+                record_verification "DNS" "FAIL" "systemd-resolved配置异常"
+            fi
+        else
+            record_verification "DNS" "FAIL" "systemd-resolved配置文件未找到"
+        fi
     else
-        grep -q "$PRIMARY_DNS_V4" /etc/resolv.conf 2>/dev/null && record_verification "DNS" "PASS" "resolv.conf已配置" || record_verification "DNS" "FAIL" "DNS配置异常"
+        if [[ -f /etc/resolv.conf ]]; then
+            local resolv_content=$(cat /etc/resolv.conf 2>/dev/null)
+            if [[ "$resolv_content" =~ $PRIMARY_DNS_V4 ]]; then
+                record_verification "DNS" "PASS" "resolv.conf已配置"
+            else
+                record_verification "DNS" "FAIL" "resolv.conf配置异常"
+            fi
+        else
+            record_verification "DNS" "FAIL" "DNS配置文件不存在"
+        fi
     fi
     
     # 验证软件包安装
@@ -251,6 +273,7 @@ pre_flight_checks() {
 configure_hostname() {
     echo -e "\n${YELLOW}=============== 1. 主机名配置 ===============${NC}"
     local current_hostname=$(hostname)
+    echo -e "${BLUE}当前主机名: $current_hostname${NC}"
     local final_hostname="$current_hostname"
     
     if [[ -n "$NEW_HOSTNAME" ]]; then
