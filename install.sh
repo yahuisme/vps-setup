@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 6.0-final
+# 版本: 6.2-final
 # ==============================================================================
 set -euo pipefail
 
@@ -16,7 +16,7 @@ PRIMARY_DNS_V6="2606:4700:4700::1111"
 SECONDARY_DNS_V6="2001:4860:4860::8888"
 NEW_HOSTNAME=""
 BBR_MODE="default"
-ENABLE_FAIL2BAN=false
+ENABLE_FAIL2BAN=true #
 FAIL2BAN_EXTRA_PORT=""
 
 # --- 颜色和全局变量 ---
@@ -177,11 +177,12 @@ ${BLUE}BBR 选项:${NC}
   --bbr-optimized       启用动态优化 BBR
   --no-bbr              禁用 BBR
 ${BLUE}安全选项:${NC}
-  --fail2ban [port]     启用 Fail2ban，可选额外SSH端口
+  --fail2ban [port]     (默认启用) 指定额外SSH保护端口
+  --no-fail2ban         禁用 Fail2ban
 ${BLUE}其他:${NC}
   -h, --help            显示帮助
   --non-interactive     非交互模式
-${GREEN}示例: bash $0 --bbr-optimized --fail2ban 2222${NC}
+${GREEN}示例: bash $0 --no-fail2ban --swap 0${NC}
 EOF
     exit 0
 }
@@ -201,6 +202,7 @@ parse_args() {
                 ENABLE_FAIL2BAN=true
                 [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }
                 shift ;;
+            --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;; # <-- 新增
             --non-interactive) non_interactive=true; shift ;;
             *) echo -e "${RED}未知选项: $1${NC}"; usage ;;
         esac
@@ -415,7 +417,7 @@ configure_fail2ban() {
     echo -e "${BLUE}配置保护端口: $port_list${NC}"
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
-bantime = 3600
+bantime = -1
 findtime = 300
 maxretry = 3
 [sshd]
@@ -452,7 +454,7 @@ main() {
     [[ $EUID -ne 0 ]] && { echo -e "${RED}需要 root 权限${NC}"; exit 1; }
     
     parse_args "$@"
-    
+
     echo -e "${CYAN}=====================================================${NC}"
     echo -e "${CYAN}               VPS 初始化配置预览${NC}"
     echo -e "${CYAN}=====================================================${NC}"
