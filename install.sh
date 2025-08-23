@@ -2,8 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.9-fixed
-# 描述: 在保持原有功能基础上，精简代码结构，提升执行效率
+# 版本: 5.9
 # ==============================================================================
 set -euo pipefail
 
@@ -88,6 +87,9 @@ record_verification() {
     if [[ "$status" = "PASS" ]]; then
         echo -e "    ${GREEN}✓${NC} $component: $message"
         ((VERIFICATION_PASSED++))
+    elif [[ "$status" = "WARN" ]]; then
+        echo -e "    ${YELLOW}⚠️${NC} $component: $message"
+        # 警告不计入失败统计
     else
         echo -e "    ${RED}✗${NC} $component: $message"
         ((VERIFICATION_FAILED++))
@@ -149,13 +151,14 @@ run_verification() {
     fi
     
     # 验证DNS (改进检查逻辑)
+    local dns_warning_msg="配置未生效 (这在云服务器上很常见，因其自动化管理服务会覆盖此配置)"
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         if [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]]; then
             local dns_config=$(cat /etc/systemd/resolved.conf.d/99-custom-dns.conf 2>/dev/null)
             if [[ "$dns_config" =~ $PRIMARY_DNS_V4 ]]; then
                 record_verification "DNS" "PASS" "systemd-resolved已配置"
             else
-                record_verification "DNS" "FAIL" "systemd-resolved配置异常"
+                record_verification "DNS" "WARN" "systemd-resolved ${dns_warning_msg}"
             fi
         else
             record_verification "DNS" "FAIL" "systemd-resolved配置文件未找到"
@@ -166,7 +169,7 @@ run_verification() {
             if [[ "$resolv_content" =~ $PRIMARY_DNS_V4 ]]; then
                 record_verification "DNS" "PASS" "resolv.conf已配置"
             else
-                record_verification "DNS" "FAIL" "resolv.conf配置异常"
+                record_verification "DNS" "WARN" "resolv.conf ${dns_warning_msg}"
             fi
         else
             record_verification "DNS" "FAIL" "DNS配置文件不存在"
@@ -509,11 +512,9 @@ configure_fail2ban() {
     local port_list="22"
     if [[ -n "$FAIL2BAN_EXTRA_PORT" ]]; then
         if [[ "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ && "$FAIL2BAN_EXTRA_PORT" -ge 1 && "$FAIL2BAN_EXTRA_PORT" -le 65535 ]]; then
-            # --- FIX START ---
             if [[ "$FAIL2BAN_EXTRA_PORT" != "22" ]]; then
                  port_list="22,$FAIL2BAN_EXTRA_PORT"
             fi
-            # --- FIX END ---
         else
             echo -e "${RED}无效端口号: $FAIL2BAN_EXTRA_PORT${NC}"
             return 1
@@ -602,7 +603,7 @@ main() {
     local hostname_display
     if [[ -n "$NEW_HOSTNAME" ]]; then
         hostname_display="$NEW_HOSTNAME"
-    elif [[ "$non_interactive" = true ]]; then
+    elif [[ "$non_interactive" = "true" ]]; then
         hostname_display="自动设置 (基于公网IP)"
     else
         hostname_display="交互式设置"
@@ -624,7 +625,7 @@ main() {
     echo -e "${CYAN}=====================================================${NC}"
     
     # 确认继续
-    if [[ "$non_interactive" = false ]]; then
+    if [[ "$non_interactive" = "false" ]]; then
         read -p "确认配置并开始? [Y/n] " -r < /dev/tty
         [[ $REPLY =~ ^[Nn]$ ]] && { echo "已取消"; exit 0; }
     fi
