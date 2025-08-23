@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.4-final
+# 版本: 5.6-final
 # ==============================================================================
 set -e
 set -o pipefail
@@ -122,7 +122,8 @@ handle_error() {
 }
 
 start_spinner() {
-    if [ "$non_interactive" = true ]; then return; fi
+    # 仅在交互式终端中显示spinner
+    if ! [[ -t 1 ]] || [ "$non_interactive" = true ]; then return; fi
     local msg="${1:-}"
     echo -n -e "${CYAN}${msg}${NC}"
     local -r chars="/-\|"
@@ -212,6 +213,7 @@ configure_hostname() {
     echo "当前主机名: $CURRENT_HOSTNAME"
     local FINAL_HOSTNAME="$CURRENT_HOSTNAME"
 
+    # 情况1: 用户通过 --hostname 参数明确指定了主机名
     if [ -n "$NEW_HOSTNAME" ]; then
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$ ]]; then
             echo -e "${BLUE}[INFO] 通过参数设置新主机名为: $NEW_HOSTNAME${NC}"
@@ -220,38 +222,30 @@ configure_hostname() {
         else
             echo -e "${RED}[ERROR] 主机名 '$NEW_HOSTNAME' 格式不正确，保持不变。${NC}"
         fi
+    # 情况2: 用户未指定主机名，根据模式判断行为
     else
-        local IP_BASED_HOSTNAME=""
-        local PUBLIC_IPV4=""
-        echo -e "${BLUE}[INFO] 未指定主机名，尝试从公网 IPv4 生成建议...${NC}"
-        
-        PUBLIC_IPV4=$(get_public_ipv4)
-
-        if [ -n "$PUBLIC_IPV4" ]; then
-            IP_BASED_HOSTNAME="${PUBLIC_IPV4//./-}"
-            echo -e "${GREEN}[INFO] 成功获取公网 IP: ${PUBLIC_IPV4}，建议的主机名为: ${IP_BASED_HOSTNAME}${NC}"
-        else
-            echo -e "${YELLOW}[WARN] 无法自动获取公网 IPv4 地址。${NC}"
-        fi
-
+        # 2a: 非交互模式，自动获取IP作为主机名
         if [ "$non_interactive" = "true" ]; then
-            if [ -n "$IP_BASED_HOSTNAME" ]; then
-                echo -e "${BLUE}[INFO] 在非交互模式下，自动应用建议的主机名。${NC}"
+            echo -e "${BLUE}[INFO] 非交互模式下未指定主机名，尝试从公网 IPv4 自动生成...${NC}"
+            local PUBLIC_IPV4
+            PUBLIC_IPV4=$(get_public_ipv4)
+
+            if [ -n "$PUBLIC_IPV4" ]; then
+                local IP_BASED_HOSTNAME="${PUBLIC_IPV4//./-}"
+                echo -e "${GREEN}[SUCCESS]${NC} 成功获取公网 IP，将自动设置新主机名为: ${IP_BASED_HOSTNAME}"
                 hostnamectl set-hostname "$IP_BASED_HOSTNAME"
                 FINAL_HOSTNAME="$IP_BASED_HOSTNAME"
             else
-                echo -e "${BLUE}[INFO] 非交互模式下无法获取IP，主机名保持不变。${NC}"
+                echo -e "${YELLOW}[WARN] 无法自动获取公网 IPv4 地址，主机名保持不变。${NC}"
             fi
+        # 2b: 交互模式，提示用户手动输入
         else
-            read -p "是否需要修改主机名? [Y/n] " -r < /dev/tty
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                local prompt_default="${IP_BASED_HOSTNAME:-$CURRENT_HOSTNAME}"
-                read -p "请输入新的主机名 [默认为: ${prompt_default}]: " INTERACTIVE_HOSTNAME < /dev/tty
-                local TARGET_HOSTNAME="${INTERACTIVE_HOSTNAME:-$prompt_default}"
-                
-                if [ -n "$TARGET_HOSTNAME" ] && [[ "$TARGET_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$ ]]; then
-                    hostnamectl set-hostname "$TARGET_HOSTNAME"
-                    FINAL_HOSTNAME="$TARGET_HOSTNAME"
+            read -p "是否需要修改主机名？ [y/N] " -r < /dev/tty
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                read -p "请输入新的主机名: " INTERACTIVE_HOSTNAME < /dev/tty
+                if [ -n "$INTERACTIVE_HOSTNAME" ] && [[ "$INTERACTIVE_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$ ]]; then
+                    hostnamectl set-hostname "$INTERACTIVE_HOSTNAME"
+                    FINAL_HOSTNAME="$INTERACTIVE_HOSTNAME"
                 else
                     echo -e "${YELLOW}[WARN] 主机名格式不正确或为空，保持不变。${NC}"
                 fi
@@ -259,6 +253,7 @@ configure_hostname() {
         fi
     fi
 
+    # 更新 /etc/hosts 的逻辑对所有情况都适用
     if ! grep -q -E "^127\.0\.1\.1\s+${FINAL_HOSTNAME}$" /etc/hosts; then
         if grep -q "^127\.0\.1\.1" /etc/hosts; then
             sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$FINAL_HOSTNAME/g" /etc/hosts
@@ -426,11 +421,11 @@ configure_dns() {
 install_tools_and_vim() {
     echo -e "\n${YELLOW}=============== 6. 安装常用工具和配置Vim ===============${NC}"
     start_spinner "更新软件包列表... "
-    apt-get update -qq || { stop_spinner; echo -e "${RED}[ERROR] 软件包列表更新失败。${NC}"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || { stop_spinner; echo -e "${RED}[ERROR] 软件包列表更新失败。${NC}"; return 1; }
     stop_spinner
 
     start_spinner "正在安装: $INSTALL_PACKAGES... "
-    apt-get install -y $INSTALL_PACKAGES || { stop_spinner; echo -e "${YELLOW}[WARN] 部分软件包安装失败。${NC}"; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y $INSTALL_PACKAGES || { stop_spinner; echo -e "${YELLOW}[WARN] 部分软件包安装失败。${NC}"; }
     stop_spinner
 
     if command -v vim &> /dev/null; then
@@ -471,7 +466,7 @@ install_and_configure_fail2ban() {
     fi
 
     start_spinner "正在安装 Fail2ban... "
-    apt-get install -y fail2ban || { stop_spinner; echo -e "${RED}[ERROR] Fail2ban 安装失败。${NC}"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || { stop_spinner; echo -e "${RED}[ERROR] Fail2ban 安装失败。${NC}"; return 1; }
     stop_spinner
     
     echo -e "${BLUE}[INFO] 正在创建配置文件 /etc/fail2ban/jail.local...${NC}"
@@ -503,7 +498,7 @@ update_and_cleanup() {
     stop_spinner
 
     start_spinner "移除无用依赖并清理缓存... "
-    apt-get autoremove --purge -y >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >/dev/null 2>&1
     apt-get clean
     stop_spinner
     echo -e "${GREEN}[SUCCESS]${NC} ✅ 系统更新和清理完成。"
@@ -540,7 +535,7 @@ main() {
     echo -e "${CYAN}=======================================================${NC}"
     echo -e "${CYAN}                 VPS 初始化配置预览                  ${NC}"
     echo -e "${CYAN}=======================================================${NC}"
-    echo -e "  ${YELLOW}主机名:${NC}         ${NEW_HOSTNAME:-'自动 (基于公网IP)'}"
+    echo -e "  ${YELLOW}主机名:${NC}         ${NEW_HOSTNAME:-'手动设置 (交互模式下)'}"
     echo -e "  ${YELLOW}时区:${NC}           ${TIMEZONE}"
     echo -e "  ${YELLOW}Swap大小:${NC}       ${SWAP_SIZE_MB}"
     echo -e "  ${YELLOW}BBR模式:${NC}        ${BBR_MODE}"
@@ -549,7 +544,7 @@ main() {
         echo -e "  ${YELLOW}DNS (IPv6):${NC}     ${PRIMARY_DNS_V6}, ${SECONDARY_DNS_V6}"
     fi
     if [ "$ENABLE_FAIL2BAN" = true ]; then
-        local f2b_ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
+        local f2b_ports="22${FAIL_BAN_EXTRA_PORT:+,${FAIL_BAN_EXTRA_PORT}}"
         echo -e "  ${YELLOW}Fail2ban:${NC}       ${GREEN}启用 (保护端口: ${f2b_ports})${NC}"
     else
         echo -e "  ${YELLOW}Fail2ban:${NC}       ${RED}禁用${NC}"
@@ -563,7 +558,7 @@ main() {
 
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
     
-    # [FIXED] 修正竞态条件：先创建文件，再设权限，最后重定向输出
+    # 修正竞态条件：先创建文件，再设权限，最后重定向输出
     touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
     exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -575,7 +570,7 @@ main() {
     SECONDS=0
     
     pre_flight_checks
-    install_tools_and_vim # 提前安装curl等工具，为主机名检测提供支持
+    install_tools_and_vim
     configure_hostname
     configure_timezone
     
