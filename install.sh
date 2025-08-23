@@ -2,7 +2,8 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 5.7-final
+# 版本: 5.8-enhanced
+# 描述: 在原有功能基础上，增加配置后验证步骤，确保所有配置正确生效
 # ==============================================================================
 set -e
 set -o pipefail
@@ -39,6 +40,9 @@ readonly NC='\033[0m' # No Color
 non_interactive=false
 spinner_pid=0
 LOG_FILE=""
+# 验证结果统计
+VERIFICATION_PASSED=0
+VERIFICATION_FAILED=0
 
 # ==============================================================================
 # --- 命令行参数解析 ---
@@ -183,6 +187,273 @@ check_disk_space() {
         echo -e "${RED}[ERROR] 磁盘空间不足，需要 ${required_mb}MB，可用 ${available_mb}MB${NC}"; return 1;
     fi
     return 0
+}
+
+# ==============================================================================
+# --- 新增：配置验证函数区 ---
+# ==============================================================================
+
+# 验证结果记录函数
+record_verification() {
+    local component="$1"
+    local status="$2"
+    local message="$3"
+    
+    if [ "$status" = "PASS" ]; then
+        echo -e "    ${GREEN}✓${NC} $component: $message"
+        ((VERIFICATION_PASSED++))
+    else
+        echo -e "    ${RED}✗${NC} $component: $message"
+        ((VERIFICATION_FAILED++))
+    fi
+}
+
+# 验证主机名配置
+verify_hostname() {
+    local expected_hostname="$1"
+    local current_hostname
+    current_hostname=$(hostname)
+    
+    if [ "$current_hostname" = "$expected_hostname" ]; then
+        local hosts_check
+        if grep -q -E "^127\.0\.1\.1\s+${expected_hostname}$" /etc/hosts; then
+            hosts_check="且/etc/hosts已更新"
+        else
+            hosts_check="但/etc/hosts可能未正确更新"
+        fi
+        record_verification "主机名" "PASS" "已设置为 '$current_hostname' $hosts_check"
+    else
+        record_verification "主机名" "FAIL" "期望 '$expected_hostname'，实际 '$current_hostname'"
+    fi
+}
+
+# 验证时区配置
+verify_timezone() {
+    local expected_timezone="$1"
+    local current_timezone
+    current_timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
+    
+    if [ "$current_timezone" = "$expected_timezone" ]; then
+        record_verification "时区" "PASS" "已设置为 '$current_timezone'"
+    else
+        record_verification "时区" "FAIL" "期望 '$expected_timezone'，实际 '$current_timezone'"
+    fi
+}
+
+# 验证BBR配置
+verify_bbr() {
+    local expected_mode="$1"
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    local current_qdisc
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    
+    if [ "$expected_mode" = "none" ]; then
+        record_verification "BBR" "PASS" "已禁用 (当前: $current_cc)"
+        return
+    fi
+    
+    if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
+        if [ "$expected_mode" = "optimized" ] && [ -f /etc/sysctl.d/99-bbr.conf ]; then
+            local config_lines
+            config_lines=$(grep -c "^net\." /etc/sysctl.d/99-bbr.conf 2>/dev/null || echo "0")
+            if [ "$config_lines" -gt 5 ]; then
+                record_verification "BBR" "PASS" "动态优化模式已启用 (配置项: $config_lines)"
+            else
+                record_verification "BBR" "PASS" "标准模式已启用"
+            fi
+        else
+            record_verification "BBR" "PASS" "标准模式已启用"
+        fi
+    else
+        record_verification "BBR" "FAIL" "期望启用BBR，实际拥塞控制: $current_cc, 队列调度: $current_qdisc"
+    fi
+}
+
+# 验证Swap配置
+verify_swap() {
+    local expected_size="$1"
+    local current_swap_kb
+    current_swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+    local current_swap_mb=$((current_swap_kb / 1024))
+    
+    if [ "$expected_size" = "0" ]; then
+        if [ "$current_swap_mb" -eq 0 ]; then
+            record_verification "Swap" "PASS" "已禁用"
+        else
+            record_verification "Swap" "FAIL" "期望禁用，但检测到 ${current_swap_mb}MB Swap"
+        fi
+        return
+    fi
+    
+    if [ "$current_swap_mb" -gt 0 ]; then
+        if [ -f /swapfile ]; then
+            local swappiness
+            swappiness=$(sysctl -n vm.swappiness 2>/dev/null || echo "未知")
+            local fstab_check=""
+            if grep -q "/swapfile" /etc/fstab; then
+                fstab_check="，已加入开机自动挂载"
+            fi
+            record_verification "Swap" "PASS" "${current_swap_mb}MB (swappiness: $swappiness$fstab_check)"
+        else
+            record_verification "Swap" "PASS" "${current_swap_mb}MB (非脚本创建)"
+        fi
+    else
+        record_verification "Swap" "FAIL" "期望配置Swap，但当前无Swap"
+    fi
+}
+
+# 验证DNS配置
+verify_dns() {
+    local ipv4_dns1="$1"
+    local ipv4_dns2="$2"
+    local has_ipv6_support="$3"
+    
+    # 检查systemd-resolved
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        if [ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]; then
+            local dns_config
+            dns_config=$(grep "^DNS=" /etc/systemd/resolved.conf.d/99-custom-dns.conf 2>/dev/null || echo "")
+            if [[ "$dns_config" =~ $ipv4_dns1 ]] && [[ "$dns_config" =~ $ipv4_dns2 ]]; then
+                record_verification "DNS" "PASS" "systemd-resolved配置正确 ($ipv4_dns1, $ipv4_dns2)"
+            else
+                record_verification "DNS" "FAIL" "systemd-resolved配置异常: $dns_config"
+            fi
+        else
+            record_verification "DNS" "FAIL" "systemd-resolved配置文件未找到"
+        fi
+    else
+        # 检查/etc/resolv.conf
+        if [ -f /etc/resolv.conf ]; then
+            local resolv_content
+            resolv_content=$(cat /etc/resolv.conf)
+            if [[ "$resolv_content" =~ $ipv4_dns1 ]] && [[ "$resolv_content" =~ $ipv4_dns2 ]]; then
+                record_verification "DNS" "PASS" "/etc/resolv.conf配置正确 ($ipv4_dns1, $ipv4_dns2)"
+            else
+                record_verification "DNS" "FAIL" "/etc/resolv.conf配置可能异常"
+            fi
+        else
+            record_verification "DNS" "FAIL" "/etc/resolv.conf文件不存在"
+        fi
+    fi
+    
+    # 测试DNS解析功能
+    if command -v nslookup &>/dev/null; then
+        if timeout 5 nslookup google.com >/dev/null 2>&1; then
+            record_verification "DNS解析" "PASS" "域名解析功能正常"
+        else
+            record_verification "DNS解析" "FAIL" "域名解析测试失败"
+        fi
+    fi
+}
+
+# 验证软件包安装
+verify_packages() {
+    local packages="$1"
+    local installed_count=0
+    local total_count=0
+    
+    for pkg in $packages; do
+        ((total_count++))
+        if dpkg -l "$pkg" >/dev/null 2>&1; then
+            ((installed_count++))
+        fi
+    done
+    
+    if [ "$installed_count" -eq "$total_count" ]; then
+        record_verification "软件包" "PASS" "所有软件包已安装 ($installed_count/$total_count)"
+    else
+        record_verification "软件包" "FAIL" "部分软件包未安装 ($installed_count/$total_count)"
+    fi
+}
+
+# 验证Vim配置
+verify_vim() {
+    if command -v vim &>/dev/null; then
+        if [ -f /etc/vim/vimrc.local ]; then
+            local config_lines
+            config_lines=$(grep -c "^[^#]" /etc/vim/vimrc.local 2>/dev/null || echo "0")
+            if [ "$config_lines" -gt 5 ]; then
+                record_verification "Vim配置" "PASS" "配置文件已创建 ($config_lines 行配置)"
+            else
+                record_verification "Vim配置" "FAIL" "配置文件异常或为空"
+            fi
+        else
+            record_verification "Vim配置" "FAIL" "配置文件未创建"
+        fi
+    else
+        record_verification "Vim" "FAIL" "Vim未安装"
+    fi
+}
+
+# 验证Fail2ban配置
+verify_fail2ban() {
+    if [ "$ENABLE_FAIL2BAN" != true ]; then
+        return 0
+    fi
+    
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        if [ -f /etc/fail2ban/jail.local ]; then
+            local protected_ports
+            protected_ports=$(grep -oP 'port\s*=\s*\K[0-9,]+' /etc/fail2ban/jail.local 2>/dev/null || echo "未知")
+            record_verification "Fail2ban" "PASS" "服务运行正常，保护端口: $protected_ports"
+        else
+            record_verification "Fail2ban" "FAIL" "服务运行但配置文件不存在"
+        fi
+    else
+        record_verification "Fail2ban" "FAIL" "服务未运行"
+    fi
+}
+
+# 主验证函数
+run_verification() {
+    echo -e "\n${YELLOW}=============== 配置验证 ===============${NC}"
+    echo -e "${BLUE}[INFO] 正在验证所有配置是否正确生效...${NC}\n"
+    
+    VERIFICATION_PASSED=0
+    VERIFICATION_FAILED=0
+    
+    # 验证主机名（如果有变更）
+    if [ -n "$NEW_HOSTNAME" ] || [ "$(hostname)" != "$INITIAL_HOSTNAME" ]; then
+        verify_hostname "$(hostname)"
+    fi
+    
+    # 验证时区
+    verify_timezone "$TIMEZONE"
+    
+    # 验证BBR
+    verify_bbr "$BBR_MODE"
+    
+    # 验证Swap（除非明确设为0）
+    if [ "$SWAP_SIZE_MB" != "0" ]; then
+        verify_swap "$SWAP_SIZE_MB"
+    else
+        verify_swap "0"
+    fi
+    
+    # 验证DNS
+    verify_dns "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4" "$(has_ipv6 && echo true || echo false)"
+    
+    # 验证软件包
+    verify_packages "$INSTALL_PACKAGES"
+    
+    # 验证Vim配置
+    verify_vim
+    
+    # 验证Fail2ban（如果启用）
+    verify_fail2ban
+    
+    # 显示验证摘要
+    echo
+    echo -e "${BLUE}[INFO] 配置验证完成${NC}"
+    echo -e "  ${GREEN}通过: ${VERIFICATION_PASSED}${NC}"
+    echo -e "  ${RED}失败: ${VERIFICATION_FAILED}${NC}"
+    
+    if [ "$VERIFICATION_FAILED" -eq 0 ]; then
+        echo -e "${GREEN}[SUCCESS] 所有配置验证通过！${NC}"
+    else
+        echo -e "${YELLOW}[WARN] 有 $VERIFICATION_FAILED 项验证失败，请检查日志。${NC}"
+    fi
 }
 
 # --- 功能函数区 ---
@@ -535,6 +806,13 @@ final_summary() {
 
     echo -e "\n总执行时间: ${SECONDS} 秒"
     echo -e "完整日志已保存至: ${LOG_FILE}"
+    
+    # 显示验证摘要
+    if [ "$VERIFICATION_FAILED" -eq 0 ]; then
+        echo -e "${GREEN}✅ 所有配置验证通过 (${VERIFICATION_PASSED}/${VERIFICATION_PASSED})${NC}"
+    else
+        echo -e "${YELLOW}⚠️ 配置验证: ${VERIFICATION_PASSED} 通过, ${VERIFICATION_FAILED} 失败${NC}"
+    fi
 }
 
 # --- 主函数 ---
@@ -556,7 +834,7 @@ main() {
         echo -e "  ${YELLOW}DNS (IPv6):${NC}     ${PRIMARY_DNS_V6}, ${SECONDARY_DNS_V6}"
     fi
     if [ "$ENABLE_FAIL2BAN" = true ]; then
-        local f2b_ports="22${FAIL_BAN_EXTRA_PORT:+,${FAIL_BAN_EXTRA_PORT}}"
+        local f2b_ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
         echo -e "  ${YELLOW}Fail2ban:${NC}       ${GREEN}启用 (保护端口: ${f2b_ports})${NC}"
     else
         echo -e "  ${YELLOW}Fail2ban:${NC}       ${RED}禁用${NC}"
@@ -610,6 +888,10 @@ main() {
     fi
 
     update_and_cleanup
+    
+    # [NEW] 执行配置验证
+    run_verification
+    
     final_summary
 
     echo
