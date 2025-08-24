@@ -2,14 +2,14 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 6.4-enhanced
+# 版本: 6.5-enhanced
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
-INSTALL_PACKAGES="sudo wget zip vim curl"
+INSTALL_PACKAGES="sudo wget zip vim"
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
@@ -78,7 +78,7 @@ check_disk_space() {
     [[ $available_mb -lt $required_mb ]] && { echo -e "${RED}[ERROR] 磁盘空间不足: 需要${required_mb}MB，可用${available_mb}MB${NC}"; return 1; }
 }
 
-# 【改进】更精确的容器环境检测
+# 改进：更精确的容器环境检测
 is_container() {
     # 优先使用 systemd-detect-virt --container 进行更精确的检测
     case "$(systemd-detect-virt --container 2>/dev/null)" in
@@ -444,7 +444,7 @@ configure_swap() {
 configure_dns() {
     echo -e "\n${YELLOW}=============== 6. DNS配置 ===============${NC}"
     
-    # 【改进】增强对云环境的警告
+    # 改进：增强对云环境的警告
     if systemctl is-active --quiet cloud-init 2>/dev/null; then
         echo -e "${YELLOW}[WARN] 检测到 cloud-init 服务正在运行。DNS 设置可能在重启后被覆盖。请考虑在您的云服务商控制面板中配置DNS。${NC}"
     fi
@@ -585,21 +585,18 @@ main() {
     echo -e "  执行时间: ${SECONDS}秒"
     echo -e "  日志文件: ${LOG_FILE}"
     
-    # 改进：更智能的重启提示
+    # 【改进】统一重启提示逻辑
     if is_container; then
         echo -e "\n${BLUE}[INFO] 容器环境无需重启，配置已生效。${NC}"
     else
         echo -e "\n${BLUE}[INFO] 建议重启以确保所有设置生效。${NC}"
-        if [[ "$non_interactive" = false ]]; then
-            read -p "立即重启? [Y/n] " -r < /dev/tty
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "${BLUE}[INFO] 重启中...${NC}"
-                reboot
-            else
-                echo -e "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
-            fi
+        # 无论是否为非交互模式，都进行询问
+        read -p "立即重启? [Y/n] " -r < /dev/tty
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            echo -e "${BLUE}[INFO] 重启中...${NC}"
+            reboot
         else
-            echo -e "${GREEN}非交互模式：请稍后手动重启系统${NC}"
+            echo -e "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
         fi
     fi
 }
