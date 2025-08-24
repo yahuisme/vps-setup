@@ -18,6 +18,16 @@
 ```
 apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh)
 ```
+运行一键脚本后依次配置：
+1. 自动检查并安装 sudo wget zip vim curl 常用应用
+2. 询问是否设置主机名
+3. 自动检测并设置 VPS 所在时区
+4. 默认开启 BBR
+5. 自动配置 Swap
+6. 自动配置 DNS（ipv4 1.1.1.1 8.8.8.8 ipv6 2606:4700:4700::1111 2001:4860:4860::8888）
+7. 自动安装并配置 Fail2ban，默认防护 22 端口
+8. 自动优化 vim 编辑器配置
+9. 系统更新及清理
 
 # 无交互自定义脚本
 ```
@@ -31,6 +41,16 @@ apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahui
 --fail2ban 12345 \
 --non-interactive
 ```
+运行无交互自定义脚本后依次配置：
+1. 自动检查并安装 sudo wget zip vim curl 常用应用
+2. 自动配置自定义主机名
+3. 自动配置自定义时区
+4. 自动配置自定义 Swap
+5. 默认开启 BBR 并根据 VPS 配置只能优化 TCP 网络参数
+6. 自动配置自定义 DNS
+7. 自动安装并配置 Fail2ban，防护 22 端口和自定义端口
+8. 自动优化 vim 编辑器配置
+9. 系统更新及清理
 
 # 配合 bin456789 一键 DD 脚本
 
