@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Debian & Ubuntu LTS VPS 通用初始化脚本
-# 版本: 6.7-enhanced
+# 版本: 6.5-enhanced
 # ==============================================================================
 set -euo pipefail
 
@@ -18,9 +18,6 @@ NEW_HOSTNAME=""
 BBR_MODE="default"
 ENABLE_FAIL2BAN=true
 FAIL2BAN_EXTRA_PORT=""
-LOG_RETENTION_DAYS=7
-TOTAL_STEPS=8
-CURRENT_STEP=0
 
 # --- 颜色和全局变量 ---
 readonly GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m'
@@ -61,12 +58,6 @@ stop_spinner() {
     echo -e "\b${GREEN}✔${NC}"
 }
 
-# 显示进度
-show_progress() {
-    ((CURRENT_STEP++))
-    echo -e "${BLUE}[INFO] 完成 $CURRENT_STEP/$TOTAL_STEPS 步骤${NC}"
-}
-
 # 系统信息获取
 get_public_ipv4() {
     local ip
@@ -75,22 +66,13 @@ get_public_ipv4() {
             ip=$($cmd $url 2>/dev/null) && [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && echo "$ip" && return
         done
     done
-    echo "vps-$(date +%s)" # Fallback 主机名
 }
 
 has_ipv6() {
     ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'
 }
 
-# DNS 连通性测试
-test_dns() {
-    local dns="$1"
-    ping -c 1 "$dns" >/dev/null 2>&1 && return 0
-    echo -e "${YELLOW}[WARN] DNS $dns 不可达${NC}"
-    return 1
-}
-
-# 磁盘空间检查
+# --- 修复后的 check_disk_space 函数 ---
 check_disk_space() {
     local required_mb=$1
     local available_mb
@@ -107,17 +89,20 @@ check_disk_space() {
         return 1
     fi
 }
+# --- 修复结束 ---
 
-# 容器环境检测
+# 改进：更精确的容器环境检测
 is_container() {
+    # 优先使用 systemd-detect-virt --container 进行更精确的检测
     case "$(systemd-detect-virt --container 2>/dev/null)" in
         docker|lxc|openvz|containerd|podman) return 0 ;;
     esac
+    # 其他检查作为回退
     [[ -f /.dockerenv ]] || [[ -f /run/.containerenv ]] ||
     grep -q 'container=lxc\|container=docker' /proc/1/environ 2>/dev/null
 }
 
-# 内核版本比较
+# 改进：更严格的内核版本比较
 compare_version() {
     printf '%s\n' "$@" | sort -V | head -n1
 }
@@ -126,17 +111,6 @@ is_kernel_version_ge() {
     local required="$1" current
     current=$(uname -r | grep -oP '^\d+\.\d+' || echo "0.0")
     [[ "$(compare_version "$current" "$required")" = "$required" ]]
-}
-
-# 清理旧日志文件
-clean_old_logs() {
-    echo -e "${BLUE}[INFO] 清理超过 ${LOG_RETENTION_DAYS} 天的日志文件...${NC}"
-    if [[ -d /var/log ]]; then
-        find /var/log -type f -name "vps-init-*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null
-        echo -e "${GREEN}✅ 旧日志清理完成${NC}"
-    else
-        echo -e "${YELLOW}[WARN] /var/log 目录不存在，跳过清理${NC}"
-    fi
 }
 
 # ==============================================================================
@@ -174,9 +148,6 @@ run_verification() {
     set +e
     
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
-    [[ -n "$NEW_HOSTNAME" && -f /etc/hosts ]] && {
-        grep -q "$NEW_HOSTNAME" /etc/hosts && record_verification "/etc/hosts" "PASS" "包含主机名 $NEW_HOSTNAME" || record_verification "/etc/hosts" "FAIL" "未包含主机名 $NEW_HOSTNAME"
-    }
     
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
     
@@ -196,7 +167,7 @@ run_verification() {
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
         [[ $current_swap_mb -eq 0 ]] && record_verification "Swap" "PASS" "已禁用" || record_verification "Swap" "FAIL" "期望禁用，实际${current_swap_mb}MB"
     else
-        [[ $current_swap_mb -gt 0 && -f /swapfile && $(grep -q "/swapfile" /proc/swaps) ]] && record_verification "Swap" "PASS" "${current_swap_mb}MB 已启用" || record_verification "Swap" "FAIL" "Swap未配置或未启用"
+        [[ $current_swap_mb -gt 0 ]] && record_verification "Swap" "PASS" "${current_swap_mb}MB" || record_verification "Swap" "FAIL" "Swap未配置"
     fi
     
     local dns_warning_msg="配置未生效 (云服务器常见现象，因其自动化服务会覆盖此配置)"
@@ -246,24 +217,9 @@ ${BLUE}安全选项:${NC}
 ${BLUE}其他:${NC}
   -h, --help            显示帮助
   --non-interactive     非交互模式
-  --log-retention-days <days>  设置日志保留天数 (默认: 7)
-${GREEN}示例:${NC}
-  bash $0 --no-fail2ban --swap 0
-  bash $0 --hostname myvps --ip-dns "1.1.1.1 8.8.8.8" --bbr-optimized --log-retention-days 14
+${GREEN}示例: bash $0 --no-fail2ban --swap 0${NC}
 EOF
     exit 0
-}
-
-validate_ports() {
-    local ports="$1"
-    IFS=',' read -ra port_array <<< "$ports"
-    for port in "${port_array[@]}"; do
-        if ! [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]]; then
-            echo -e "${RED}[ERROR] 无效端口: $port${NC}"
-            return 1
-        fi
-    done
-    echo "$ports"
 }
 
 parse_args() {
@@ -279,18 +235,10 @@ parse_args() {
             --no-bbr) BBR_MODE="none"; shift ;;
             --fail2ban)
                 ENABLE_FAIL2BAN=true
-                [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT=$(validate_ports "$2") || exit 1; shift; }
+                [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }
                 shift ;;
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
             --non-interactive) non_interactive=true; shift ;;
-            --log-retention-days) 
-                if [[ "$2" =~ ^[0-9]+$ && "$2" -ge 0 ]]; then
-                    LOG_RETENTION_DAYS="$2"
-                    shift 2
-                else
-                    echo -e "${RED}[ERROR] 无效日志保留天数: $2${NC}"
-                    exit 1
-                fi ;;
             *) echo -e "${RED}未知选项: $1${NC}"; usage ;;
         esac
     done
@@ -303,6 +251,7 @@ parse_args() {
 pre_flight_checks() {
     echo -e "${BLUE}[INFO] 系统预检查...${NC}"
     
+    # 改进：增强环境检查
     if is_container; then
         echo -e "${YELLOW}[WARN] 检测到容器环境，某些功能可能受限${NC}"
         if [[ "$non_interactive" = false ]]; then
@@ -326,13 +275,13 @@ pre_flight_checks() {
         fi
     fi
     
+    # 改进：检查必要权限
     if ! groups | grep -q sudo 2>/dev/null && [[ $EUID -ne 0 ]]; then
         echo -e "${RED}[ERROR] 需要 root 权限或 sudo 权限${NC}"
         exit 1
     fi
     
     echo -e "${GREEN}✅ 系统: $PRETTY_NAME${NC}"
-    show_progress
 }
 
 install_packages() {
@@ -368,7 +317,6 @@ EOF
         [[ -d /root ]] && echo "source /etc/vim/vimrc.local" >> /root/.vimrc 2>/dev/null || true
     fi
     echo -e "${GREEN}✅ 软件包安装与配置完成${NC}"
-    show_progress
 }
 
 configure_hostname() {
@@ -386,7 +334,7 @@ configure_hostname() {
             echo -e "${RED}[ERROR] 主机名格式不正确，保持不变${NC}"
             NEW_HOSTNAME=""
         fi
-    elif [[ "$non_interactive" = "true" ]]; then
+    elif [[ "$non_interactive" = "true" && -n "$(get_public_ipv4)" ]]; then
         final_hostname="$(get_public_ipv4 | tr '.' '-')"
         hostnamectl set-hostname "$final_hostname"
         NEW_HOSTNAME="$final_hostname"
@@ -403,7 +351,9 @@ configure_hostname() {
         fi
     fi
     
+    # 改进：更安全的 hosts 文件修改
     if [[ "$final_hostname" != "$current_hostname" ]]; then
+        # 先备份原有设置，然后安全地更新
         if grep -q "^127\.0\.1\.1" /etc/hosts; then
             sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$final_hostname/" /etc/hosts
         else
@@ -411,13 +361,11 @@ configure_hostname() {
         fi
     fi
     echo -e "${GREEN}✅ 主机名: $(hostname)${NC}"
-    show_progress
 }
 
 configure_timezone() {
     echo -e "\n${YELLOW}=============== 3. 时区配置 ===============${NC}"
     timedatectl set-timezone "$TIMEZONE" 2>/dev/null && echo -e "${GREEN}✅ 时区: $TIMEZONE${NC}"
-    show_progress
 }
 
 configure_bbr() {
@@ -428,24 +376,19 @@ configure_bbr() {
     if [[ "$BBR_MODE" = "none" ]]; then
         echo -e "${BLUE}[INFO] 根据参数跳过 BBR 配置${NC}"
         rm -f "$config_file"
-        show_progress
         return
     fi
     
+    # 改进：更严格的内核版本检查
     if ! is_kernel_version_ge "4.9"; then
         echo -e "${RED}[ERROR] 内核版本过低 ($(uname -r))，BBR 需要 4.9+${NC}"
-        show_progress
         return 1
-    fi
-    
-    if ! lsmod | grep -q tcp_bbr; then
-        modprobe tcp_bbr 2>/dev/null || echo -e "${YELLOW}[WARN] BBR 模块未加载${NC}"
     fi
     
     if [[ "$BBR_MODE" = "optimized" ]]; then
         if is_kernel_version_ge "4.9"; then
             echo -e "${BLUE}[INFO] 配置动态优化 BBR...${NC}"
-            local mem_mb=$(free -m | awk '/^Memeração:{print $2}')
+            local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
             local somaxconn=$(( mem_mb > 2048 ? 65535 : (mem_mb > 1024 ? 49152 : 32768) ))
             local rmem_wmem_max=$(( mem_mb > 2048 ? 67108864 : (mem_mb > 1024 ? 33554432 : (mem_mb > 512 ? 16777216 : 8388608)) ))
             
@@ -460,7 +403,6 @@ net.ipv4.tcp_fin_timeout = 15
 EOF
             sysctl --system >/dev/null 2>&1
             echo -e "${GREEN}✅ 动态优化 BBR 已启用${NC}"
-            show_progress
             return
         else
             echo -e "${RED}内核版本过低，使用标准BBR${NC}"
@@ -471,19 +413,12 @@ EOF
     echo -e "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr" > "$config_file"
     sysctl -p "$config_file" >/dev/null 2>&1
     echo -e "${GREEN}✅ 标准 BBR 已启用${NC}"
-    show_progress
 }
 
 configure_swap() {
     echo -e "\n${YELLOW}=============== 5. Swap配置 ===============${NC}"
     
-    if is_container; then
-        echo -e "${YELLOW}[WARN] 容器环境不支持 Swap 配置，跳过${NC}"
-        show_progress
-        return
-    fi
-    
-    [[ "$SWAP_SIZE_MB" = "0" ]] && { echo -e "${BLUE}Swap已禁用${NC}"; show_progress; return; }
+    [[ "$SWAP_SIZE_MB" = "0" ]] && { echo -e "${BLUE}Swap已禁用${NC}"; return; }
     
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
@@ -494,20 +429,19 @@ configure_swap() {
         swap_mb=$SWAP_SIZE_MB
     fi
     
-    check_disk_space $((swap_mb + 100)) || { show_progress; return 1; }
+    check_disk_space $((swap_mb + 100)) || return 1
     
     local current_swap_file="/swapfile"
     
+    # 检查现有 swapfile 的大小
     if [[ -f "$current_swap_file" ]]; then
         local current_size_mb=$(du -m "$current_swap_file" | awk '{print $1}')
         if [[ "$current_size_mb" -ne "$swap_mb" ]]; then
-            if grep -q "$current_swap_file" /proc/swaps 2>/dev/null; then
-                swapoff "$current_swap_file" >/dev/null 2>&1 || { echo -e "${RED}[ERROR] 无法关闭现有 Swap 文件${NC}"; show_progress; return 1; }
-            fi
+            echo -e "${YELLOW}[WARN] 检测到现有 Swap 文件大小 ($current_size_mb MB) 与期望 ($swap_mb MB) 不符，正在重建...${NC}"
+            swapoff "$current_swap_file" >/dev/null 2>&1 || true
             rm -f "$current_swap_file"
         else
             echo -e "${BLUE}检测到已存在大小合适的 Swap 文件，跳过创建。${NC}"
-            show_progress
             return
         fi
     fi
@@ -517,10 +451,12 @@ configure_swap() {
     start_spinner "创建 Swap 文件... "
     local success=false
     
+    # 优先使用 fallocate
     if command -v fallocate &>/dev/null; then
         fallocate -l "${swap_mb}M" "$current_swap_file" 2>/dev/null && success=true
     fi
     
+    # 如果 fallocate 失败或不存在，回退到 dd
     if [[ "$success" = false ]]; then
         dd if=/dev/zero of="$current_swap_file" bs=1M count="$swap_mb" status=none 2>/dev/null && success=true
     fi
@@ -528,7 +464,6 @@ configure_swap() {
     if [[ "$success" = false ]]; then
         stop_spinner
         echo -e "${RED}[ERROR] Swap 文件创建失败${NC}"
-        show_progress
         return 1
     fi
     
@@ -537,25 +472,19 @@ configure_swap() {
     chmod 600 "$current_swap_file" && mkswap "$current_swap_file" >/dev/null && swapon "$current_swap_file"
     grep -q "$current_swap_file" /etc/fstab || echo "$current_swap_file none swap sw 0 0" >> /etc/fstab
     echo -e "${GREEN}✅ ${swap_mb}MB Swap 已配置${NC}"
-    show_progress
 }
 
 configure_dns() {
     echo -e "\n${YELLOW}=============== 6. DNS配置 ===============${NC}"
     
+    # 改进：增强对云环境的警告
     if systemctl is-active --quiet cloud-init 2>/dev/null; then
         echo -e "${YELLOW}[WARN] 检测到 cloud-init 服务正在运行。DNS 设置可能在重启后被覆盖。请考虑在您的云服务商控制面板中配置DNS。${NC}"
     fi
 
+    # 改进：检查网络管理器状态
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         echo -e "${YELLOW}[WARN] NetworkManager 正在运行，DNS 设置可能被覆盖${NC}"
-    fi
-    
-    test_dns "$PRIMARY_DNS_V4" || PRIMARY_DNS_V4="8.8.8.8"
-    test_dns "$SECONDARY_DNS_V4" || SECONDARY_DNS_V4="8.8.4.4"
-    if has_ipv6; then
-        test_dns "$PRIMARY_DNS_V6" || PRIMARY_DNS_V6=""
-        test_dns "$SECONDARY_DNS_V6" || SECONDARY_DNS_V6=""
     fi
     
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
@@ -564,11 +493,12 @@ configure_dns() {
         {
             echo "[Resolve]"
             echo "DNS=$PRIMARY_DNS_V4 $SECONDARY_DNS_V4"
-            has_ipv6 && [[ -n "$PRIMARY_DNS_V6" ]] && echo "FallbackDNS=$PRIMARY_DNS_V6 $SECONDARY_DNS_V6"
+            has_ipv6 && echo "FallbackDNS=$PRIMARY_DNS_V6 $SECONDARY_DNS_V6"
         } > /etc/systemd/resolved.conf.d/99-custom-dns.conf
         systemctl restart systemd-resolved
     else
         echo -e "${BLUE}配置 /etc/resolv.conf...${NC}"
+        # 改进：更安全的 resolv.conf 处理
         if [[ -L /etc/resolv.conf ]]; then
             echo -e "${YELLOW}[WARN] /etc/resolv.conf 是符号链接，配置可能不持久${NC}"
         fi
@@ -576,28 +506,22 @@ configure_dns() {
         {
             echo "nameserver $PRIMARY_DNS_V4"
             echo "nameserver $SECONDARY_DNS_V4"
-            has_ipv6 && [[ -n "$PRIMARY_DNS_V6" ]] && { echo "nameserver $PRIMARY_DNS_V6"; echo "nameserver $SECONDARY_DNS_V6"; }
+            has_ipv6 && { echo "nameserver $PRIMARY_DNS_V6"; echo "nameserver $SECONDARY_DNS_V6"; }
         } > /etc/resolv.conf
     fi
     echo -e "${GREEN}✅ DNS 配置完成${NC}"
-    show_progress
 }
 
 configure_fail2ban() {
     echo -e "\n${YELLOW}=============== 7. Fail2ban配置 ===============${NC}"
     
     local port_list="22"
-    if [[ -n "$FAIL2BAN_EXTRA_PORT" ]]; then
-        port_list=$(validate_ports "22,$FAIL2BAN_EXTRA_PORT") || { show_progress; return 1; }
+    if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ && "$FAIL2BAN_EXTRA_PORT" != "22" ]]; then
+        port_list="22,$FAIL2BAN_EXTRA_PORT"
     fi
     
     start_spinner "安装 Fail2ban... "
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1; then
-        stop_spinner
-        echo -e "${YELLOW}[WARN] Fail2ban 安装失败，继续执行其他步骤${NC}"
-        show_progress
-        return 0
-    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1 || { stop_spinner; echo -e "${RED}安装失败${NC}"; return 1; }
     stop_spinner
     
     echo -e "${BLUE}配置保护端口: $port_list${NC}"
@@ -615,7 +539,6 @@ ignoreip = 127.0.0.1/8
 EOF
     systemctl enable --now fail2ban >/dev/null 2>&1
     echo -e "${GREEN}✅ Fail2ban 已配置并启动${NC}"
-    show_progress
 }
 
 system_update() {
@@ -631,7 +554,6 @@ system_update() {
     stop_spinner
     
     echo -e "${GREEN}✅ 系统更新与清理完成${NC}"
-    show_progress
 }
 
 # ==============================================================================
@@ -643,10 +565,7 @@ main() {
     [[ $EUID -ne 0 ]] && { echo -e "${RED}需要 root 权限${NC}"; exit 1; }
     
     parse_args "$@"
-    
-    # 清理旧日志文件
-    clean_old_logs
-    
+
     echo -e "${CYAN}=====================================================${NC}"
     echo -e "${CYAN}             VPS 初始化配置预览${NC}"
     echo -e "${CYAN}=====================================================${NC}"
@@ -662,7 +581,6 @@ main() {
     echo -e "  BBR模式:         $BBR_MODE"
     echo -e "  DNS(v4):         $PRIMARY_DNS_V4, $SECONDARY_DNS_V4"
     has_ipv6 && echo -e "  DNS(v6):         $PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
-    echo -e "  日志保留天数:    $LOG_RETENTION_DAYS"
     
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         local ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
@@ -677,7 +595,7 @@ main() {
         [[ $REPLY =~ ^[Nn]$ ]] && { echo "已取消"; exit 0; }
     fi
     
-    LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S)-$$.log"
+    LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
     exec > >(tee -a "$LOG_FILE") 2>&1
     
     echo -e "${BLUE}[INFO] 开始执行配置... (日志: $LOG_FILE)${NC}"
@@ -700,10 +618,12 @@ main() {
     echo -e "  执行时间: ${SECONDS}秒"
     echo -e "  日志文件: ${LOG_FILE}"
     
+    # 【改进】统一重启提示逻辑
     if is_container; then
         echo -e "\n${BLUE}[INFO] 容器环境无需重启，配置已生效。${NC}"
     else
         echo -e "\n${BLUE}[INFO] 建议重启以确保所有设置生效。${NC}"
+        # 无论是否为非交互模式，都进行询问
         read -p "立即重启? [Y/n] " -r < /dev/tty
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             echo -e "${BLUE}[INFO] 重启中...${NC}"
