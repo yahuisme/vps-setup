@@ -72,11 +72,24 @@ has_ipv6() {
     ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'
 }
 
+# --- 修复后的 check_disk_space 函数 ---
 check_disk_space() {
-    local required_mb=$1 available_mb
-    available_mb=$(df / | awk 'NR==2 {print int($4/1024)}')
-    [[ $available_mb -lt $required_mb ]] && { echo -e "${RED}[ERROR] 磁盘空间不足: 需要${required_mb}MB，可用${available_mb}MB${NC}"; return 1; }
+    local required_mb=$1
+    local available_mb
+
+    available_mb=$(df -BM / | awk 'NR==2 {gsub(/M/,"",$4); print $4}' || echo 0)
+
+    if [[ "$available_mb" -eq 0 ]]; then
+        echo -e "${RED}[ERROR] 无法获取可用磁盘空间信息。${NC}"
+        return 1
+    fi
+
+    if [[ "$available_mb" -lt "$required_mb" ]]; then
+        echo -e "${RED}[ERROR] 磁盘空间不足: 需要${required_mb}MB，可用${available_mb}MB${NC}"
+        return 1
+    fi
 }
+# --- 修复结束 ---
 
 # 改进：更精确的容器环境检测
 is_container() {
@@ -193,7 +206,7 @@ ${BLUE}核心选项:${NC}
   --hostname <name>     设置新的主机名
   --timezone <tz>       设置时区 (默认: 自动检测)
   --swap <size_mb>      设置 Swap 大小，'auto'/'0'
-  --ip-dns <'主 备'>    设置 IPv4 DNS
+  --ip-dns <'主 备'>   设置 IPv4 DNS
   --ip6-dns <'主 备'>   设置 IPv6 DNS
 ${BLUE}BBR 选项:${NC}
   --bbr-optimized       启用动态优化 BBR
@@ -392,7 +405,7 @@ EOF
             echo -e "${GREEN}✅ 动态优化 BBR 已启用${NC}"
             return
         else
-             echo -e "${RED}内核版本过低，使用标准BBR${NC}"
+            echo -e "${RED}内核版本过低，使用标准BBR${NC}"
         fi
     fi
     
@@ -542,18 +555,18 @@ main() {
     elif [[ "$non_interactive" = true ]]; then hostname_display="自动设置 (基于公网IP)"
     else hostname_display="交互式设置"; fi
     
-    echo -e "  主机名:       $hostname_display"
-    echo -e "  时区:         $TIMEZONE"
-    echo -e "  Swap:         $SWAP_SIZE_MB"
-    echo -e "  BBR模式:      $BBR_MODE"
-    echo -e "  DNS(v4):      $PRIMARY_DNS_V4, $SECONDARY_DNS_V4"
-    has_ipv6 && echo -e "  DNS(v6):      $PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
+    echo -e "  主机名:          $hostname_display"
+    echo -e "  时区:            $TIMEZONE"
+    echo -e "  Swap:            $SWAP_SIZE_MB"
+    echo -e "  BBR模式:         $BBR_MODE"
+    echo -e "  DNS(v4):         $PRIMARY_DNS_V4, $SECONDARY_DNS_V4"
+    has_ipv6 && echo -e "  DNS(v6):         $PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
     
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         local ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
-        echo -e "  Fail2ban:     ${GREEN}启用 (端口: $ports)${NC}"
+        echo -e "  Fail2ban:        ${GREEN}启用 (端口: $ports)${NC}"
     else
-        echo -e "  Fail2ban:     ${RED}禁用${NC}"
+        echo -e "  Fail2ban:        ${RED}禁用${NC}"
     fi
     echo -e "${CYAN}=====================================================${NC}"
     
