@@ -419,13 +419,6 @@ configure_swap() {
     echo -e "\n${YELLOW}=============== 5. Swap配置 ===============${NC}"
     
     [[ "$SWAP_SIZE_MB" = "0" ]] && { echo -e "${BLUE}Swap已禁用${NC}"; return; }
-    [[ $(swapon --show) ]] && { echo -e "${BLUE}Swap已存在，跳过${NC}"; return; }
-    
-    # 改进：检查现有 swapfile
-    if [[ -f /swapfile ]]; then
-        echo -e "${BLUE}检测到现有 /swapfile，跳过创建${NC}"
-        return
-    fi
     
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
@@ -438,19 +431,46 @@ configure_swap() {
     
     check_disk_space $((swap_mb + 100)) || return 1
     
+    local current_swap_file="/swapfile"
+    
+    # 检查现有 swapfile 的大小
+    if [[ -f "$current_swap_file" ]]; then
+        local current_size_mb=$(du -m "$current_swap_file" | awk '{print $1}')
+        if [[ "$current_size_mb" -ne "$swap_mb" ]]; then
+            echo -e "${YELLOW}[WARN] 检测到现有 Swap 文件大小 ($current_size_mb MB) 与期望 ($swap_mb MB) 不符，正在重建...${NC}"
+            swapoff "$current_swap_file" >/dev/null 2>&1 || true
+            rm -f "$current_swap_file"
+        else
+            echo -e "${BLUE}检测到已存在大小合适的 Swap 文件，跳过创建。${NC}"
+            return
+        fi
+    fi
+    
     echo -e "${BLUE}正在创建 ${swap_mb}MB Swap...${NC}"
     
-    # 改进：使用 dd 确保创建非稀疏文件，更安全可靠
     start_spinner "创建 Swap 文件... "
-    dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none 2>/dev/null || {
+    local success=false
+    
+    # 优先使用 fallocate
+    if command -v fallocate &>/dev/null; then
+        fallocate -l "${swap_mb}M" "$current_swap_file" 2>/dev/null && success=true
+    fi
+    
+    # 如果 fallocate 失败或不存在，回退到 dd
+    if [[ "$success" = false ]]; then
+        dd if=/dev/zero of="$current_swap_file" bs=1M count="$swap_mb" status=none 2>/dev/null && success=true
+    fi
+    
+    if [[ "$success" = false ]]; then
         stop_spinner
         echo -e "${RED}[ERROR] Swap 文件创建失败${NC}"
         return 1
-    }
+    fi
+    
     stop_spinner
     
-    chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
-    grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    chmod 600 "$current_swap_file" && mkswap "$current_swap_file" >/dev/null && swapon "$current_swap_file"
+    grep -q "$current_swap_file" /etc/fstab || echo "$current_swap_file none swap sw 0 0" >> /etc/fstab
     echo -e "${GREEN}✅ ${swap_mb}MB Swap 已配置${NC}"
 }
 
