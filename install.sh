@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 6.8
+# 版本: 7.0
 # ------------------------------------------------------------------------------
 # 功能:
 # - 安装基础工具 (sudo, wget, zip, vim)
@@ -11,6 +11,7 @@
 # - 智能配置 BBR 加速 (标准或动态优化)
 # - 智能配置 Swap 内存 (自动或手动设置)
 # - 配置 DNS 服务器
+# - (交互式/非交互式) 自定义 SSH 端口和密码
 # - 保护 SSH 服务 (Fail2ban)
 # - 自动更新与清理系统
 # - 运行后进行配置验证
@@ -30,6 +31,10 @@ NEW_HOSTNAME=""
 BBR_MODE="default"
 ENABLE_FAIL2BAN=true
 FAIL2BAN_EXTRA_PORT=""
+# --- SSH 相关配置 ---
+NEW_SSH_PORT=""
+NEW_SSH_PASSWORD=""
+
 
 # --- 颜色和全局变量 ---
 readonly GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m'
@@ -191,6 +196,13 @@ run_verification() {
     for pkg in $INSTALL_PACKAGES; do ((total++)); dpkg -l "$pkg" >/dev/null 2>&1 && ((installed++)); done
     [[ $installed -eq $total ]] && record_verification "软件包" "PASS" "全部已安装 ($installed/$total)" || record_verification "软件包" "FAIL" "部分未安装 ($installed/$total)"
     
+    if [[ -n "$NEW_SSH_PORT" ]]; then
+        local current_port
+        current_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
+        [[ -z "$current_port" ]] && current_port="22" # Default if not explicitly set
+        verify_config "SSH 端口" "$NEW_SSH_PORT" "$current_port"
+    fi
+    
     [[ "$ENABLE_FAIL2BAN" = true ]] && {
         if systemctl is-active --quiet fail2ban 2>/dev/null; then
             local protected_ports=$(awk -F'=' '/^port/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' /etc/fail2ban/jail.local 2>/dev/null || echo "N/A")
@@ -226,10 +238,12 @@ ${BLUE}BBR 选项:${NC}
 ${BLUE}安全选项:${NC}
   --fail2ban [port]     (默认启用) 指定额外SSH保护端口
   --no-fail2ban         禁用 Fail2ban
+  --ssh-port <port>     预设新的SSH端口 (交互/非交互均可)
+  --ssh-password <pass> 预设root的SSH密码 (交互/非交互均可)
 ${BLUE}其他:${NC}
   -h, --help            显示帮助
   --non-interactive     非交互模式
-${GREEN}示例: bash $0 --no-fail2ban --swap 0${NC}
+${GREEN}示例: bash $0 --ssh-port 2222 --ssh-password 'YourPass'${NC}
 EOF
     exit 0
 }
@@ -251,6 +265,8 @@ parse_args() {
                 [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }
                 shift ;;
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
+            --ssh-port) NEW_SSH_PORT="$2"; shift 2 ;;
+            --ssh-password) NEW_SSH_PASSWORD="$2"; shift 2 ;;
             --non-interactive) non_interactive=true; shift ;;
             *) echo -e "${RED}未知选项: $1${NC}"; usage ;;
         esac
@@ -505,17 +521,81 @@ configure_dns() {
 }
 
 #-------------------------------------------------------------------------------
+# @description 配置SSH端口和密码 (交互式或非交互式)
+#-------------------------------------------------------------------------------
+configure_ssh() {
+    echo -e "\n${YELLOW}=============== 7. SSH 安全配置 ===============${NC}"
+    
+    # --- 交互式输入 (仅在交互模式且未通过flag设置时触发) ---
+    if [[ "$non_interactive" = false ]]; then
+        if [[ -z "$NEW_SSH_PORT" ]]; then
+            read -p "请输入新的SSH端口 (留空则不修改): " -r user_port < /dev/tty
+            NEW_SSH_PORT="$user_port"
+        fi
+        if [[ -z "$NEW_SSH_PASSWORD" ]]; then
+            read -p "请输入新的root密码 (留空则不修改): " -r user_pass < /dev/tty
+            NEW_SSH_PASSWORD="$user_pass"
+        fi
+    fi
+    
+    # --- 应用配置 ---
+    local ssh_config_changed=false
+
+    if [[ -n "$NEW_SSH_PORT" ]]; then
+        if [[ "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
+            echo -e "${BLUE}配置 SSH 端口为: $NEW_SSH_PORT...${NC}"
+            sed -i -E "s/^[#\s]*Port\s+[0-9]+$/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
+            if ! grep -qE "^\s*Port\s+" /etc/ssh/sshd_config; then
+                echo "Port $NEW_SSH_PORT" >> /etc/ssh/sshd_config
+            fi
+            ssh_config_changed=true
+            echo -e "${GREEN}✅ SSH 端口已设置${NC}"
+        else
+            echo -e "${RED}[ERROR] SSH 端口 '$NEW_SSH_PORT' 无效，跳过配置。${NC}"
+            NEW_SSH_PORT="" # 重置无效端口以防止后续逻辑出错
+        fi
+    else
+        echo -e "${BLUE}[INFO] 未指定新的 SSH 端口，跳过配置。${NC}"
+    fi
+
+    if [[ -n "$NEW_SSH_PASSWORD" ]]; then
+        echo -e "${BLUE}设置 root SSH 密码...${NC}"
+        echo "root:$NEW_SSH_PASSWORD" | chpasswd
+        echo -e "${GREEN}✅ root 密码已设置${NC}"
+    else
+        echo -e "${BLUE}[INFO] 未指定新的 SSH 密码，跳过配置。${NC}"
+    fi
+
+    if [[ "$ssh_config_changed" = true ]]; then
+        start_spinner "重启 SSH 服务... "
+        systemctl restart sshd
+        stop_spinner
+        echo -e "${YELLOW}[WARN] SSH 端口已更改为 $NEW_SSH_PORT，请使用新端口重新连接！${NC}"
+    fi
+}
+
+#-------------------------------------------------------------------------------
 # @description 配置Fail2ban以保护SSH服务
 #-------------------------------------------------------------------------------
 configure_fail2ban() {
-    echo -e "\n${YELLOW}=============== 7. Fail2ban配置 ===============${NC}"
-    local port_list="22"
-    if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ && "$FAIL2BAN_EXTRA_PORT" != "22" ]]; then
-        port_list="22,$FAIL2BAN_EXTRA_PORT"
+    echo -e "\n${YELLOW}=============== 8. Fail2ban配置 ===============${NC}"
+    
+    # 智能决定主要保护的SSH端口
+    local primary_ssh_port="22"
+    if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
+        primary_ssh_port="$NEW_SSH_PORT"
     fi
+    
+    local port_list="$primary_ssh_port"
+    # 如果指定了额外的端口且不与主端口重复，则添加
+    if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ && "$FAIL2BAN_EXTRA_PORT" != "$primary_ssh_port" ]]; then
+        port_list="$primary_ssh_port,$FAIL2BAN_EXTRA_PORT"
+    fi
+
     start_spinner "安装 Fail2ban... "
     DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1 || { stop_spinner; echo -e "${RED}安装失败${NC}"; return 1; }
     stop_spinner
+    
     echo -e "${BLUE}配置保护端口: $port_list${NC}"
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
@@ -537,7 +617,7 @@ EOF
 # @description 更新系统软件包并清理缓存
 #-------------------------------------------------------------------------------
 system_update() {
-    echo -e "\n${YELLOW}=============== 8. 系统更新与清理 ===============${NC}"
+    echo -e "\n${YELLOW}=============== 9. 系统更新与清理 ===============${NC}"
     start_spinner "系统升级... "
     DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y \
         -o Dpkg::Options::="--force-confold" >/dev/null 2>&1
@@ -559,7 +639,7 @@ main() {
     parse_args "$@"
 
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${CYAN}              VPS 初始化配置预览                       ${NC}"
+    echo -e "${CYAN}           VPS 初始化配置预览                      ${NC}"
     echo -e "${CYAN}=====================================================${NC}"
     
     local hostname_display
@@ -581,6 +661,14 @@ main() {
     else
         echo -e "  Fail2ban: ${RED}禁用${NC}"
     fi
+
+    # 仅显示通过 flag 预设的 SSH 配置
+    if [[ -n "$NEW_SSH_PORT" ]]; then
+         echo -e "  SSH端口: ${YELLOW}${NEW_SSH_PORT} (预设)${NC}"
+    fi
+    if [[ -n "$NEW_SSH_PASSWORD" ]]; then
+         echo -e "  SSH密码: ${YELLOW}******** (预设)${NC}"
+    fi
     echo -e "${CYAN}=====================================================${NC}"
     
     if [[ "$non_interactive" = false ]]; then
@@ -601,6 +689,7 @@ main() {
     configure_bbr
     configure_swap
     configure_dns
+    configure_ssh # 处理交互式及非交互式SSH配置
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
     
@@ -611,16 +700,24 @@ main() {
     echo -e "  执行时间: ${SECONDS}秒"
     echo -e "  日志文件: ${LOG_FILE}"
     
+    if [[ -n "$NEW_SSH_PORT" ]]; then
+        echo -e "\n${YELLOW}重要提示: SSH端口已更改为 $NEW_SSH_PORT。您需要使用新端口重新连接。${NC}"
+    fi
+
     if is_container; then
         echo -e "\n${BLUE}[INFO] 容器环境无需重启，配置已生效。${NC}"
     else
         echo -e "\n${BLUE}[INFO] 建议重启以确保所有设置生效。${NC}"
-        read -p "立即重启? [Y/n] " -r < /dev/tty
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            echo -e "${BLUE}[INFO] 重启中...${NC}"
-            reboot
+        if [[ "$non_interactive" = false ]]; then
+            read -p "立即重启? [Y/n] " -r < /dev/tty
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                echo -e "${BLUE}[INFO] 重启中...${NC}"
+                reboot
+            else
+                echo -e "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
+            fi
         else
-            echo -e "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
+            echo -e "${YELLOW}非交互模式，跳过自动重启。请在确认连接正常后手动重启。${NC}"
         fi
     fi
 }
