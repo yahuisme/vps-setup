@@ -563,18 +563,19 @@ main() {
     elif [[ "$non_interactive" = true ]]; then hostname_display="自动设置 (基于公网IP)"
     else hostname_display="交互式设置"; fi
     
-    printf "  %-18s %s\n" "主机名:" "$hostname_display"
-    printf "  %-18s %s\n" "时区:" "$TIMEZONE"
-    printf "  %-18s %s\n" "Swap:" "$SWAP_SIZE_MB"
-    printf "  %-18s %s\n" "BBR模式:" "$BBR_MODE"
-    printf "  %-18s %s\n" "DNS(v4):" "$PRIMARY_DNS_V4, $SECONDARY_DNS_V4"
-    has_ipv6 && printf "  %-18s %s\n" "DNS(v6):" "$PRIMARY_DNS_V6, $SECONDARY_DNS_V6"
+    # --- 使用 echo -e 和手动空格进行精确对齐 ---
+    echo -e "  主机名:          ${hostname_display}"
+    echo -e "  时区:              ${TIMEZONE}"
+    echo -e "  Swap:              ${SWAP_SIZE_MB}"
+    echo -e "  BBR模式:         ${BBR_MODE}"
+    echo -e "  DNS(v4):           ${PRIMARY_DNS_V4}, ${SECONDARY_DNS_V4}"
+    has_ipv6 && echo -e "  DNS(v6):           ${PRIMARY_DNS_V6}, ${SECONDARY_DNS_V6}"
     
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         local ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
-        printf "  %-18s %s\n" "Fail2ban:" "${GREEN}启用 (端口: $ports)${NC}"
+        echo -e "  Fail2ban:          ${GREEN}启用 (端口: $ports)${NC}"
     else
-        printf "  %-18s %s\n" "Fail2ban:" "${RED}禁用${NC}"
+        echo -e "  Fail2ban:          ${RED}禁用${NC}"
     fi
     echo -e "${CYAN}=====================================================${NC}"
     
