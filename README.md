@@ -24,29 +24,21 @@ apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahui
 3. 自动检测并设置 VPS 所在时区
 4. 默认开启 BBR
 5. 自动配置 Swap
-6. 自动配置 DNS（ipv4 1.1.1.1 8.8.8.8 ipv6 2606:4700:4700::1111 2001:4860:4860::8888）
+6. 自动配置 DNS（ipv4 1.1.1.1 8.8.8.8 ; ipv6 2606:4700:4700::1111 2001:4860:4860::8888）
 7. 自动安装并配置 Fail2ban，默认防护 22 端口
 8. 自动优化 vim 编辑器配置
 9. 系统更新及清理
 
 # 无交互自定义脚本
 ```
-apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh) \
---hostname "hostname" \
---timezone "Asia/Hong_Kong" \
---swap "1024" \
---bbr-optimized \
---ip-dns "94.140.14.14 94.140.15.15" \
---ip6-dns "2a10:50c0::ad1:ff 2a10:50c0::ad2:ff" \
---fail2ban 12345 \
---non-interactive
+apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap "1024" --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --fail2ban 12345 --non-interactive
 ```
 运行无交互自定义脚本后依次配置：
 1. 自动检查并安装 sudo wget zip vim curl 常用应用
 2. 自动配置自定义主机名
 3. 自动配置自定义时区
 4. 自动配置自定义 Swap
-5. 默认开启 BBR 并根据 VPS 配置只能优化 TCP 网络参数
+5. 默认开启 BBR 并根据 VPS 配置智能优化 TCP 网络参数
 6. 自动配置自定义 DNS
 7. 自动安装并配置 Fail2ban，防护 22 端口和自定义端口
 8. 自动优化 vim 编辑器配置
