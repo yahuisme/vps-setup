@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.2
+# 版本: 7.3
 # ------------------------------------------------------------------------------
 # 功能:
 # - 安装基础工具 (sudo, wget, zip, vim)
@@ -596,8 +596,8 @@ configure_fail2ban() {
         port_list_array+=("$FAIL2BAN_EXTRA_PORT")
     fi
 
-    # 4. (核心改动) 在特定非交互场景下，自动检测现有SSH端口
-    if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -z "$FAIL2BAN_EXTRA_PORT" ]]; then
+    # 4. 在特定非交互场景下，自动检测现有SSH端口 (增加文件存在性检查)
+    if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -z "$FAIL2BAN_EXTRA_PORT" && -f /etc/ssh/sshd_config ]]; then
         local detected_port
         # 从sshd_config文件中提取最后一个有效的Port设置
         detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
@@ -711,6 +711,13 @@ main() {
     configure_bbr
     configure_swap
     configure_dns
+    # 在执行SSH配置前，确保openssh-server已安装
+    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
+        if ! dpkg -l openssh-server >/dev/null 2>&1; then
+            echo -e "${YELLOW}[WARN] 检测到您想配置SSH，但未安装openssh-server，正在自动安装...${NC}"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1
+        fi
+    fi
     configure_ssh # 处理交互式及非交互式SSH配置
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
