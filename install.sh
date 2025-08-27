@@ -322,7 +322,11 @@ set mouse=a
 set nobackup
 set noswapfile
 EOF
-        [[ -d /root ]] && echo "source /etc/vim/vimrc.local" >> /root/.vimrc 2>/dev/null || true
+        # --- [优化点: 确保 Vim 配置不重复添加] ---
+        if [[ -d /root ]]; then
+            ! grep -Fxq "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && \
+            echo "source /etc/vim/vimrc.local" >> /root/.vimrc
+        fi
     fi
     echo -e "${GREEN}✅ 软件包安装与配置完成${NC}"
 }
@@ -555,7 +559,7 @@ main() {
     parse_args "$@"
 
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${CYAN}             VPS 初始化配置预览                      ${NC}"
+    echo -e "${CYAN}              VPS 初始化配置预览                       ${NC}"
     echo -e "${CYAN}=====================================================${NC}"
     
     local hostname_display
