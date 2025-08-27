@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 6.6
+# 版本: 6.8
 # ------------------------------------------------------------------------------
 # 功能:
 # - 安装基础工具 (sudo, wget, zip, vim)
@@ -611,14 +611,12 @@ main() {
         echo -e "\n${BLUE}[INFO] 容器环境无需重启，配置已生效。${NC}"
     else
         echo -e "\n${BLUE}[INFO] 建议重启以确保所有设置生效。${NC}"
-        if [[ "$non_interactive" = false ]]; then
-            read -p "立即重启? [Y/n] " -r < /dev/tty
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "${BLUE}[INFO] 重启中...${NC}"
-                reboot
-            else
-                echo -e "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
-            fi
+        read -p "立即重启? [Y/n] " -r < /dev/tty
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            echo -e "${BLUE}[INFO] 重启中...${NC}"
+            reboot
+        else
+            echo -e "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
         fi
     fi
 }
