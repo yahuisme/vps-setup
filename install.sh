@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.0
+# 版本: 7.1
 # ------------------------------------------------------------------------------
 # 功能:
 # - 安装基础工具 (sudo, wget, zip, vim)
@@ -12,7 +12,7 @@
 # - 智能配置 Swap 内存 (自动或手动设置)
 # - 配置 DNS 服务器
 # - (交互式/非交互式) 自定义 SSH 端口和密码
-# - 保护 SSH 服务 (Fail2ban)
+# - 保护 SSH 服务 (Fail2ban, 智能保护新旧端口)
 # - 自动更新与清理系统
 # - 运行后进行配置验证
 # - 支持非交互式自动化部署
@@ -580,23 +580,31 @@ configure_ssh() {
 configure_fail2ban() {
     echo -e "\n${YELLOW}=============== 8. Fail2ban配置 ===============${NC}"
     
-    # 智能决定主要保护的SSH端口
-    local primary_ssh_port="22"
+    # --- 构建要保护的端口列表 ---
+    local port_list_array=()
+    
+    # 1. 始终包含默认的22端口
+    port_list_array+=("22")
+    
+    # 2. 如果设置了新的SSH端口，则添加
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
-        primary_ssh_port="$NEW_SSH_PORT"
+        port_list_array+=("$NEW_SSH_PORT")
     fi
     
-    local port_list="$primary_ssh_port"
-    # 如果指定了额外的端口且不与主端口重复，则添加
-    if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ && "$FAIL2BAN_EXTRA_PORT" != "$primary_ssh_port" ]]; then
-        port_list="$primary_ssh_port,$FAIL2BAN_EXTRA_PORT"
+    # 3. 如果设置了额外的Fail2ban端口，则添加
+    if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]]; then
+        port_list_array+=("$FAIL2BAN_EXTRA_PORT")
     fi
+
+    # 对端口列表进行去重和格式化
+    local port_list
+    port_list=$(printf "%s\n" "${port_list_array[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
 
     start_spinner "安装 Fail2ban... "
     DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1 || { stop_spinner; echo -e "${RED}安装失败${NC}"; return 1; }
     stop_spinner
     
-    echo -e "${BLUE}配置保护端口: $port_list${NC}"
+    echo -e "${BLUE}配置 Fail2ban 保护端口: $port_list${NC}"
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime = -1
@@ -656,8 +664,9 @@ main() {
     has_ipv6 && echo -e "  DNS(v6): ${PRIMARY_DNS_V6}, ${SECONDARY_DNS_V6}"
     
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-        local ports="22${FAIL2BAN_EXTRA_PORT:+,${FAIL2BAN_EXTRA_PORT}}"
-        echo -e "  Fail2ban: ${GREEN}启用 (端口: $ports)${NC}"
+        local ports_preview="22"
+        [[ -n "$FAIL2BAN_EXTRA_PORT" ]] && ports_preview+=",${FAIL2BAN_EXTRA_PORT}"
+        echo -e "  Fail2ban: ${GREEN}启用 (基础端口: $ports_preview)${NC}"
     else
         echo -e "  Fail2ban: ${RED}禁用${NC}"
     fi
