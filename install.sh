@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.1
+# 版本: 7.2
 # ------------------------------------------------------------------------------
 # 功能:
 # - 安装基础工具 (sudo, wget, zip, vim)
@@ -586,14 +586,27 @@ configure_fail2ban() {
     # 1. 始终包含默认的22端口
     port_list_array+=("22")
     
-    # 2. 如果设置了新的SSH端口，则添加
+    # 2. 添加由参数或交互式输入指定的新SSH端口
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
         port_list_array+=("$NEW_SSH_PORT")
     fi
     
-    # 3. 如果设置了额外的Fail2ban端口，则添加
+    # 3. 添加由 --fail2ban 参数指定的额外端口
     if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]]; then
         port_list_array+=("$FAIL2BAN_EXTRA_PORT")
+    fi
+
+    # 4. (核心改动) 在特定非交互场景下，自动检测现有SSH端口
+    if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -z "$FAIL2BAN_EXTRA_PORT" ]]; then
+        local detected_port
+        # 从sshd_config文件中提取最后一个有效的Port设置
+        detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
+        
+        # 如果检测到端口，且该端口不是22，则加入保护列表
+        if [[ -n "$detected_port" && "$detected_port" -ne 22 ]]; then
+            echo -e "${BLUE}[INFO] 自动检测到当前SSH端口: $detected_port, 已加入Fail2ban保护列表${NC}"
+            port_list_array+=("$detected_port")
+        fi
     fi
 
     # 对端口列表进行去重和格式化
