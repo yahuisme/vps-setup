@@ -132,6 +132,7 @@ record_verification() {
     local component="$1" status="$2" message="$3"
     if [[ "$status" = "PASS" ]]; then
         echo -e "    ${GREEN}✓${NC} ${component}: ${message}"
+        ((VERIFICATION_PASSED++))
     elif [[ "$status" = "WARN" ]]; then
         echo -e "    ${YELLOW}⚠️${NC} ${component}: ${message}"
     else
