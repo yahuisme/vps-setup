@@ -2,11 +2,10 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.5
+# 版本: 7.6
 # ------------------------------------------------------------------------------
-# 更新日志 (v7.5):
-# - [策略] 根据用户要求，将 Fail2ban 封禁策略恢复为默认的永久封禁 (-1)。
-# - [修复] 修正了因日志重定向导致加载动画(spinner)无法显示的问题，提升了交互体验。
+# 更新日志 (v7.6):
+# - [优化] 调整了加载动画显示逻辑，使其在非交互模式下的终端中也能正常显示。
 # ==============================================================================
 set -euo pipefail
 
@@ -54,9 +53,8 @@ handle_error() {
 
 # @description 启动加载动画 (强制输出到 TTY)
 start_spinner() {
-    [[ "$non_interactive" = true ]] && return
-    # 检查 /dev/tty 是否可写，确保在非标准环境下不会报错
-    if [[ ! -w /dev/tty ]]; then return; fi
+    # 动画只在交互式终端中显示
+    if [[ ! -t 1 ]]; then return; fi
     
     echo -n -e "${CYAN}${1:-}${NC}" > /dev/tty
     ( while :; do for c in '/' '-' '\' '|'; do echo -ne "\b$c"; sleep 0.1; done; done ) > /dev/tty &
@@ -71,7 +69,8 @@ stop_spinner() {
         wait "$spinner_pid" 2>/dev/null || true
         spinner_pid=0
     fi
-    if [[ ! -w /dev/tty ]]; then return; fi
+    # 动画只在交互式终端中显示
+    if [[ ! -t 1 ]]; then return; fi
     tput cnorm > /dev/tty # 恢复光标
     echo -e "\b${GREEN}✔${NC}" > /dev/tty
 }
