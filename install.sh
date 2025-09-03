@@ -2,20 +2,11 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.3.1
+# 版本: 7.5
 # ------------------------------------------------------------------------------
-# 功能:
-# - 安装基础工具 (sudo, wget, zip, vim)
-# - 自动或手动配置主机名
-# - 设置系统时区
-# - 智能配置 BBR 加速 (标准或动态优化)
-# - 智能配置 Swap 内存 (自动或手动设置)
-# - 配置 DNS 服务器
-# - 自定义 SSH 端口和密码
-# - 保护 SSH 服务 (Fail2ban, 智能保护新旧端口)
-# - 自动更新与清理系统
-# - 运行后进行配置验证
-# - 支持非交互式自动化部署
+# 更新日志 (v7.5):
+# - [策略] 根据用户要求，将 Fail2ban 封禁策略恢复为默认的永久封禁 (-1)。
+# - [修复] 修正了因日志重定向导致加载动画(spinner)无法显示的问题，提升了交互体验。
 # ==============================================================================
 set -euo pipefail
 
@@ -53,27 +44,36 @@ VERIFICATION_FAILED=0
 # @description 错误处理函数，在脚本出错时触发
 handle_error() {
     local exit_code=$? line_number=$1
-    tput cnorm # 恢复光标
+    # 确保光标恢复操作直接写入终端
+    tput cnorm > /dev/tty
     echo -e "\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     [[ -n "$LOG_FILE" ]] && echo -e "${RED}完整日志: ${LOG_FILE}${NC}"
     [[ $spinner_pid -ne 0 ]] && kill "$spinner_pid" 2>/dev/null # 停止加载动画
     exit "$exit_code"
 }
 
-# @description 启动加载动画
+# @description 启动加载动画 (强制输出到 TTY)
 start_spinner() {
-    [[ ! -t 1 || "$non_interactive" = true ]] && return
-    echo -n -e "${CYAN}${1:-}${NC}"
-    ( while :; do for c in '/' '-' '\' '|'; do echo -ne "\b$c"; sleep 0.1; done; done ) &
+    [[ "$non_interactive" = true ]] && return
+    # 检查 /dev/tty 是否可写，确保在非标准环境下不会报错
+    if [[ ! -w /dev/tty ]]; then return; fi
+    
+    echo -n -e "${CYAN}${1:-}${NC}" > /dev/tty
+    ( while :; do for c in '/' '-' '\' '|'; do echo -ne "\b$c"; sleep 0.1; done; done ) > /dev/tty &
     spinner_pid=$!
-    tput civis # 隐藏光标
+    tput civis > /dev/tty # 隐藏光标
 }
 
-# @description 停止加载动画
+# @description 停止加载动画 (强制输出到 TTY)
 stop_spinner() {
-    [[ $spinner_pid -ne 0 ]] && { kill "$spinner_pid" 2>/dev/null; wait "$spinner_pid" 2>/dev/null || true; spinner_pid=0; }
-    tput cnorm # 恢复光标
-    echo -e "\b${GREEN}✔${NC}"
+    if [[ $spinner_pid -ne 0 ]]; then
+        kill "$spinner_pid" 2>/dev/null
+        wait "$spinner_pid" 2>/dev/null || true
+        spinner_pid=0
+    fi
+    if [[ ! -w /dev/tty ]]; then return; fi
+    tput cnorm > /dev/tty # 恢复光标
+    echo -e "\b${GREEN}✔${NC}" > /dev/tty
 }
 
 # @description 获取公共 IPv4 地址
@@ -338,7 +338,6 @@ set mouse=a
 set nobackup
 set noswapfile
 EOF
-        # --- [优化点: 确保 Vim 配置不重复添加] ---
         if [[ -d /root ]]; then
             ! grep -Fxq "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && \
             echo "source /etc/vim/vimrc.local" >> /root/.vimrc
@@ -468,20 +467,29 @@ configure_swap() {
         fi
     fi
     echo -e "${BLUE}正在创建 ${swap_mb}MB Swap...${NC}"
-    start_spinner "创建 Swap 文件... "
+    
     local success=false
+    start_spinner "创建 Swap 文件... "
     if command -v fallocate &>/dev/null; then
         fallocate -l "${swap_mb}M" "$current_swap_file" 2>/dev/null && success=true
     fi
-    if [[ "$success" = false ]]; then
-        dd if=/dev/zero of="$current_swap_file" bs=1M count="$swap_mb" status=none 2>/dev/null && success=true
-    fi
+    
     if [[ "$success" = false ]]; then
         stop_spinner
+        echo -e "${BLUE}[INFO] fallocate不可用，使用dd创建 (这可能需要一些时间)...${NC}"
+        if dd if=/dev/zero of="$current_swap_file" bs=1M count="$swap_mb" status=progress; then
+            success=true
+        fi
+        echo ""
+    else
+        stop_spinner
+    fi
+
+    if [[ "$success" = false ]]; then
         echo -e "${RED}[ERROR] Swap 文件创建失败${NC}"
         return 1
     fi
-    stop_spinner
+
     chmod 600 "$current_swap_file" && mkswap "$current_swap_file" >/dev/null && swapon "$current_swap_file"
     grep -q "$current_swap_file" /etc/fstab || echo "$current_swap_file none swap sw 0 0" >> /etc/fstab
     echo -e "${GREEN}✅ ${swap_mb}MB Swap 已配置${NC}"
@@ -528,7 +536,6 @@ configure_dns() {
 configure_ssh() {
     echo -e "\n${YELLOW}=============== 7. SSH 安全配置 ===============${NC}"
     
-    # --- 交互式输入 (仅在交互模式且未通过flag设置时触发) ---
     if [[ "$non_interactive" = false ]]; then
         if [[ -z "$NEW_SSH_PORT" ]]; then
             read -p "请输入新的SSH端口 (留空则不修改): " -r user_port < /dev/tty
@@ -540,21 +547,18 @@ configure_ssh() {
         fi
     fi
     
-    # --- 应用配置 ---
     local ssh_config_changed=false
-
     if [[ -n "$NEW_SSH_PORT" ]]; then
         if [[ "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
             echo -e "${BLUE}配置 SSH 端口为: ${NEW_SSH_PORT}...${NC}"
-            sed -i -E "s/^[#\s]*Port\s+[0-9]+$/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
-            if ! grep -qE "^\s*Port\s+" /etc/ssh/sshd_config; then
-                echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
-            fi
+            sed -i -E 's/^[#\s]*Port\s+[0-9]+$/# &/' /etc/ssh/sshd_config
+            echo "" >> /etc/ssh/sshd_config
+            echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
             ssh_config_changed=true
             echo -e "${GREEN}✅ SSH 端口已设置${NC}"
         else
             echo -e "${RED}[ERROR] SSH 端口 '${NEW_SSH_PORT}' 无效，跳过配置。${NC}"
-            NEW_SSH_PORT="" # 重置无效端口以防止后续逻辑出错
+            NEW_SSH_PORT=""
         fi
     else
         echo -e "${BLUE}[INFO] 未指定新的 SSH 端口，跳过配置。${NC}"
@@ -582,36 +586,27 @@ configure_ssh() {
 configure_fail2ban() {
     echo -e "\n${YELLOW}=============== 8. Fail2ban配置 ===============${NC}"
     
-    # --- 构建要保护的端口列表 ---
     local port_list_array=()
-    
-    # 1. 始终包含默认的22端口
     port_list_array+=("22")
     
-    # 2. 添加由参数或交互式输入指定的新SSH端口
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
         port_list_array+=("$NEW_SSH_PORT")
     fi
     
-    # 3. 添加由 --fail2ban 参数指定的额外端口
     if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]]; then
         port_list_array+=("$FAIL2BAN_EXTRA_PORT")
     fi
 
-    # 4. 在特定非交互场景下，自动检测现有SSH端口 (增加文件存在性检查)
     if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -z "$FAIL2BAN_EXTRA_PORT" && -f /etc/ssh/sshd_config ]]; then
         local detected_port
-        # 从sshd_config文件中提取最后一个有效的Port设置
         detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
         
-        # 如果检测到端口，且该端口不是22，则加入保护列表
         if [[ -n "$detected_port" && "$detected_port" -ne 22 ]]; then
             echo -e "${BLUE}[INFO] 自动检测到当前SSH端口: ${detected_port}, 已加入Fail2ban保护列表${NC}"
             port_list_array+=("$detected_port")
         fi
     fi
 
-    # 对端口列表进行去重和格式化
     local port_list
     port_list=$(printf "%s\n" "${port_list_array[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
 
@@ -662,7 +657,7 @@ main() {
     parse_args "$@"
 
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${CYAN}                  VPS 初始化配置预览                   ${NC}"
+    echo -e "${CYAN}              VPS 初始化配置预览             ${NC}"
     echo -e "${CYAN}=====================================================${NC}"
     
     local hostname_display
@@ -670,7 +665,6 @@ main() {
     elif [[ "$non_interactive" = true ]]; then hostname_display="自动设置 (基于公网IP)"
     else hostname_display="交互式设置"; fi
     
-    # --- 使用 echo -e 和空格进行对齐 ---
     echo -e "  主机名: ${hostname_display}"
     echo -e "  时区: ${TIMEZONE}"
     echo -e "  Swap: ${SWAP_SIZE_MB}"
@@ -686,7 +680,6 @@ main() {
         echo -e "  Fail2ban: ${RED}禁用${NC}"
     fi
 
-    # 仅显示通过 flag 预设的 SSH 配置
     if [[ -n "$NEW_SSH_PORT" ]]; then
          echo -e "  SSH端口: ${YELLOW}${NEW_SSH_PORT} (预设)${NC}"
     fi
@@ -713,14 +706,13 @@ main() {
     configure_bbr
     configure_swap
     configure_dns
-    # 在执行SSH配置前，确保openssh-server已安装
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
         if ! dpkg -l openssh-server >/dev/null 2>&1; then
             echo -e "${YELLOW}[WARN] 检测到您想配置SSH，但未安装openssh-server，正在自动安装...${NC}"
             DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1
         fi
     fi
-    configure_ssh # 处理交互式及非交互式SSH配置
+    configure_ssh
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
     
