@@ -1,7 +1,7 @@
 # debian-setup
-提升 Debian 系原版系统开箱使用便捷性设置脚本
+提升 VPS 原版系统开箱使用便捷性设置脚本
 
-脚本支持 Debian 10 -1 3 和 Ubuntu 20.04 - 24.04
+脚本支持 Debian 10 -13 和 Ubuntu 20.04 - 24.04
 
 ## 功能特点
 - 常用软件包自动安装
@@ -16,7 +16,7 @@
 
 ## 一键脚本
 ```
-apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh)
+apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh)
 ```
 运行一键脚本后依次配置：
 1. 自动检查并安装 sudo wget zip vim 常用应用
@@ -31,7 +31,7 @@ apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahui
 
 ## 无交互自定义脚本
 ```
-apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.com/yahuisme/debian-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap "1024" --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'woshimima' --fail2ban 12345 --non-interactive
+apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap "1024" --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'woshimima' --fail2ban 12345 --non-interactive
 ```
 运行无交互自定义脚本后依次配置：
 1. 自动检查并安装 sudo wget zip vim 常用应用
