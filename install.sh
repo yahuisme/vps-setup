@@ -2,11 +2,11 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.8
+# 版本: 7.9
 # ------------------------------------------------------------------------------
-# 更新日志 (v7.8):
-# - [优化] 采纳用户建议，调整日志策略。脚本的提示信息(如[INFO])将只显示在屏幕上，
-#   日志文件将只记录后台系统命令的原始输出，使其更加简洁。
+# 更新日志 (v7.9):
+# - [修复] 为 chpasswd 命令添加日志重定向，确保日志完整性。
+# - [优化] 增强了非交互模式下自动设置主机名的逻辑，处理了无法获取IP的边缘情况。
 # ==============================================================================
 set -euo pipefail
 
@@ -368,11 +368,16 @@ configure_hostname() {
             log "${RED}[ERROR] 主机名格式不正确，保持不变${NC}"
             NEW_HOSTNAME=""
         fi
-    elif [[ "$non_interactive" = "true" && -n "$(get_public_ipv4)" ]]; then
-        final_hostname="$(get_public_ipv4 | tr '.' '-')"
-        hostnamectl set-hostname "$final_hostname" >> "$LOG_FILE" 2>&1
-        NEW_HOSTNAME="$final_hostname"
-        log "${GREEN}自动设置主机名: ${final_hostname}${NC}"
+    elif [[ "$non_interactive" = "true" ]]; then
+        local auto_ip
+        if auto_ip=$(get_public_ipv4); then
+            final_hostname=$(echo "$auto_ip" | tr '.' '-')
+            hostnamectl set-hostname "$final_hostname" >> "$LOG_FILE" 2>&1
+            NEW_HOSTNAME="$final_hostname"
+            log "${GREEN}自动设置主机名: ${final_hostname}${NC}"
+        else
+            log "${YELLOW}[WARN] 非交互模式下无法获取公网IP，跳过自动设置主机名。${NC}"
+        fi
     elif [[ "$non_interactive" = "false" ]]; then
         read -p "修改主机名? [y/N] " -r < /dev/tty
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
@@ -572,7 +577,7 @@ configure_ssh() {
 
     if [[ -n "$NEW_SSH_PASSWORD" ]]; then
         log "${BLUE}设置 root SSH 密码...${NC}"
-        echo "root:${NEW_SSH_PASSWORD}" | chpasswd
+        echo "root:${NEW_SSH_PASSWORD}" | chpasswd >> "$LOG_FILE" 2>&1
         log "${GREEN}✅ root 密码已设置${NC}"
     else
         log "${BLUE}[INFO] 未指定新的 SSH 密码，跳过配置。${NC}"
@@ -662,7 +667,7 @@ main() {
     
     parse_args "$@"
 
-    # 预览信息只输出到屏幕，不写入日志
+    # 预览信息只输出到屏幕(stderr)，不写入日志
     {
         echo -e "${CYAN}=====================================================${NC}"
         echo -e "${CYAN}              VPS 初始化配置预览             ${NC}"
