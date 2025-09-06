@@ -1,4 +1,4 @@
-# debian-setup
+# vps-setup
 提升 VPS 原版系统开箱使用便捷性设置脚本
 
 脚本支持 Debian 10 -13 和 Ubuntu 20.04 - 24.04
@@ -10,6 +10,7 @@
 - BBR 自动开启
 - Swap 自动配置
 - DNS 自动配置
+- ssh 端口和密码配置
 - Fail2ban 自动配置
 - vim 编辑器优化配置
 - 系统更新和清理
@@ -25,9 +26,10 @@ apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahui
 4. 默认开启 BBR
 5. 自动配置 Swap
 6. 自动配置 DNS（默认 ipv4 1.1.1.1 8.8.8.8 ; ipv6 2606:4700:4700::1111 2001:4860:4860::8888）
-7. 自动安装并配置 Fail2ban，默认防护 22 和设置的其它 ssh 端口
-8. 自动优化 vim 编辑器配置
-9. 系统更新及清理
+7. 询问是否修改 ssh 端口和密码
+8. 自动安装并配置 Fail2ban，默认防护 22 和设置的其它 ssh 端口
+9. 自动优化 vim 编辑器配置
+10. 系统更新及清理
 
 ## 无交互自定义脚本
 ```
