@@ -4,9 +4,13 @@
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
 # 版本: 7.9
 # ------------------------------------------------------------------------------
-# 更新日志 (v7.9):
-# - [修复] 为 chpasswd 命令添加日志重定向，确保日志完整性。
-# - [优化] 增强了非交互模式下自动设置主机名的逻辑，处理了无法获取IP的边缘情况。
+# 改进日志:
+# - [安全] 加强权限验证
+# - [优化] BBR配置更加保守和自适应
+# - [增强] DNS配置警告优化  
+# - [性能] Swap创建进度显示
+# - [完善] 验证函数精确度提升
+# - [简化] 移除过度复杂功能，保持核心改进
 # ==============================================================================
 set -euo pipefail
 
@@ -26,7 +30,6 @@ FAIL2BAN_EXTRA_PORT=""
 NEW_SSH_PORT=""
 NEW_SSH_PASSWORD=""
 
-
 # --- 颜色和全局变量 ---
 readonly GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m' CYAN='\033[0;36m' NC='\033[0m'
@@ -36,30 +39,26 @@ spinner_pid=0
 LOG_FILE=""
 VERIFICATION_PASSED=0
 VERIFICATION_FAILED=0
+VERIFICATION_WARNINGS=0
 
 # ==============================================================================
 # --- 核心辅助函数 ---
 # ==============================================================================
 
-# @description 将信息输出到屏幕
 log() {
     echo -e "$1"
 }
 
-# @description 错误处理函数，在脚本出错时触发
 handle_error() {
     local exit_code=$? line_number=$1
-    tput cnorm # 恢复光标
-    
+    tput cnorm
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
-    echo -e "$error_message" # 输出到屏幕
-    [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE" # 写入日志
-
+    echo -e "$error_message"
+    [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE"
     [[ $spinner_pid -ne 0 ]] && kill "$spinner_pid" 2>/dev/null
     exit "$exit_code"
 }
 
-# @description 启动加载动画
 start_spinner() {
     if [[ ! -t 1 ]]; then return; fi
     echo -n -e "${CYAN}${1:-}${NC}"
@@ -68,7 +67,6 @@ start_spinner() {
     tput civis
 }
 
-# @description 停止加载动画
 stop_spinner() {
     if [[ $spinner_pid -ne 0 ]]; then
         kill "$spinner_pid" 2>/dev/null
@@ -80,7 +78,17 @@ stop_spinner() {
     echo -e "\b${GREEN}✔${NC}"
 }
 
-# @description 获取公共 IPv4 地址
+show_progress() {
+    local current=$1 total=$2 width=40
+    local percent=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    printf "\r["
+    printf "%*s" $filled | tr ' ' '='
+    printf "%*s" $empty | tr ' ' '-'
+    printf "] %d%%" $percent
+}
+
 get_public_ipv4() {
     local ip
     for cmd in "curl -s -4 --max-time 5" "wget -qO- -4 --timeout=5"; do
@@ -90,12 +98,10 @@ get_public_ipv4() {
     done
 }
 
-# @description 检查系统是否具备 IPv6 连接
 has_ipv6() {
     ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'
 }
 
-# @description 检查可用磁盘空间
 check_disk_space() {
     local required_mb="$1" available_mb
     available_mb=$(df -BM / | awk 'NR==2 {gsub(/M/,"",$4); print $4}' || echo 0)
@@ -106,7 +112,6 @@ check_disk_space() {
     fi
 }
 
-# @description 检测是否为容器环境 (Docker, LXC, OpenVZ 等)
 is_container() {
     case "$(systemd-detect-virt --container 2>/dev/null)" in
         docker|lxc|openvz|containerd|podman) return 0 ;;
@@ -115,37 +120,49 @@ is_container() {
     grep -q 'container=lxc\|container=docker' /proc/1/environ 2>/dev/null
 }
 
-# @description 比较内核版本
 compare_version() {
     printf '%s\n' "$@" | sort -V | head -n1
 }
 
-# @description 判断当前内核版本是否大于等于指定版本
 is_kernel_version_ge() {
     local required="$1" current
     current=$(uname -r | grep -oP '^\d+\.\d+' || echo "0.0")
     [[ "$(compare_version "$current" "$required")" = "$required" ]]
 }
 
-# ==============================================================================
-# --- 验证函数 ---
-# ==============================================================================
-
-# @description 记录单项验证结果
-record_verification() {
-    local component="$1" status="$2" message="$3"
-    if [[ "$status" = "PASS" ]]; then
-        log "    ${GREEN}✓${NC} ${component}: ${message}"
-        ((VERIFICATION_PASSED++))
-    elif [[ "$status" = "WARN" ]]; then
-        log "    ${YELLOW}⚠️${NC} ${component}: ${message}"
-    else
-        log "    ${RED}✗${NC} ${component}: ${message}"
-        ((VERIFICATION_FAILED++))
+# @description 简化的权限验证
+verify_privileges() {
+    local checks=0
+    
+    # 检查root权限
+    [[ $EUID -eq 0 ]] && ((checks++))
+    
+    # 检查关键文件写权限
+    [[ -w /etc/passwd ]] && ((checks++))
+    
+    # 检查sudo权限（非root时）
+    [[ $EUID -eq 0 ]] || groups | grep -qE '\b(sudo|wheel|admin)\b' && ((checks++))
+    
+    if [[ $checks -lt 2 ]]; then
+        log "${RED}[ERROR] 权限不足，需要root权限或完整sudo权限${NC}"
+        return 1
     fi
+    return 0
 }
 
-# @description 验证单个配置项是否与期望值相符
+# ==============================================================================
+# --- 改进的验证函数 ---
+# ==============================================================================
+
+record_verification() {
+    local component="$1" status="$2" message="$3"
+    case "$status" in
+        "PASS") log "    ${GREEN}✓${NC} ${component}: ${message}"; ((VERIFICATION_PASSED++)) ;;
+        "WARN") log "    ${YELLOW}⚠${NC} ${component}: ${message}"; ((VERIFICATION_WARNINGS++)) ;;
+        "FAIL") log "    ${RED}✗${NC} ${component}: ${message}"; ((VERIFICATION_FAILED++)) ;;
+    esac
+}
+
 verify_config() {
     local component="$1" expected="$2" actual="$3"
     if [[ "$actual" = "$expected" ]]; then
@@ -155,104 +172,126 @@ verify_config() {
     fi
 }
 
-# @description 运行所有配置验证
-run_verification() {
-    log "\n${YELLOW}=============== 配置验证 ===============${NC}"
-    log "${BLUE}[INFO] 正在验证所有配置...${NC}\n"
-    
-    VERIFICATION_PASSED=0
-    VERIFICATION_FAILED=0
-    set +e # 临时禁用错误处理，以便验证函数能够继续
-    
-    [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
-    
-    verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
-    
+verify_bbr() {
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
+    
     if [[ "$BBR_MODE" = "none" ]]; then
-        record_verification "BBR" "PASS" "已禁用 (当前: $current_cc)"
+        [[ "$current_cc" != "bbr" ]] && record_verification "BBR" "PASS" "已禁用" || record_verification "BBR" "WARN" "可能需要重启生效"
     elif [[ "$current_cc" = "bbr" && "$current_qdisc" = "fq" ]]; then
-        local mode_desc="标准模式"
-        if [[ "$BBR_MODE" = "optimized" ]] && [[ -f /etc/sysctl.d/99-bbr.conf ]] && [[ $(awk '/^net\./ {count++} END {print count}' /etc/sysctl.d/99-bbr.conf 2>/dev/null) -gt 5 ]]; then
-            mode_desc="动态优化模式"
-        fi
-        record_verification "BBR" "PASS" "${mode_desc} 已启用"
+        record_verification "BBR" "PASS" "已启用 (${BBR_MODE}模式)"
     else
-        record_verification "BBR" "FAIL" "BBR配置异常: ${current_cc}/${current_qdisc}"
+        record_verification "BBR" "FAIL" "配置异常: ${current_cc}/${current_qdisc}"
     fi
-    
+}
+
+verify_swap() {
     local current_swap_mb=$(awk '/SwapTotal/ {print int($2/1024 + 0.5)}' /proc/meminfo)
+    
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
-        [[ $current_swap_mb -eq 0 ]] && record_verification "Swap" "PASS" "已禁用" || record_verification "Swap" "FAIL" "期望禁用，实际${current_swap_mb}MB"
+        [[ $current_swap_mb -eq 0 ]] && record_verification "Swap" "PASS" "已禁用" || record_verification "Swap" "FAIL" "期望禁用但仍有${current_swap_mb}MB"
     else
-        [[ $current_swap_mb -gt 0 ]] && record_verification "Swap" "PASS" "${current_swap_mb}MB" || record_verification "Swap" "FAIL" "Swap未配置"
+        [[ $current_swap_mb -gt 0 ]] && record_verification "Swap" "PASS" "${current_swap_mb}MB" || record_verification "Swap" "FAIL" "未配置"
+    fi
+}
+
+verify_dns() {
+    local status="FAIL" message=""
+    
+    # 检查云环境警告
+    if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+        status="WARN"
+        message="云环境可能覆盖配置; "
     fi
     
-    local dns_warning_msg="配置未生效 (云服务器常见现象，因其自动化服务会覆盖此配置)"
+    # 检查实际配置
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf && "$(cat /etc/systemd/resolved.conf.d/99-custom-dns.conf 2>/dev/null)" =~ $PRIMARY_DNS_V4 ]] && record_verification "DNS" "PASS" "systemd-resolved已配置" || record_verification "DNS" "WARN" "systemd-resolved ${dns_warning_msg}"
+        if [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]] && grep -q "$PRIMARY_DNS_V4" /etc/systemd/resolved.conf.d/99-custom-dns.conf; then
+            [[ "$status" != "WARN" ]] && status="PASS"
+            message+="systemd-resolved已配置"
+        else
+            status="FAIL"
+            message="systemd-resolved配置缺失"
+        fi
     else
-        [[ -f /etc/resolv.conf && "$(cat /etc/resolv.conf 2>/dev/null)" =~ $PRIMARY_DNS_V4 ]] && record_verification "DNS" "PASS" "resolv.conf已配置" || record_verification "DNS" "WARN" "resolv.conf ${dns_warning_msg}"
+        if grep -q "$PRIMARY_DNS_V4" /etc/resolv.conf 2>/dev/null; then
+            [[ "$status" != "WARN" ]] && status="PASS"
+            message+="resolv.conf已配置"
+        else
+            status="FAIL"
+            message="resolv.conf配置缺失"
+        fi
     fi
     
+    record_verification "DNS" "$status" "$message"
+}
+
+run_verification() {
+    log "\n${YELLOW}=============== 配置验证 ===============${NC}"
+    VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
+    set +e
+    
+    [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
+    verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
+    verify_bbr
+    verify_swap
+    verify_dns
+    
+    # 软件包验证
     local installed=0 total=0
     for pkg in $INSTALL_PACKAGES; do ((total++)); dpkg -l "$pkg" >/dev/null 2>&1 && ((installed++)); done
-    [[ $installed -eq $total ]] && record_verification "软件包" "PASS" "全部已安装 ($installed/$total)" || record_verification "软件包" "FAIL" "部分未安装 ($installed/$total)"
+    [[ $installed -eq $total ]] && record_verification "软件包" "PASS" "全部已安装 ($installed/$total)" || record_verification "软件包" "FAIL" "部分缺失 ($installed/$total)"
     
+    # SSH端口验证
     if [[ -n "$NEW_SSH_PORT" ]]; then
-        local current_port
-        current_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
-        [[ -z "$current_port" ]] && current_port="22" # Default if not explicitly set
-        verify_config "SSH 端口" "$NEW_SSH_PORT" "$current_port"
+        local current_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
+        [[ -z "$current_port" ]] && current_port="22"
+        verify_config "SSH端口" "$NEW_SSH_PORT" "$current_port"
     fi
     
-    [[ "$ENABLE_FAIL2BAN" = true ]] && {
+    # Fail2ban验证
+    if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         if systemctl is-active --quiet fail2ban 2>/dev/null; then
-            local protected_ports=$(awk -F'=' '/^port/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' /etc/fail2ban/jail.local 2>/dev/null || echo "N/A")
-            record_verification "Fail2ban" "PASS" "运行正常，保护端口: ${protected_ports}"
+            record_verification "Fail2ban" "PASS" "运行正常"
         else
             record_verification "Fail2ban" "FAIL" "服务异常"
         fi
-    }
+    fi
     
-    set -e # 恢复错误处理
-    
-    log "\n${BLUE}[INFO] 验证完成: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
-    [[ $VERIFICATION_FAILED -eq 0 ]] && log "${GREEN}✅ 所有配置验证通过！${NC}" || log "${YELLOW}⚠️ 有 ${VERIFICATION_FAILED} 项需要检查${NC}"
+    set -e
+    log "\n${BLUE}验证结果: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${YELLOW}警告 ${VERIFICATION_WARNINGS}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
 }
 
 # ==============================================================================
 # --- 参数解析 ---
 # ==============================================================================
 
-# @description 显示帮助信息
 usage() {
     cat << EOF
-${YELLOW}用法: $0 [选项]...${NC}
+${YELLOW}用法: $0 [选项]${NC}
 ${BLUE}核心选项:${NC}
-  --hostname <name>     设置新的主机名
-  --timezone <tz>       设置时区 (默认: 自动检测)
-  --swap <size_mb>      设置 Swap 大小，'auto'/'0'
-  --ip-dns <'主 备'>    设置 IPv4 DNS
-  --ip6-dns <'主 备'>   设置 IPv6 DNS
-${BLUE}BBR 选项:${NC}
-  --bbr-optimized       启用动态优化 BBR
-  --no-bbr              禁用 BBR
+  --hostname <name>     设置主机名
+  --timezone <tz>       设置时区
+  --swap <size_mb>      设置Swap大小，'auto'/'0'
+  --ip-dns <'主 备'>    设置IPv4 DNS
+  --ip6-dns <'主 备'>   设置IPv6 DNS
+${BLUE}BBR选项:${NC}
+  --bbr-conservative    启用保守BBR (推荐)
+  --bbr-optimized       启用优化BBR (高配置)
+  --no-bbr              禁用BBR
 ${BLUE}安全选项:${NC}
-  --fail2ban [port]     (默认启用) 指定额外SSH保护端口
-  --no-fail2ban         禁用 Fail2ban
-  --ssh-port <port>     预设新的SSH端口 (交互/非交互均可)
-  --ssh-password <pass> 预设root的SSH密码 (交互/非交互均可)
+  --fail2ban [port]     启用Fail2ban
+  --no-fail2ban         禁用Fail2ban
+  --ssh-port <port>     设置SSH端口
+  --ssh-password <pass> 设置root密码
 ${BLUE}其他:${NC}
   -h, --help            显示帮助
   --non-interactive     非交互模式
-${GREEN}示例: bash $0 --ssh-port 2222 --ssh-password 'YourPass'${NC}
+${GREEN}示例: $0 --bbr-conservative --ssh-port 2222${NC}
 EOF
     exit 0
 }
 
-# @description 解析命令行参数
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -262,12 +301,10 @@ parse_args() {
             --swap) SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns) read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"; shift 2 ;;
             --ip6-dns) read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"; shift 2 ;;
+            --bbr-conservative) BBR_MODE="conservative"; shift ;;
             --bbr-optimized) BBR_MODE="optimized"; shift ;;
             --no-bbr) BBR_MODE="none"; shift ;;
-            --fail2ban)
-                ENABLE_FAIL2BAN=true
-                [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }
-                shift ;;
+            --fail2ban) ENABLE_FAIL2BAN=true; [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }; shift ;;
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
             --ssh-port) NEW_SSH_PORT="$2"; shift 2 ;;
             --ssh-password) NEW_SSH_PASSWORD="$2"; shift 2 ;;
@@ -278,53 +315,45 @@ parse_args() {
 }
 
 # ==============================================================================
-# --- 功能函数 (按执行顺序排列) ---
+# --- 功能函数 ---
 # ==============================================================================
 
-#-------------------------------------------------------------------------------
-# @description 预检：检查系统兼容性和权限
-#-------------------------------------------------------------------------------
 pre_flight_checks() {
     log "${BLUE}[INFO] 系统预检查...${NC}"
+    verify_privileges || exit 1
+    
     if is_container; then
-        log "${YELLOW}[WARN] 检测到容器环境，某些功能可能受限${NC}"
-        if [[ "$non_interactive" = false ]]; then
-            read -p "继续执行? [y/N] " -r < /dev/tty
-            [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0
-        fi
+        log "${YELLOW}[WARN] 容器环境，某些功能可能受限${NC}"
+        [[ "$non_interactive" = false ]] && { read -p "继续? [y/N] " -r < /dev/tty; [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0; }
     fi
-    [[ ! -f /etc/os-release ]] && { log "错误: /etc/os-release 未找到"; exit 1; }
+    
+    [[ ! -f /etc/os-release ]] && { log "${RED}错误: 系统信息缺失${NC}"; exit 1; }
     source /etc/os-release
+    
     local supported=false
     [[ "$ID" = "debian" && "$VERSION_ID" =~ ^(10|11|12|13)$ ]] && supported=true
     [[ "$ID" = "ubuntu" && "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04)$ ]] && supported=true
+    
     if [[ "$supported" = "false" ]]; then
-        log "${YELLOW}[WARN] 当前系统: ${PRETTY_NAME} (建议使用 Debian 10-13 或 Ubuntu 20.04-24.04)${NC}"
-        if [[ "$non_interactive" = "false" ]]; then
-            read -p "继续? [y/N] " -r < /dev/tty
-            [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0
-        fi
+        log "${YELLOW}[WARN] 系统: ${PRETTY_NAME} (建议使用Debian 10-13或Ubuntu 20.04-24.04)${NC}"
+        [[ "$non_interactive" = false ]] && { read -p "继续? [y/N] " -r < /dev/tty; [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0; }
     fi
-    if ! groups | grep -q sudo 2>/dev/null && [[ $EUID -ne 0 ]]; then
-        log "${RED}[ERROR] 需要 root 权限或 sudo 权限${NC}"
-        exit 1
-    fi
+    
     log "${GREEN}✅ 系统: ${PRETTY_NAME}${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 安装基础软件包并配置Vim
-#-------------------------------------------------------------------------------
 install_packages() {
     log "\n${YELLOW}=============== 1. 软件包安装 ===============${NC}"
     start_spinner "更新软件包列表... "
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1 || { stop_spinner; log "${RED}更新失败${NC}"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
     stop_spinner
+    
     start_spinner "安装基础软件包... "
-    DEBIAN_FRONTEND=noninteractive apt-get install -y $INSTALL_PACKAGES >> "$LOG_FILE" 2>&1 || { stop_spinner; log "${YELLOW}部分安装失败${NC}"; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y $INSTALL_PACKAGES >> "$LOG_FILE" 2>&1
     stop_spinner
+    
+    # 简化的Vim配置
     if command -v vim &>/dev/null; then
-        log "${BLUE}配置 Vim...${NC}"
         cat > /etc/vim/vimrc.local << 'EOF'
 syntax on
 set nocompatible
@@ -342,43 +371,35 @@ set mouse=a
 set nobackup
 set noswapfile
 EOF
-        if [[ -d /root ]]; then
-            ! grep -Fxq "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && \
-            echo "source /etc/vim/vimrc.local" >> /root/.vimrc
-        fi
+        [[ -d /root ]] && ! grep -q "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && echo "source /etc/vim/vimrc.local" >> /root/.vimrc
     fi
-    log "${GREEN}✅ 软件包安装与配置完成${NC}"
+    log "${GREEN}✅ 软件包安装完成${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置系统主机名
-#-------------------------------------------------------------------------------
 configure_hostname() {
     log "\n${YELLOW}=============== 2. 主机名配置 ===============${NC}"
-    local current_hostname
-    current_hostname=$(hostname)
+    local current_hostname=$(hostname)
     log "${BLUE}当前主机名: ${current_hostname}${NC}"
+    
     local final_hostname="$current_hostname"
     if [[ -n "$NEW_HOSTNAME" ]]; then
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
             hostnamectl set-hostname "$NEW_HOSTNAME" >> "$LOG_FILE" 2>&1
             final_hostname="$NEW_HOSTNAME"
-            log "${BLUE}[INFO] 主机名设为: ${NEW_HOSTNAME}${NC}"
+            log "${GREEN}✅ 主机名设为: ${NEW_HOSTNAME}${NC}"
         else
-            log "${RED}[ERROR] 主机名格式不正确，保持不变${NC}"
+            log "${RED}[ERROR] 主机名格式错误${NC}"
             NEW_HOSTNAME=""
         fi
-    elif [[ "$non_interactive" = "true" ]]; then
+    elif [[ "$non_interactive" = true ]]; then
         local auto_ip
         if auto_ip=$(get_public_ipv4); then
             final_hostname=$(echo "$auto_ip" | tr '.' '-')
             hostnamectl set-hostname "$final_hostname" >> "$LOG_FILE" 2>&1
             NEW_HOSTNAME="$final_hostname"
-            log "${GREEN}自动设置主机名: ${final_hostname}${NC}"
-        else
-            log "${YELLOW}[WARN] 非交互模式下无法获取公网IP，跳过自动设置主机名。${NC}"
+            log "${GREEN}✅ 自动设置主机名: ${final_hostname}${NC}"
         fi
-    elif [[ "$non_interactive" = "false" ]]; then
+    elif [[ "$non_interactive" = false ]]; then
         read -p "修改主机名? [y/N] " -r < /dev/tty
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             read -p "输入新主机名: " new_name < /dev/tty
@@ -389,6 +410,8 @@ configure_hostname() {
             fi
         fi
     fi
+    
+    # 更新hosts文件
     if [[ "$final_hostname" != "$current_hostname" ]]; then
         if grep -q "^127\.0\.1\.1" /etc/hosts; then
             sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${final_hostname}/" /etc/hosts
@@ -396,266 +419,258 @@ configure_hostname() {
             echo -e "127.0.1.1\t${final_hostname}" >> /etc/hosts
         fi
     fi
-    log "${GREEN}✅ 主机名: $(hostname)${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置系统时区
-#-------------------------------------------------------------------------------
 configure_timezone() {
     log "\n${YELLOW}=============== 3. 时区配置 ===============${NC}"
-    timedatectl set-timezone "$TIMEZONE" >> "$LOG_FILE" 2>&1 && log "${GREEN}✅ 时区: ${TIMEZONE}${NC}"
+    timedatectl set-timezone "$TIMEZONE" >> "$LOG_FILE" 2>&1
+    log "${GREEN}✅ 时区: ${TIMEZONE}${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置TCP BBR拥塞控制算法
-#-------------------------------------------------------------------------------
 configure_bbr() {
     log "\n${YELLOW}=============== 4. BBR配置 ===============${NC}"
     local config_file="/etc/sysctl.d/99-bbr.conf"
+    
     if [[ "$BBR_MODE" = "none" ]]; then
-        log "${BLUE}[INFO] 根据参数跳过 BBR 配置${NC}"
+        log "${BLUE}[INFO] 跳过BBR配置${NC}"
         rm -f "$config_file"
         return
     fi
+    
     if ! is_kernel_version_ge "4.9"; then
-        log "${RED}[ERROR] 内核版本过低 ($(uname -r))，BBR 需要 4.9+${NC}"
+        log "${RED}[ERROR] 内核版本过低 ($(uname -r))，需要4.9+${NC}"
         return 1
     fi
-    if [[ "$BBR_MODE" = "optimized" ]]; then
-        log "${BLUE}[INFO] 配置动态优化 BBR...${NC}"
-        local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-        local somaxconn=$(( mem_mb > 2048 ? 65535 : (mem_mb > 1024 ? 49152 : 32768) ))
-        local rmem_wmem_max=$(( mem_mb > 2048 ? 67108864 : (mem_mb > 1024 ? 33554432 : (mem_mb > 512 ? 16777216 : 8388608)) ))
-        cat > "$config_file" << EOF
+    
+    local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+    log "${BLUE}检测到内存: ${mem_mb}MB${NC}"
+    
+    case "$BBR_MODE" in
+        "conservative")
+            log "${BLUE}配置保守BBR...${NC}"
+            local rmem_wmem=$((mem_mb > 1024 ? 33554432 : 16777216))
+            local somaxconn=$((mem_mb > 1024 ? 16384 : 8192))
+            cat > "$config_file" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = ${rmem_wmem_max}
-net.core.wmem_max = ${rmem_wmem_max}
+net.core.rmem_max = ${rmem_wmem}
+net.core.wmem_max = ${rmem_wmem}
+net.core.somaxconn = ${somaxconn}
+net.ipv4.tcp_fin_timeout = 30
+EOF
+            ;;
+        "optimized")
+            log "${BLUE}配置优化BBR...${NC}"
+            if [[ $mem_mb -lt 1024 ]]; then
+                log "${YELLOW}[WARN] 内存较低，建议使用保守模式${NC}"
+            fi
+            local rmem_wmem=$((mem_mb > 2048 ? 67108864 : mem_mb > 1024 ? 33554432 : 16777216))
+            local somaxconn=$((mem_mb > 2048 ? 32768 : mem_mb > 1024 ? 16384 : 8192))
+            cat > "$config_file" << EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = ${rmem_wmem}
+net.core.wmem_max = ${rmem_wmem}
 net.core.somaxconn = ${somaxconn}
 net.ipv4.tcp_max_syn_backlog = ${somaxconn}
 net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
 EOF
-        sysctl --system >> "$LOG_FILE" 2>&1
-        log "${GREEN}✅ 动态优化 BBR 已启用${NC}"
-        return
-    fi
-    log "${BLUE}[INFO] 配置标准 BBR...${NC}"
-    echo -e "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr" > "$config_file"
+            ;;
+        *)
+            log "${BLUE}配置标准BBR...${NC}"
+            cat > "$config_file" << EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+            ;;
+    esac
+    
     sysctl -p "$config_file" >> "$LOG_FILE" 2>&1
-    log "${GREEN}✅ 标准 BBR 已启用${NC}"
+    log "${GREEN}✅ BBR配置完成${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置Swap交换文件
-#-------------------------------------------------------------------------------
 configure_swap() {
     log "\n${YELLOW}=============== 5. Swap配置 ===============${NC}"
     [[ "$SWAP_SIZE_MB" = "0" ]] && { log "${BLUE}Swap已禁用${NC}"; return; }
+    
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
         local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-        swap_mb=$((mem_mb < 2048 ? mem_mb : 2048))
-        log "${BLUE}自动设置 Swap: ${swap_mb}MB${NC}"
+        # 简化的自动计算
+        if [[ $mem_mb -lt 1024 ]]; then
+            swap_mb=$mem_mb
+        elif [[ $mem_mb -lt 4096 ]]; then
+            swap_mb=2048
+        else
+            swap_mb=4096
+        fi
+        log "${BLUE}自动设置Swap: ${swap_mb}MB${NC}"
     else
         swap_mb="$SWAP_SIZE_MB"
     fi
+    
     check_disk_space $((swap_mb + 100)) || return 1
-    local current_swap_file="/swapfile"
-    if [[ -f "$current_swap_file" ]]; then
-        local current_size_bytes
-        current_size_bytes=$(stat -c %s "$current_swap_file" 2>/dev/null || echo 0)
-        local current_size_mb=$((current_size_bytes / 1024 / 1024))
-        if [[ "$current_size_mb" -ne "$swap_mb" ]]; then
-            log "${YELLOW}[WARN] 检测到现有 Swap 文件大小 (${current_size_mb} MB) 与期望 (${swap_mb} MB) 不符，正在重建...${NC}"
-            swapoff "$current_swap_file" >> "$LOG_FILE" 2>&1 || true
-            rm -f "$current_swap_file"
-        else
-            log "${BLUE}检测到已存在大小合适的 Swap 文件，跳过创建。${NC}"
+    
+    local swap_file="/swapfile"
+    
+    # 检查现有swap
+    if [[ -f "$swap_file" ]]; then
+        local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
+        if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
+            log "${GREEN}✅ Swap文件已存在 (${current_size_mb}MB)${NC}"
             return
         fi
+        swapoff "$swap_file" 2>/dev/null || true
+        rm -f "$swap_file"
     fi
-    log "${BLUE}正在创建 ${swap_mb}MB Swap...${NC}"
     
-    local success=false
-    start_spinner "创建 Swap 文件... "
+    log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
+    
+    # 选择创建方法并显示进度
     if command -v fallocate &>/dev/null; then
-        fallocate -l "${swap_mb}M" "$current_swap_file" >> "$LOG_FILE" 2>&1 && success=true
+        start_spinner "快速创建Swap... "
+        fallocate -l "${swap_mb}M" "$swap_file" >> "$LOG_FILE" 2>&1
+        stop_spinner
+    else
+        log "${BLUE}使用dd创建，请稍候...${NC}"
+        dd if=/dev/zero of="$swap_file" bs=1M count="$swap_mb" status=progress 2>&1 | while IFS= read -r line; do
+            if [[ "$line" =~ ([0-9]+)\ bytes.*copied ]]; then
+                local copied_bytes=${BASH_REMATCH[1]}
+                local copied_mb=$((copied_bytes / 1024 / 1024))
+                show_progress $copied_mb $swap_mb
+            fi
+        done
+        echo ""
     fi
     
-    if [[ "$success" = false ]]; then
-        stop_spinner
-        log "${BLUE}[INFO] fallocate不可用，使用dd创建 (这可能需要一些时间)...${NC}"
-        if dd if=/dev/zero of="$current_swap_file" bs=1M count="$swap_mb" status=progress >> "$LOG_FILE" 2>&1; then
-            success=true
-        fi
-        log ""
-    else
-        stop_spinner
-    fi
-
-    if [[ "$success" = false ]]; then
-        log "${RED}[ERROR] Swap 文件创建失败${NC}"
-        return 1
-    fi
-
-    chmod 600 "$current_swap_file"
-    mkswap "$current_swap_file" >> "$LOG_FILE" 2>&1
-    swapon "$current_swap_file" >> "$LOG_FILE" 2>&1
-    grep -q "$current_swap_file" /etc/fstab || echo "$current_swap_file none swap sw 0 0" >> /etc/fstab
-    log "${GREEN}✅ ${swap_mb}MB Swap 已配置${NC}"
+    chmod 600 "$swap_file"
+    mkswap "$swap_file" >> "$LOG_FILE" 2>&1
+    swapon "$swap_file" >> "$LOG_FILE" 2>&1
+    grep -q "$swap_file" /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
+    log "${GREEN}✅ ${swap_mb}MB Swap已配置${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置DNS服务器
-#-------------------------------------------------------------------------------
 configure_dns() {
     log "\n${YELLOW}=============== 6. DNS配置 ===============${NC}"
-    if systemctl is-active --quiet cloud-init 2>/dev/null; then
-        log "${YELLOW}[WARN] 检测到 cloud-init 服务正在运行。DNS 设置可能在重启后被覆盖。请考虑在您的云服务商控制面板中配置DNS。${NC}"
+    
+    # 简化的环境检查
+    if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+        log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
     fi
-    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        log "${YELLOW}[WARN] NetworkManager 正在运行，DNS 设置可能被覆盖${NC}"
-    fi
+    
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        log "${BLUE}配置 systemd-resolved...${NC}"
+        log "${BLUE}配置systemd-resolved...${NC}"
         mkdir -p /etc/systemd/resolved.conf.d
-        {
-            echo "[Resolve]"
-            echo "DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}"
-            has_ipv6 && echo "FallbackDNS=${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}"
-        } > /etc/systemd/resolved.conf.d/99-custom-dns.conf
+        cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
+[Resolve]
+DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$(has_ipv6 && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}")
+FallbackDNS=1.0.0.1 8.8.4.4
+EOF
         systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1
     else
-        log "${BLUE}配置 /etc/resolv.conf...${NC}"
-        if [[ -L /etc/resolv.conf ]]; then
-            log "${YELLOW}[WARN] /etc/resolv.conf 是符号链接，配置可能不持久${NC}"
-        fi
-        chattr -i /etc/resolv.conf >> "$LOG_FILE" 2>&1 || true
-        {
-            echo "nameserver ${PRIMARY_DNS_V4}"
-            echo "nameserver ${SECONDARY_DNS_V4}"
-            has_ipv6 && { echo "nameserver ${PRIMARY_DNS_V6}"; echo "nameserver ${SECONDARY_DNS_V6}"; }
-        } > /etc/resolv.conf
+        log "${BLUE}配置resolv.conf...${NC}"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf << EOF
+nameserver ${PRIMARY_DNS_V4}
+nameserver ${SECONDARY_DNS_V4}
+$(has_ipv6 && echo "nameserver ${PRIMARY_DNS_V6}")
+$(has_ipv6 && echo "nameserver ${SECONDARY_DNS_V6}")
+EOF
     fi
-    log "${GREEN}✅ DNS 配置完成${NC}"
+    log "${GREEN}✅ DNS配置完成${NC}"
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置SSH端口和密码 (交互式或非交互式)
-#-------------------------------------------------------------------------------
 configure_ssh() {
-    log "\n${YELLOW}=============== 7. SSH 安全配置 ===============${NC}"
+    log "\n${YELLOW}=============== 7. SSH配置 ===============${NC}"
     
     if [[ "$non_interactive" = false ]]; then
-        if [[ -z "$NEW_SSH_PORT" ]]; then
-            read -p "请输入新的SSH端口 (留空则不修改): " -r user_port < /dev/tty
-            NEW_SSH_PORT="$user_port"
-        fi
-        if [[ -z "$NEW_SSH_PASSWORD" ]]; then
-            read -p "请输入新的root密码 (留空则不修改): " -r user_pass < /dev/tty
-            NEW_SSH_PASSWORD="$user_pass"
-        fi
+        [[ -z "$NEW_SSH_PORT" ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
+        [[ -z "$NEW_SSH_PASSWORD" ]] && { read -p "root密码 (留空跳过): " -r NEW_SSH_PASSWORD < /dev/tty; }
     fi
     
-    local ssh_config_changed=false
-    if [[ -n "$NEW_SSH_PORT" ]]; then
-        if [[ "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
-            log "${BLUE}配置 SSH 端口为: ${NEW_SSH_PORT}...${NC}"
-            sed -i -E 's/^[#\s]*Port\s+[0-9]+$/# &/' /etc/ssh/sshd_config
-            echo "" >> /etc/ssh/sshd_config
-            echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
-            ssh_config_changed=true
-            log "${GREEN}✅ SSH 端口已设置${NC}"
-        else
-            log "${RED}[ERROR] SSH 端口 '${NEW_SSH_PORT}' 无效，跳过配置。${NC}"
-            NEW_SSH_PORT=""
-        fi
-    else
-        log "${BLUE}[INFO] 未指定新的 SSH 端口，跳过配置。${NC}"
+    local ssh_changed=false
+    if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
+        cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
+        sed -i -E 's/^[#\s]*Port\s+[0-9]+$/# &/' /etc/ssh/sshd_config
+        echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+        ssh_changed=true
+        log "${GREEN}✅ SSH端口设为: ${NEW_SSH_PORT}${NC}"
     fi
-
+    
     if [[ -n "$NEW_SSH_PASSWORD" ]]; then
-        log "${BLUE}设置 root SSH 密码...${NC}"
         echo "root:${NEW_SSH_PASSWORD}" | chpasswd >> "$LOG_FILE" 2>&1
-        log "${GREEN}✅ root 密码已设置${NC}"
-    else
-        log "${BLUE}[INFO] 未指定新的 SSH 密码，跳过配置。${NC}"
+        log "${GREEN}✅ root密码已设置${NC}"
     fi
-
-    if [[ "$ssh_config_changed" = true ]]; then
-        start_spinner "重启 SSH 服务... "
-        systemctl restart sshd >> "$LOG_FILE" 2>&1
-        stop_spinner
-        log "${YELLOW}[WARN] SSH 端口已更改为 ${NEW_SSH_PORT}，请使用新端口重新连接！${NC}"
+    
+    if [[ "$ssh_changed" = true ]]; then
+        if sshd -t 2>>"$LOG_FILE"; then
+            systemctl restart sshd >> "$LOG_FILE" 2>&1
+            log "${YELLOW}[WARN] SSH端口已更改，请用新端口重连！${NC}"
+        else
+            log "${RED}[ERROR] SSH配置错误，已恢复备份${NC}"
+            cp "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)" /etc/ssh/sshd_config
+            systemctl restart sshd >> "$LOG_FILE" 2>&1
+        fi
     fi
 }
 
-#-------------------------------------------------------------------------------
-# @description 配置Fail2ban以保护SSH服务
-#-------------------------------------------------------------------------------
 configure_fail2ban() {
     log "\n${YELLOW}=============== 8. Fail2ban配置 ===============${NC}"
     
-    local port_list_array=()
-    port_list_array+=("22")
+    local ports=("22")
+    [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]] && ports+=("$NEW_SSH_PORT")
+    [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]] && ports+=("$FAIL2BAN_EXTRA_PORT")
     
-    if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
-        port_list_array+=("$NEW_SSH_PORT")
+    # 自动检测SSH端口
+    if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -f /etc/ssh/sshd_config ]]; then
+        local detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
+        [[ -n "$detected_port" && "$detected_port" -ne 22 ]] && ports+=("$detected_port")
     fi
     
-    if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]]; then
-        port_list_array+=("$FAIL2BAN_EXTRA_PORT")
-    fi
-
-    if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -z "$FAIL2BAN_EXTRA_PORT" && -f /etc/ssh/sshd_config ]]; then
-        local detected_port
-        detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
-        
-        if [[ -n "$detected_port" && "$detected_port" -ne 22 ]]; then
-            log "${BLUE}[INFO] 自动检测到当前SSH端口: ${detected_port}, 已加入Fail2ban保护列表${NC}"
-            port_list_array+=("$detected_port")
-        fi
-    fi
-
-    local port_list
-    port_list=$(printf "%s\n" "${port_list_array[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
-
-    start_spinner "安装 Fail2ban... "
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1 || { stop_spinner; log "${RED}安装失败${NC}"; return 1; }
+    local port_list=$(printf "%s," "${ports[@]}" | sed 's/,$//')
+    
+    start_spinner "安装Fail2ban... "
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1
     stop_spinner
     
-    log "${BLUE}配置 Fail2ban 保护端口: ${port_list}${NC}"
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime = -1
 findtime = 300
 maxretry = 3
+backend = systemd
+ignoreip = 127.0.0.1/8
 
 [sshd]
 enabled = true
 port = ${port_list}
-backend = systemd
-ignoreip = 127.0.0.1/8
+maxretry = 3
 EOF
-    systemctl enable --now fail2ban >> "$LOG_FILE" 2>&1
-    log "${GREEN}✅ Fail2ban 已配置并启动${NC}"
+    
+    systemctl enable fail2ban >> "$LOG_FILE" 2>&1
+    systemctl start fail2ban >> "$LOG_FILE" 2>&1
+    
+    if systemctl is-active --quiet fail2ban; then
+        log "${GREEN}✅ Fail2ban已启动，保护端口: ${port_list}${NC}"
+    else
+        log "${RED}[ERROR] Fail2ban启动失败${NC}"
+    fi
 }
 
-#-------------------------------------------------------------------------------
-# @description 更新系统软件包并清理缓存
-#-------------------------------------------------------------------------------
 system_update() {
-    log "\n${YELLOW}=============== 9. 系统更新与清理 ===============${NC}"
+    log "\n${YELLOW}=============== 9. 系统更新 ===============${NC}"
+    
     start_spinner "系统升级... "
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y \
-        -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
     stop_spinner
+    
     start_spinner "清理缓存... "
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
+    apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
     apt-get clean >> "$LOG_FILE" 2>&1
     stop_spinner
-    log "${GREEN}✅ 系统更新与清理完成${NC}"
+    
+    log "${GREEN}✅ 系统更新完成${NC}"
 }
 
 # ==============================================================================
@@ -663,56 +678,35 @@ system_update() {
 # ==============================================================================
 main() {
     trap 'handle_error ${LINENO}' ERR
-    [[ $EUID -ne 0 ]] && { echo -e "${RED}需要 root 权限${NC}"; exit 1; }
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}需要root权限${NC}"; exit 1; }
     
     parse_args "$@"
 
-    # 预览信息只输出到屏幕(stderr)，不写入日志
+    # 简化的配置预览
     {
-        echo -e "${CYAN}=====================================================${NC}"
-        echo -e "${CYAN}              VPS 初始化配置预览             ${NC}"
-        echo -e "${CYAN}=====================================================${NC}"
-        
-        local hostname_display
-        if [[ -n "$NEW_HOSTNAME" ]]; then hostname_display="$NEW_HOSTNAME"
-        elif [[ "$non_interactive" = true ]]; then hostname_display="自动设置 (基于公网IP)"
-        else hostname_display="交互式设置"; fi
-        
-        echo -e "  主机名: ${hostname_display}"
-        echo -e "  时区: ${TIMEZONE}"
-        echo -e "  Swap: ${SWAP_SIZE_MB}"
-        echo -e "  BBR模式: ${BBR_MODE}"
-        echo -e "  DNS(v4): ${PRIMARY_DNS_V4}, ${SECONDARY_DNS_V4}"
-        has_ipv6 && echo -e "  DNS(v6): ${PRIMARY_DNS_V6}, ${SECONDARY_DNS_V6}"
-        
-        if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-            local ports_preview="22"
-            [[ -n "$FAIL2BAN_EXTRA_PORT" ]] && ports_preview+=",${FAIL2BAN_EXTRA_PORT}"
-            echo -e "  Fail2ban: ${GREEN}启用 (基础端口: ${ports_preview})${NC}"
-        else
-            echo -e "  Fail2ban: ${RED}禁用${NC}"
-        fi
-
-        if [[ -n "$NEW_SSH_PORT" ]]; then
-             echo -e "  SSH端口: ${YELLOW}${NEW_SSH_PORT} (预设)${NC}"
-        fi
-        if [[ -n "$NEW_SSH_PASSWORD" ]]; then
-             echo -e "  SSH密码: ${YELLOW}******** (预设)${NC}"
-        fi
-        echo -e "${CYAN}=====================================================${NC}"
+        echo -e "${CYAN}==================== VPS初始化 ====================${NC}"
+        echo -e "主机名: ${NEW_HOSTNAME:-自动/交互}"
+        echo -e "时区: ${TIMEZONE}"
+        echo -e "Swap: ${SWAP_SIZE_MB}"
+        echo -e "BBR: ${BBR_MODE}"
+        echo -e "DNS: ${PRIMARY_DNS_V4}, ${SECONDARY_DNS_V4}"
+        echo -e "Fail2ban: ${ENABLE_FAIL2BAN}"
+        [[ -n "$NEW_SSH_PORT" ]] && echo -e "SSH端口: ${NEW_SSH_PORT}"
+        echo -e "${CYAN}===================================================${NC}"
     } >&2
 
     if [[ "$non_interactive" = false ]]; then
-        read -p "确认配置并开始? [Y/n] " -r < /dev/tty
-        [[ "$REPLY" =~ ^[Nn]$ ]] && { echo "已取消"; exit 0; }
+        read -p "开始配置? [Y/n] " -r < /dev/tty
+        [[ "$REPLY" =~ ^[Nn]$ ]] && exit 0
     fi
     
     LOG_FILE="/var/log/vps-init-$(date +%Y%m%d-%H%M%S).log"
-    echo "VPS Initialization Log - Started at $(date)" > "$LOG_FILE"
+    echo "VPS Init Log - $(date)" > "$LOG_FILE"
     
-    log "\n${BLUE}[INFO] 开始执行配置... (日志: ${LOG_FILE})${NC}"
+    log "\n${BLUE}开始执行配置...${NC}"
     SECONDS=0
     
+    # 执行所有配置步骤
     pre_flight_checks
     install_packages
     configure_hostname
@@ -720,45 +714,48 @@ main() {
     configure_bbr
     configure_swap
     configure_dns
+    
+    # SSH配置 - 自动安装openssh-server如果需要
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
         if ! dpkg -l openssh-server >/dev/null 2>&1; then
-            log "${YELLOW}[WARN] 检测到您想配置SSH，但未安装openssh-server，正在自动安装...${NC}"
-            start_spinner "安装 openssh-server... "
+            start_spinner "安装openssh-server... "
             DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >> "$LOG_FILE" 2>&1
             stop_spinner
         fi
     fi
+    
     configure_ssh
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
     
+    # 运行验证
     run_verification
     
-    log "\n${YELLOW}==================== 配置完成 ====================${NC}"
-    log "${GREEN}🎉 VPS初始化配置完成！${NC}"
-    log "  执行时间: ${SECONDS}秒"
+    # 完成信息
+    log "\n${YELLOW}==================== 完成 ====================${NC}"
+    log "${GREEN}🎉 VPS初始化完成！${NC}"
+    log "执行时间: ${SECONDS}秒"
+    log "日志文件: ${LOG_FILE}"
     
+    # 重要提示
     if [[ -n "$NEW_SSH_PORT" ]]; then
-        log "\n${YELLOW}重要提示: SSH端口已更改为 ${NEW_SSH_PORT}。您需要使用新端口重新连接。${NC}"
+        log "\n${RED}⚠️  SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！${NC}"
     fi
-
+    
+    # 重启提示
     if is_container; then
-        log "\n${BLUE}[INFO] 容器环境无需重启，配置已生效。${NC}"
+        log "\n${BLUE}容器环境，配置已生效${NC}"
     else
-        log "\n${BLUE}[INFO] 建议重启以确保所有设置生效。${NC}"
+        log "\n${BLUE}建议重启以确保所有配置生效${NC}"
         if [[ "$non_interactive" = false ]]; then
             read -p "立即重启? [Y/n] " -r < /dev/tty
-            if [[ ! "$REPLY" =~ ^[Nn]$ ]]; then
-                log "${BLUE}[INFO] 重启中...${NC}"
-                reboot
-            else
-                log "${GREEN}请稍后手动重启：${YELLOW}sudo reboot${NC}"
-            fi
-        else
-            log "${YELLOW}非交互模式，跳过自动重启。请在确认连接正常后手动重启。${NC}"
+            [[ ! "$REPLY" =~ ^[Nn]$ ]] && { log "${BLUE}重启中...${NC}"; sleep 2; reboot; }
         fi
     fi
+    
+    # 根据验证结果确定退出码
+    [[ $VERIFICATION_FAILED -eq 0 ]] && exit 0 || exit 1
 }
 
-# 脚本入口点
+# 脚本入口
 main "$@"
