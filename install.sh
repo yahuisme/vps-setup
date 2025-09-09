@@ -2,22 +2,22 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9
+# 版本: 7.9.2
 # ------------------------------------------------------------------------------
 # 改进日志:
+# - [安全] 加固命令行密码处理，交互模式下隐藏输入并对非交互模式告警
+# - [健壮] SSH端口配置实现幂等性，防止重复配置
+# - [健壮] Fail2ban端口列表自动去重
+# - [修复] 增强IPv6网络检测的可靠性
 # - [安全] 加强权限验证
 # - [优化] BBR配置更加保守和自适应
-# - [增强] DNS配置警告优化  
-# - [性能] Swap创建进度显示
-# - [完善] 验证函数精确度提升
-# - [简化] 移除过度复杂功能，保持核心改进
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
-INSTALL_PACKAGES="sudo wget zip vim"
+INSTALL_PACKAGES="sudo wget zip vim curl" # 添加curl用于网络测试
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
@@ -99,7 +99,16 @@ get_public_ipv4() {
 }
 
 has_ipv6() {
-    ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'
+    if ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'; then
+        return 0
+    fi
+    if command -v ping &>/dev/null; then
+        ping -6 -c 1 -W 3 dns.google >/dev/null 2>&1 && return 0
+    fi
+    if command -v curl &>/dev/null; then
+        curl -6 -s --head --max-time 5 "https://[2606:4700:4700::1111]/" >/dev/null 2>&1 && return 0
+    fi
+    return 1
 }
 
 check_disk_space() {
@@ -130,19 +139,11 @@ is_kernel_version_ge() {
     [[ "$(compare_version "$current" "$required")" = "$required" ]]
 }
 
-# @description 简化的权限验证
 verify_privileges() {
     local checks=0
-    
-    # 检查root权限
     [[ $EUID -eq 0 ]] && ((checks++))
-    
-    # 检查关键文件写权限
     [[ -w /etc/passwd ]] && ((checks++))
-    
-    # 检查sudo权限（非root时）
     [[ $EUID -eq 0 ]] || groups | grep -qE '\b(sudo|wheel|admin)\b' && ((checks++))
-    
     if [[ $checks -lt 2 ]]; then
         log "${RED}[ERROR] 权限不足，需要root权限或完整sudo权限${NC}"
         return 1
@@ -175,7 +176,6 @@ verify_config() {
 verify_bbr() {
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
-    
     if [[ "$BBR_MODE" = "none" ]]; then
         [[ "$current_cc" != "bbr" ]] && record_verification "BBR" "PASS" "已禁用" || record_verification "BBR" "WARN" "可能需要重启生效"
     elif [[ "$current_cc" = "bbr" && "$current_qdisc" = "fq" ]]; then
@@ -187,7 +187,6 @@ verify_bbr() {
 
 verify_swap() {
     local current_swap_mb=$(awk '/SwapTotal/ {print int($2/1024 + 0.5)}' /proc/meminfo)
-    
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
         [[ $current_swap_mb -eq 0 ]] && record_verification "Swap" "PASS" "已禁用" || record_verification "Swap" "FAIL" "期望禁用但仍有${current_swap_mb}MB"
     else
@@ -197,14 +196,10 @@ verify_swap() {
 
 verify_dns() {
     local status="FAIL" message=""
-    
-    # 检查云环境警告
     if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         status="WARN"
         message="云环境可能覆盖配置; "
     fi
-    
-    # 检查实际配置
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         if [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]] && grep -q "$PRIMARY_DNS_V4" /etc/systemd/resolved.conf.d/99-custom-dns.conf; then
             [[ "$status" != "WARN" ]] && status="PASS"
@@ -222,7 +217,6 @@ verify_dns() {
             message="resolv.conf配置缺失"
         fi
     fi
-    
     record_verification "DNS" "$status" "$message"
 }
 
@@ -230,26 +224,19 @@ run_verification() {
     log "\n${YELLOW}=============== 配置验证 ===============${NC}"
     VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
     set +e
-    
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
     verify_bbr
     verify_swap
     verify_dns
-    
-    # 软件包验证
     local installed=0 total=0
     for pkg in $INSTALL_PACKAGES; do ((total++)); dpkg -l "$pkg" >/dev/null 2>&1 && ((installed++)); done
     [[ $installed -eq $total ]] && record_verification "软件包" "PASS" "全部已安装 ($installed/$total)" || record_verification "软件包" "FAIL" "部分缺失 ($installed/$total)"
-    
-    # SSH端口验证
     if [[ -n "$NEW_SSH_PORT" ]]; then
         local current_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
         [[ -z "$current_port" ]] && current_port="22"
         verify_config "SSH端口" "$NEW_SSH_PORT" "$current_port"
     fi
-    
-    # Fail2ban验证
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         if systemctl is-active --quiet fail2ban 2>/dev/null; then
             record_verification "Fail2ban" "PASS" "运行正常"
@@ -257,7 +244,6 @@ run_verification() {
             record_verification "Fail2ban" "FAIL" "服务异常"
         fi
     fi
-    
     set -e
     log "\n${BLUE}验证结果: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${YELLOW}警告 ${VERIFICATION_WARNINGS}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
 }
@@ -273,8 +259,8 @@ ${BLUE}核心选项:${NC}
   --hostname <name>     设置主机名
   --timezone <tz>       设置时区
   --swap <size_mb>      设置Swap大小，'auto'/'0'
-  --ip-dns <'主 备'>    设置IPv4 DNS
-  --ip6-dns <'主 备'>   设置IPv6 DNS
+  --ip-dns <'主 备'>     设置IPv4 DNS
+  --ip6-dns <'主 备'>    设置IPv6 DNS
 ${BLUE}BBR选项:${NC}
   --bbr-conservative    启用保守BBR (推荐)
   --bbr-optimized       启用优化BBR (高配置)
@@ -321,24 +307,19 @@ parse_args() {
 pre_flight_checks() {
     log "${BLUE}[INFO] 系统预检查...${NC}"
     verify_privileges || exit 1
-    
     if is_container; then
         log "${YELLOW}[WARN] 容器环境，某些功能可能受限${NC}"
         [[ "$non_interactive" = false ]] && { read -p "继续? [y/N] " -r < /dev/tty; [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0; }
     fi
-    
     [[ ! -f /etc/os-release ]] && { log "${RED}错误: 系统信息缺失${NC}"; exit 1; }
     source /etc/os-release
-    
     local supported=false
     [[ "$ID" = "debian" && "$VERSION_ID" =~ ^(10|11|12|13)$ ]] && supported=true
     [[ "$ID" = "ubuntu" && "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04)$ ]] && supported=true
-    
     if [[ "$supported" = "false" ]]; then
         log "${YELLOW}[WARN] 系统: ${PRETTY_NAME} (建议使用Debian 10-13或Ubuntu 20.04-24.04)${NC}"
         [[ "$non_interactive" = false ]] && { read -p "继续? [y/N] " -r < /dev/tty; [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0; }
     fi
-    
     log "${GREEN}✅ 系统: ${PRETTY_NAME}${NC}"
 }
 
@@ -347,12 +328,9 @@ install_packages() {
     start_spinner "更新软件包列表... "
     DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
     stop_spinner
-    
     start_spinner "安装基础软件包... "
     DEBIAN_FRONTEND=noninteractive apt-get install -y $INSTALL_PACKAGES >> "$LOG_FILE" 2>&1
     stop_spinner
-    
-    # 简化的Vim配置
     if command -v vim &>/dev/null; then
         cat > /etc/vim/vimrc.local << 'EOF'
 syntax on
@@ -380,7 +358,6 @@ configure_hostname() {
     log "\n${YELLOW}=============== 2. 主机名配置 ===============${NC}"
     local current_hostname=$(hostname)
     log "${BLUE}当前主机名: ${current_hostname}${NC}"
-    
     local final_hostname="$current_hostname"
     if [[ -n "$NEW_HOSTNAME" ]]; then
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
@@ -410,8 +387,6 @@ configure_hostname() {
             fi
         fi
     fi
-    
-    # 更新hosts文件
     if [[ "$final_hostname" != "$current_hostname" ]]; then
         if grep -q "^127\.0\.1\.1" /etc/hosts; then
             sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${final_hostname}/" /etc/hosts
@@ -430,21 +405,17 @@ configure_timezone() {
 configure_bbr() {
     log "\n${YELLOW}=============== 4. BBR配置 ===============${NC}"
     local config_file="/etc/sysctl.d/99-bbr.conf"
-    
     if [[ "$BBR_MODE" = "none" ]]; then
         log "${BLUE}[INFO] 跳过BBR配置${NC}"
         rm -f "$config_file"
         return
     fi
-    
     if ! is_kernel_version_ge "4.9"; then
         log "${RED}[ERROR] 内核版本过低 ($(uname -r))，需要4.9+${NC}"
         return 1
     fi
-    
     local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
     log "${BLUE}检测到内存: ${mem_mb}MB${NC}"
-    
     case "$BBR_MODE" in
         "conservative")
             log "${BLUE}配置保守BBR...${NC}"
@@ -485,7 +456,6 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
             ;;
     esac
-    
     sysctl -p "$config_file" >> "$LOG_FILE" 2>&1
     log "${GREEN}✅ BBR配置完成${NC}"
 }
@@ -493,28 +463,18 @@ EOF
 configure_swap() {
     log "\n${YELLOW}=============== 5. Swap配置 ===============${NC}"
     [[ "$SWAP_SIZE_MB" = "0" ]] && { log "${BLUE}Swap已禁用${NC}"; return; }
-    
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
         local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-        # 简化的自动计算
-        if [[ $mem_mb -lt 1024 ]]; then
-            swap_mb=$mem_mb
-        elif [[ $mem_mb -lt 4096 ]]; then
-            swap_mb=2048
-        else
-            swap_mb=4096
-        fi
+        if [[ $mem_mb -lt 1024 ]]; then swap_mb=$mem_mb
+        elif [[ $mem_mb -lt 4096 ]]; then swap_mb=2048
+        else swap_mb=4096; fi
         log "${BLUE}自动设置Swap: ${swap_mb}MB${NC}"
     else
         swap_mb="$SWAP_SIZE_MB"
     fi
-    
     check_disk_space $((swap_mb + 100)) || return 1
-    
     local swap_file="/swapfile"
-    
-    # 检查现有swap
     if [[ -f "$swap_file" ]]; then
         local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
         if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
@@ -524,10 +484,7 @@ configure_swap() {
         swapoff "$swap_file" 2>/dev/null || true
         rm -f "$swap_file"
     fi
-    
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
-    
-    # 选择创建方法并显示进度
     if command -v fallocate &>/dev/null; then
         start_spinner "快速创建Swap... "
         fallocate -l "${swap_mb}M" "$swap_file" >> "$LOG_FILE" 2>&1
@@ -543,7 +500,6 @@ configure_swap() {
         done
         echo ""
     fi
-    
     chmod 600 "$swap_file"
     mkswap "$swap_file" >> "$LOG_FILE" 2>&1
     swapon "$swap_file" >> "$LOG_FILE" 2>&1
@@ -553,12 +509,9 @@ configure_swap() {
 
 configure_dns() {
     log "\n${YELLOW}=============== 6. DNS配置 ===============${NC}"
-    
-    # 简化的环境检查
     if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
     fi
-    
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         log "${BLUE}配置systemd-resolved...${NC}"
         mkdir -p /etc/systemd/resolved.conf.d
@@ -584,15 +537,22 @@ EOF
 configure_ssh() {
     log "\n${YELLOW}=============== 7. SSH配置 ===============${NC}"
     
-    if [[ "$non_interactive" = false ]]; then
-        [[ -z "$NEW_SSH_PORT" ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
-        [[ -z "$NEW_SSH_PASSWORD" ]] && { read -p "root密码 (留空跳过): " -r NEW_SSH_PASSWORD < /dev/tty; }
-    fi
+    [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
     
+    # --- [安全优化] ---
+    if [[ -z "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = false ]]; then
+        read -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty
+        echo
+    fi
+    if [[ -n "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = true ]]; then
+        log "${RED}[SECURITY WARNING] 使用 --ssh-password 参数会将密码记录在shell历史中，存在安全风险！${NC}"
+    fi
+
     local ssh_changed=false
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
         cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
-        sed -i -E 's/^[#\s]*Port\s+[0-9]+$/# &/' /etc/ssh/sshd_config
+        # --- [健壮性优化] ---
+        sed -i '/^[#\s]*Port\s\+/d' /etc/ssh/sshd_config
         echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
         ssh_changed=true
         log "${GREEN}✅ SSH端口设为: ${NEW_SSH_PORT}${NC}"
@@ -622,13 +582,13 @@ configure_fail2ban() {
     [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]] && ports+=("$NEW_SSH_PORT")
     [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]] && ports+=("$FAIL2BAN_EXTRA_PORT")
     
-    # 自动检测SSH端口
     if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -f /etc/ssh/sshd_config ]]; then
         local detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
-        [[ -n "$detected_port" && "$detected_port" -ne 22 ]] && ports+=("$detected_port")
+        [[ -n "$detected_port" ]] && ports+=("$detected_port")
     fi
     
-    local port_list=$(printf "%s," "${ports[@]}" | sed 's/,$//')
+    # --- [健壮性优化] ---
+    local port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
     
     start_spinner "安装Fail2ban... "
     DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1
@@ -660,16 +620,13 @@ EOF
 
 system_update() {
     log "\n${YELLOW}=============== 9. 系统更新 ===============${NC}"
-    
     start_spinner "系统升级... "
     DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
     stop_spinner
-    
     start_spinner "清理缓存... "
     apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
     apt-get clean >> "$LOG_FILE" 2>&1
     stop_spinner
-    
     log "${GREEN}✅ 系统更新完成${NC}"
 }
 
@@ -682,7 +639,6 @@ main() {
     
     parse_args "$@"
 
-    # 简化的配置预览
     {
         echo -e "${CYAN}==================== VPS初始化 ====================${NC}"
         echo -e "主机名: ${NEW_HOSTNAME:-自动/交互}"
@@ -706,7 +662,6 @@ main() {
     log "\n${BLUE}开始执行配置...${NC}"
     SECONDS=0
     
-    # 执行所有配置步骤
     pre_flight_checks
     install_packages
     configure_hostname
@@ -715,7 +670,6 @@ main() {
     configure_swap
     configure_dns
     
-    # SSH配置 - 自动安装openssh-server如果需要
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
         if ! dpkg -l openssh-server >/dev/null 2>&1; then
             start_spinner "安装openssh-server... "
@@ -728,21 +682,17 @@ main() {
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
     
-    # 运行验证
     run_verification
     
-    # 完成信息
     log "\n${YELLOW}==================== 完成 ====================${NC}"
     log "${GREEN}🎉 VPS初始化完成！${NC}"
     log "执行时间: ${SECONDS}秒"
     log "日志文件: ${LOG_FILE}"
     
-    # 重要提示
     if [[ -n "$NEW_SSH_PORT" ]]; then
         log "\n${RED}⚠️  SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！${NC}"
     fi
     
-    # 重启提示
     if is_container; then
         log "\n${BLUE}容器环境，配置已生效${NC}"
     else
@@ -753,9 +703,7 @@ main() {
         fi
     fi
     
-    # 根据验证结果确定退出码
     [[ $VERIFICATION_FAILED -eq 0 ]] && exit 0 || exit 1
 }
 
-# 脚本入口
 main "$@"
