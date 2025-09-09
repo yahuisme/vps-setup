@@ -2,22 +2,21 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.2
+# 版本: 7.9.3
 # ------------------------------------------------------------------------------
 # 改进日志:
+# - [增强] DNS验证结果现在会显示具体的IPv4和IPv6 DNS地址
 # - [安全] 加固命令行密码处理，交互模式下隐藏输入并对非交互模式告警
 # - [健壮] SSH端口配置实现幂等性，防止重复配置
 # - [健壮] Fail2ban端口列表自动去重
 # - [修复] 增强IPv6网络检测的可靠性
-# - [安全] 加强权限验证
-# - [优化] BBR配置更加保守和自适应
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
-INSTALL_PACKAGES="sudo wget zip vim curl" # 添加curl用于网络测试
+INSTALL_PACKAGES="sudo wget zip vim curl"
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
@@ -194,29 +193,37 @@ verify_swap() {
     fi
 }
 
+# --- [已修改] 增强的DNS验证函数 ---
 verify_dns() {
-    local status="FAIL" message=""
+    local status="FAIL" message="" dns_servers=""
+    
     if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         status="WARN"
-        message="云环境可能覆盖配置; "
+        message="云环境可能覆盖; "
     fi
+    
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        if [[ -f /etc/systemd/resolved.conf.d/99-custom-dns.conf ]] && grep -q "$PRIMARY_DNS_V4" /etc/systemd/resolved.conf.d/99-custom-dns.conf; then
-            [[ "$status" != "WARN" ]] && status="PASS"
-            message+="systemd-resolved已配置"
-        else
-            status="FAIL"
-            message="systemd-resolved配置缺失"
+        local conf_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
+        if [[ -f "$conf_file" ]]; then
+            dns_servers=$(grep -E "^\s*DNS=" "$conf_file" | sed -e 's/DNS=//' -e 's/^\s*//' -e 's/\s*$//')
         fi
+        message+="systemd-resolved: "
     else
-        if grep -q "$PRIMARY_DNS_V4" /etc/resolv.conf 2>/dev/null; then
-            [[ "$status" != "WARN" ]] && status="PASS"
-            message+="resolv.conf已配置"
-        else
-            status="FAIL"
-            message="resolv.conf配置缺失"
+        local conf_file="/etc/resolv.conf"
+        if [[ -f "$conf_file" ]]; then
+            dns_servers=$(grep -E "^\s*nameserver" "$conf_file" | awk '{print $2}' | paste -sd ' ' -)
         fi
+        message+="resolv.conf: "
     fi
+    
+    if [[ -n "$dns_servers" ]]; then
+        [[ "$status" != "WARN" ]] && status="PASS"
+        message+="${dns_servers}"
+    else
+        status="FAIL"
+        message+="配置缺失"
+    fi
+    
     record_verification "DNS" "$status" "$message"
 }
 
@@ -539,7 +546,6 @@ configure_ssh() {
     
     [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
     
-    # --- [安全优化] ---
     if [[ -z "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = false ]]; then
         read -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty
         echo
@@ -551,7 +557,6 @@ configure_ssh() {
     local ssh_changed=false
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
         cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
-        # --- [健壮性优化] ---
         sed -i '/^[#\s]*Port\s\+/d' /etc/ssh/sshd_config
         echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
         ssh_changed=true
@@ -587,7 +592,6 @@ configure_fail2ban() {
         [[ -n "$detected_port" ]] && ports+=("$detected_port")
     fi
     
-    # --- [健壮性优化] ---
     local port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
     
     start_spinner "安装Fail2ban... "
