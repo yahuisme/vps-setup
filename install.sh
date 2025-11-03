@@ -2,16 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.5
+# 版本: 7.9.7
 # ------------------------------------------------------------------------------
-# 改进日志:
-# - [修复] 修正了由非换行空格 (U+00A0) 导致的 "syntax error"
-# - [调整] BBR逻辑变更：默认启用标准BBR (--bbr)，--no-bbr 可禁用
-# - [增强] DNS验证结果现在会显示具体的IPv4和IPv6 DNS地址
-# - [安全] 加固命令行密码处理，交互模式下隐藏输入并对非交互模式告警
-# - [健壮] SSH端口配置实现幂等性，防止重复配置
-# - [健壮] Fail2ban端口列表自动去重
-# - [修复] 增强IPv6网络检测的可靠性
+# 改进日志 (v7.9.7):
+# - [新增] 增加 "时间同步" 配置 (启用 systemd-timesyncd)
+# - [健壮] 确保在启用 systemd-timesyncd 前，没有其他NTP服务在运行
+# - [CRITICAL-FIX] 彻底清除了导致 v7.9.5 脚本语法错误的非换行空格 (U+00A0)
+# - [FIX] 修复了非交互模式下，获取公网IP失败时仍尝试设置空主机名的Bug
 # ==============================================================================
 set -euo pipefail
 
@@ -195,7 +192,6 @@ verify_swap() {
     fi
 }
 
-# --- [已修改] 增强的DNS验证函数 ---
 verify_dns() {
     local status="FAIL" message="" dns_servers=""
     
@@ -229,12 +225,26 @@ verify_dns() {
     record_verification "DNS" "$status" "$message"
 }
 
+# [新增] 验证时间同步
+verify_time_sync() {
+    if timedatectl status | grep -q 'NTP service: active'; then
+        record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
+    elif systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null; then
+        record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
+    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
+    else
+        record_verification "时间同步" "FAIL" "NTP服务未运行"
+    fi
+}
+
 run_verification() {
     log "\n${YELLOW}=============== 配置验证 ===============${NC}"
     VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
     set +e
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
+    verify_time_sync # [新增]
     verify_bbr
     verify_swap
     verify_dns
@@ -377,13 +387,20 @@ configure_hostname() {
             log "${RED}[ERROR] 主机名格式错误${NC}"
             NEW_HOSTNAME=""
         fi
+    
+    # [FIX] 修复非交互模式下的逻辑漏洞
     elif [[ "$non_interactive" = true ]]; then
         local auto_ip
-        if auto_ip=$(get_public_ipv4); then
+        auto_ip=$(get_public_ipv4) # 先获取
+        
+        # [FIX] 检查 auto_ip 是否为空
+        if [[ -n "$auto_ip" ]]; then 
             final_hostname=$(echo "$auto_ip" | tr '.' '-')
             hostnamectl set-hostname "$final_hostname" >> "$LOG_FILE" 2>&1
             NEW_HOSTNAME="$final_hostname"
             log "${GREEN}✅ 自动设置主机名: ${final_hostname}${NC}"
+        else
+            log "${YELLOW}[WARN] 无法自动获取公网IP，跳过自动设置主机名。${NC}"
         fi
     elif [[ "$non_interactive" = false ]]; then
         read -p "修改主机名? [y/N] " -r < /dev/tty
@@ -411,8 +428,42 @@ configure_timezone() {
     log "${GREEN}✅ 时区: ${TIMEZONE}${NC}"
 }
 
+# [新增] 确保时间同步
+configure_time_sync() {
+    log "\n${YELLOW}=============== 4. 时间同步配置 ===============${NC}"
+    # 检查是否有其他NTP服务在运行
+    if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null || systemctl is-active --quiet ntpd 2>/dev/null; then
+        log "${GREEN}✅ 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过 systemd-timesyncd 配置。${NC}"
+        return
+    fi
+    
+    # 检查 timedatectl 是否存在
+    if ! command -v timedatectl >/dev/null 2>&1; then
+        log "${YELLOW}[WARN] 未找到 timedatectl 命令, 无法自动启用NTP。${NC}"
+        log "${YELLOW}       请考虑安装 'systemd' 或 'chrony'。${NC}"
+        return
+    fi
+
+    start_spinner "启用 systemd-timesyncd (NTP)... "
+    # timedatectl set-ntp true 是幂等的
+    timedatectl set-ntp true >> "$LOG_FILE" 2>&1
+    # 在某些系统上，还需要显式启动 (尽管 set-ntp true 通常会处理)
+    systemctl start systemd-timesyncd >> "$LOG_FILE" 2>&1
+    stop_spinner
+    
+    # 验证
+    if timedatectl status | grep -q 'NTP service: active'; then
+        log "${GREEN}✅ systemd-timesyncd (NTP) 已启用并激活。${NC}"
+    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        log "${GREEN}✅ systemd-timesyncd (NTP) 服务正在运行。${NC}"
+    else
+        log "${RED}[ERROR] 尝试启用 systemd-timesyncd 失败！${NC}"
+        log "${RED}       请检查 'timedatectl status' 和 'systemctl status systemd-timesyncd'${NC}"
+    fi
+}
+
 configure_bbr() {
-    log "\n${YELLOW}=============== 4. BBR配置 ===============${NC}"
+    log "\n${YELLOW}=============== 5. BBR配置 ===============${NC}"
     local config_file="/etc/sysctl.d/99-bbr.conf"
     if [[ "$BBR_MODE" = "none" ]]; then
         log "${BLUE}[INFO] 跳过BBR配置${NC}"
@@ -458,7 +509,7 @@ EOF
 }
 
 configure_swap() {
-    log "\n${YELLOW}=============== 5. Swap配置 ===============${NC}"
+    log "\n${YELLOW}=============== 6. Swap配置 ===============${NC}"
     [[ "$SWAP_SIZE_MB" = "0" ]] && { log "${BLUE}Swap已禁用${NC}"; return; }
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
@@ -505,7 +556,7 @@ configure_swap() {
 }
 
 configure_dns() {
-    log "\n${YELLOW}=============== 6. DNS配置 ===============${NC}"
+    log "\n${YELLOW}=============== 7. DNS配置 ===============${NC}"
     if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
     fi
@@ -532,7 +583,7 @@ EOF
 }
 
 configure_ssh() {
-    log "\n${YELLOW}=============== 7. SSH配置 ===============${NC}"
+    log "\n${YELLOW}=============== 8. SSH配置 ===============${NC}"
     
     [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
     
@@ -571,7 +622,7 @@ configure_ssh() {
 }
 
 configure_fail2ban() {
-    log "\n${YELLOW}=============== 8. Fail2ban配置 ===============${NC}"
+    log "\n${YELLOW}=============== 9. Fail2ban配置 ===============${NC}"
     
     local ports=("22")
     [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]] && ports+=("$NEW_SSH_PORT")
@@ -613,7 +664,7 @@ EOF
 }
 
 system_update() {
-    log "\n${YELLOW}=============== 9. 系统更新 ===============${NC}"
+    log "\n${YELLOW}=============== 10. 系统更新 ===============${NC}"
     start_spinner "系统升级... "
     DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
     stop_spinner
@@ -660,6 +711,7 @@ main() {
     install_packages
     configure_hostname
     configure_timezone
+    configure_time_sync # [新增]
     configure_bbr
     configure_swap
     configure_dns
