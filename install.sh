@@ -2,21 +2,22 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.10
+# 版本: 7.9.11
 # ------------------------------------------------------------------------------
-# 改进日志 (v7.9.10):
-# - [健壮] 移除了所有 'timeout' 命令，防止在最小化系统中崩溃
+# 改进日志 (v7.9.11):
+# - [CRITICAL-FIX] 彻底重写 'configure_time_sync' 函数，解决其在 Debian 13 上的失败问题
+# - [健壮] 增加 'systemctl unmask systemd-timesyncd' 步骤
+# - [健壮] 检查 'timedatectl' 命令的真实返回值，而不是隐藏错误
+# - [健壮] 增加了 'systemctl enable --now' 作为 'timedatectl' 的备用方案
 #
-# 改进日志 (v7.9.7):
-# - [新增] 增加 "时间同步" 配置 (启用 systemd-timesyncd)
-# - [FIX] 修复非交互模式下，获取公网IP失败时仍尝试设置空主机名的Bug
+# 改进日志 (v7.9.10):
+# - [FIX] 修复 'tput civis' 命令失败导致 'set -e' 终止脚本的Bug
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
-# [FIX] 移除 coreutils 和 ncurses-bin
 INSTALL_PACKAGES="sudo wget zip vim curl"
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
@@ -207,13 +208,12 @@ verify_swap() {
 verify_dns() {
     local status="FAIL" message="" dns_servers=""
     
-    # [FIX] 移除 timeout，依赖 set -e
-    if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+    if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
         status="WARN"
         message="云环境可能覆盖; "
     fi
     
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if (systemctl is-active --quiet systemd-resolved 2>/dev/null); then
         local conf_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
         if [[ -f "$conf_file" ]]; then
             dns_servers=$(grep -E "^\s*DNS=" "$conf_file" | sed -e 's/DNS=//' -e 's/^\s*//' -e 's/\s*$//')
@@ -240,12 +240,11 @@ verify_dns() {
 
 # [新增] 验证时间同步
 verify_time_sync() {
-    # [FIX] 移除 timeout，依赖 set -e
-    if timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
+    if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
         record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
-    elif systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null; then
+    elif (systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null); then
         record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
-    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
     else
         record_verification "时间同步" "FAIL" "NTP服务未运行"
@@ -272,7 +271,7 @@ run_verification() {
         verify_config "SSH端口" "$NEW_SSH_PORT" "$current_port"
     fi
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        if (systemctl is-active --quiet fail2ban 2>/dev/null); then
             record_verification "Fail2ban" "PASS" "运行正常"
         else
             record_verification "Fail2ban" "FAIL" "服务异常"
@@ -444,11 +443,11 @@ configure_timezone() {
     log "${GREEN}✅ 时区: ${TIMEZONE}${NC}"
 }
 
-# [新增] 确保时间同步
+# [修改] 健壮性更强的函数
 configure_time_sync() {
     log "\n${YELLOW}=============== 4. 时间同步配置 ===============${NC}"
     
-    # [FIX] 增加 "|| true" 确保即使 systemctl 失败 (e.g., command not found), set -e 也不会终止脚本
+    # 检查是否有其他NTP服务在运行
     if (systemctl is-active --quiet chrony 2>/dev/null || \
        systemctl is-active --quiet ntp 2>/dev/null || \
        systemctl is-active --quiet ntpd 2>/dev/null); then
@@ -458,28 +457,47 @@ configure_time_sync() {
     
     if ! command -v timedatectl >/dev/null 2>&1; then
         log "${YELLOW}[WARN] 未找到 timedatectl 命令, 无法自动启用NTP。${NC}"
-        log "${YELLOW}       请考虑安装 'systemd' 或 'chrony'。${NC}"
+        return
+    fi
+
+    # 检查服务是否存在
+    if ! systemctl cat systemd-timesyncd >/dev/null 2>&1; then
+        log "${YELLOW}[WARN] 未找到 systemd-timesyncd.service, 无法启用。${NC}"
+        log "${YELLOW}       请考虑安装 'chrony'。${NC}"
         return
     fi
 
     start_spinner "启用 systemd-timesyncd (NTP)... "
     
-    # [FIX] 增加 "|| true" 确保命令失败或超时都不会触发 set -e
-    timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || true
-    systemctl start systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+    local ntp_set_success=false
+    # 尝试 unmask (以防万一)
+    systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+    
+    # 尝试 set-ntp true (这是首选方法)
+    if timedatectl set-ntp true >> "$LOG_FILE" 2>&1; then
+        ntp_set_success=true
+    else
+        # 备用方法：如果 timedatectl 失败，尝试手动 enable/start
+        log "${YELLOW}[WARN] 'timedatectl' 命令失败, 尝试 'systemctl enable --now'...${NC}"
+        systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+    fi
     
     stop_spinner
     
-    # [FIX] 增加 "|| true"
+    # 验证
     if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
         log "${GREEN}✅ systemd-timesyncd (NTP) 已启用并激活。${NC}"
     elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         log "${GREEN}✅ systemd-timesyncd (NTP) 服务正在运行。${NC}"
     else
         log "${RED}[ERROR] 尝试启用 systemd-timesyncd 失败！${NC}"
+        if [ "$ntp_set_success" = false ]; then
+             log "${RED}       'timedatectl set-ntp true' 命令执行失败。${NC}"
+        fi
         log "${RED}       请检查 'timedatectl status' 和 'systemctl status systemd-timesyncd'${NC}"
     fi
 }
+
 
 configure_bbr() {
     log "\n${YELLOW}=============== 5. BBR配置 ===============${NC}"
