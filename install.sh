@@ -5,6 +5,7 @@
 # 版本: 7.9.8
 # ------------------------------------------------------------------------------
 # 改进日志 (v7.9.8):
+# - [CRITICAL-FIX] 修复了 v7.9.7 中 'systemctl' 命令因 D-Bus 挂起导致脚本卡住的Bug
 # - [CRITICAL-FIX] 再次并彻底清除非法 U+00A0 空格 (v7.9.7 合并时出错)
 #
 # 改进日志 (v7.9.7):
@@ -197,12 +198,12 @@ verify_swap() {
 verify_dns() {
     local status="FAIL" message="" dns_servers=""
     
-    if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+    if timeout 2s systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         status="WARN"
         message="云环境可能覆盖; "
     fi
     
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if timeout 2s systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         local conf_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
         if [[ -f "$conf_file" ]]; then
             dns_servers=$(grep -E "^\s*DNS=" "$conf_file" | sed -e 's/DNS=//' -e 's/^\s*//' -e 's/\s*$//')
@@ -229,11 +230,11 @@ verify_dns() {
 
 # [新增] 验证时间同步
 verify_time_sync() {
-    if timedatectl status | grep -q 'NTP service: active'; then
+    if timeout 5s timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
         record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
-    elif systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null; then
+    elif timeout 2s systemctl is-active --quiet chrony 2>/dev/null || timeout 2s systemctl is-active --quiet ntp 2>/dev/null; then
         record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
-    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    elif timeout 2s systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
         record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
     else
         record_verification "时间同步" "FAIL" "NTP服务未运行"
@@ -259,7 +260,7 @@ run_verification() {
         verify_config "SSH端口" "$NEW_SSH_PORT" "$current_port"
     fi
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        if timeout 2s systemctl is-active --quiet fail2ban 2>/dev/null; then
             record_verification "Fail2ban" "PASS" "运行正常"
         else
             record_verification "Fail2ban" "FAIL" "服务异常"
@@ -433,13 +434,15 @@ configure_timezone() {
 # [新增] 确保时间同步
 configure_time_sync() {
     log "\n${YELLOW}=============== 4. 时间同步配置 ===============${NC}"
-    # 检查是否有其他NTP服务在运行
-    if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null || systemctl is-active --quiet ntpd 2>/dev/null; then
+    
+    # [FIX] 增加 timeout 防止 systemctl 挂起
+    if timeout 2s systemctl is-active --quiet chrony 2>/dev/null || \
+       timeout 2s systemctl is-active --quiet ntp 2>/dev/null || \
+       timeout 2s systemctl is-active --quiet ntpd 2>/dev/null; then
         log "${GREEN}✅ 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过 systemd-timesyncd 配置。${NC}"
         return
     fi
     
-    # 检查 timedatectl 是否存在
     if ! command -v timedatectl >/dev/null 2>&1; then
         log "${YELLOW}[WARN] 未找到 timedatectl 命令, 无法自动启用NTP。${NC}"
         log "${YELLOW}       请考虑安装 'systemd' 或 'chrony'。${NC}"
@@ -447,17 +450,17 @@ configure_time_sync() {
     fi
 
     start_spinner "启用 systemd-timesyncd (NTP)... "
-    # timedatectl set-ntp true 是幂等的
-    timedatectl set-ntp true >> "$LOG_FILE" 2>&1
-    # 在某些系统上，还需要显式启动 (尽管 set-ntp true 通常会处理)
-    # [FIX] 增加 2>&1 抑制潜在的 (无害的) 错误输出
-    systemctl start systemd-timesyncd >> "$LOG_FILE" 2>&1
+    
+    # [FIX] 增加 timeout 防止 D-Bus 挂起
+    timeout 5s timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] 'timedatectl set-ntp' command timed out or failed.${NC}"
+    timeout 5s systemctl start systemd-timesyncd >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] 'systemctl start systemd-timesyncd' command timed out or failed.${NC}"
+    
     stop_spinner
     
-    # 验证
-    if timedatectl status | grep -q 'NTP service: active'; then
+    # [FIX] 增加 timeout 防止验证时挂起
+    if timeout 5s timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
         log "${GREEN}✅ systemd-timesyncd (NTP) 已启用并激活。${NC}"
-    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    elif timeout 2s systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
         log "${GREEN}✅ systemd-timesyncd (NTP) 服务正在运行。${NC}"
     else
         log "${RED}[ERROR] 尝试启用 systemd-timesyncd 失败！${NC}"
@@ -560,10 +563,10 @@ configure_swap() {
 
 configure_dns() {
     log "\n${YELLOW}=============== 7. DNS配置 ===============${NC}"
-    if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+    if timeout 2s systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
     fi
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if timeout 2s systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         log "${BLUE}配置systemd-resolved...${NC}"
         mkdir -p /etc/systemd/resolved.conf.d
         cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
@@ -571,7 +574,7 @@ configure_dns() {
 DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$(has_ipv6 && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}")
 FallbackDNS=1.0.0.1 8.8.4.4
 EOF
-        systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1
+        timeout 5s systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] systemd-resolved 重启失败或超时${NC}"
     else
         log "${BLUE}配置resolv.conf...${NC}"
         chattr -i /etc/resolv.conf 2>/dev/null || true
@@ -614,12 +617,12 @@ configure_ssh() {
     
     if [[ "$ssh_changed" = true ]]; then
         if sshd -t 2>>"$LOG_FILE"; then
-            systemctl restart sshd >> "$LOG_FILE" 2>&1
+            timeout 5s systemctl restart sshd >> "$LOG_FILE" 2>&1
             log "${YELLOW}[WARN] SSH端口已更改，请用新端口重连！${NC}"
         else
             log "${RED}[ERROR] SSH配置错误，已恢复备份${NC}"
             cp "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)" /etc/ssh/sshd_config
-            systemctl restart sshd >> "$LOG_FILE" 2>&1
+            timeout 5s systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
         fi
     fi
 }
@@ -656,10 +659,10 @@ port = ${port_list}
 maxretry = 3
 EOF
     
-    systemctl enable fail2ban >> "$LOG_FILE" 2>&1
-    systemctl start fail2ban >> "$LOG_FILE" 2>&1
+    timeout 5s systemctl enable fail2ban >> "$LOG_FILE" 2>&1
+    timeout 5s systemctl start fail2ban >> "$LOG_FILE" 2>&1
     
-    if systemctl is-active --quiet fail2ban; then
+    if timeout 2s systemctl is-active --quiet fail2ban; then
         log "${GREEN}✅ Fail2ban已启动，保护端口: ${port_list}${NC}"
     else
         log "${RED}[ERROR] Fail2ban启动失败${NC}"
