@@ -2,22 +2,21 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.8
+# 版本: 7.9.10
 # ------------------------------------------------------------------------------
-# 改进日志 (v7.9.8):
-# - [CRITICAL-FIX] 修复了 v7.9.7 中 'systemctl' 命令因 D-Bus 挂起导致脚本卡住的Bug
-# - [CRITICAL-FIX] 再次并彻底清除非法 U+00A0 空格 (v7.9.7 合并时出错)
+# 改进日志 (v7.9.10):
+# - [健壮] 移除了所有 'timeout' 命令，防止在最小化系统中崩溃
 #
 # 改进日志 (v7.9.7):
 # - [新增] 增加 "时间同步" 配置 (启用 systemd-timesyncd)
-# - [健壮] 确保在启用 systemd-timesyncd 前，没有其他NTP服务在运行
-# - [FIX] 修复了非交互模式下，获取公网IP失败时仍尝试设置空主机名的Bug
+# - [FIX] 修复非交互模式下，获取公网IP失败时仍尝试设置空主机名的Bug
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
+# [FIX] 移除 coreutils 和 ncurses-bin
 INSTALL_PACKAGES="sudo wget zip vim curl"
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
@@ -52,7 +51,8 @@ log() {
 
 handle_error() {
     local exit_code=$? line_number=$1
-    tput cnorm
+    # [FIX] 增加 2>/dev/null || true 确保 tput 失败时不会再次触发错误
+    command -v tput >/dev/null 2>&1 && tput cnorm 2>/dev/null || true
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     echo -e "$error_message"
     [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE"
@@ -61,11 +61,16 @@ handle_error() {
 }
 
 start_spinner() {
-    if [[ ! -t 1 ]]; then return; fi
+    # 如果 tput 不可用或非 TTY，则不显示 spinner
+    if ! command -v tput >/dev/null 2>&1 || [[ ! -t 1 ]]; then
+        echo -e "${CYAN}${1:-}${NC}"
+        return
+    fi
     echo -n -e "${CYAN}${1:-}${NC}"
     ( while :; do for c in '/' '-' '\' '|'; do echo -ne "\b$c"; sleep 0.1; done; done ) &
     spinner_pid=$!
-    tput civis
+    # [FIX] 增加 2>/dev/null || true 防止 'tput civis' 失败时终止脚本
+    tput civis 2>/dev/null || true
 }
 
 stop_spinner() {
@@ -74,9 +79,13 @@ stop_spinner() {
         wait "$spinner_pid" 2>/dev/null || true
         spinner_pid=0
     fi
-    if [[ ! -t 1 ]]; then return; fi
-    tput cnorm
-    echo -e "\b${GREEN}✔${NC}"
+    # [FIX] 增加 2>/dev/null || true
+    if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
+        tput cnorm 2>/dev/null || true
+        echo -e "\b${GREEN}✔${NC}"
+    else
+        echo -e "${GREEN}✔${NC}"
+    fi
 }
 
 show_progress() {
@@ -198,12 +207,13 @@ verify_swap() {
 verify_dns() {
     local status="FAIL" message="" dns_servers=""
     
-    if timeout 2s systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+    # [FIX] 移除 timeout，依赖 set -e
+    if systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
         status="WARN"
         message="云环境可能覆盖; "
     fi
     
-    if timeout 2s systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         local conf_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
         if [[ -f "$conf_file" ]]; then
             dns_servers=$(grep -E "^\s*DNS=" "$conf_file" | sed -e 's/DNS=//' -e 's/^\s*//' -e 's/\s*$//')
@@ -230,11 +240,12 @@ verify_dns() {
 
 # [新增] 验证时间同步
 verify_time_sync() {
-    if timeout 5s timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
+    # [FIX] 移除 timeout，依赖 set -e
+    if timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
         record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
-    elif timeout 2s systemctl is-active --quiet chrony 2>/dev/null || timeout 2s systemctl is-active --quiet ntp 2>/dev/null; then
+    elif systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null; then
         record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
-    elif timeout 2s systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
         record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
     else
         record_verification "时间同步" "FAIL" "NTP服务未运行"
@@ -244,6 +255,7 @@ verify_time_sync() {
 run_verification() {
     log "\n${YELLOW}=============== 配置验证 ===============${NC}"
     VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
+    # 验证时临时关闭 set -e
     set +e
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
@@ -260,12 +272,13 @@ run_verification() {
         verify_config "SSH端口" "$NEW_SSH_PORT" "$current_port"
     fi
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-        if timeout 2s systemctl is-active --quiet fail2ban 2>/dev/null; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
             record_verification "Fail2ban" "PASS" "运行正常"
         else
             record_verification "Fail2ban" "FAIL" "服务异常"
         fi
     fi
+    # 恢复 set -e
     set -e
     log "\n${BLUE}验证结果: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${YELLOW}警告 ${VERIFICATION_WARNINGS}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
 }
@@ -435,10 +448,10 @@ configure_timezone() {
 configure_time_sync() {
     log "\n${YELLOW}=============== 4. 时间同步配置 ===============${NC}"
     
-    # [FIX] 增加 timeout 防止 systemctl 挂起
-    if timeout 2s systemctl is-active --quiet chrony 2>/dev/null || \
-       timeout 2s systemctl is-active --quiet ntp 2>/dev/null || \
-       timeout 2s systemctl is-active --quiet ntpd 2>/dev/null; then
+    # [FIX] 增加 "|| true" 确保即使 systemctl 失败 (e.g., command not found), set -e 也不会终止脚本
+    if (systemctl is-active --quiet chrony 2>/dev/null || \
+       systemctl is-active --quiet ntp 2>/dev/null || \
+       systemctl is-active --quiet ntpd 2>/dev/null); then
         log "${GREEN}✅ 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过 systemd-timesyncd 配置。${NC}"
         return
     fi
@@ -451,16 +464,16 @@ configure_time_sync() {
 
     start_spinner "启用 systemd-timesyncd (NTP)... "
     
-    # [FIX] 增加 timeout 防止 D-Bus 挂起
-    timeout 5s timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] 'timedatectl set-ntp' command timed out or failed.${NC}"
-    timeout 5s systemctl start systemd-timesyncd >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] 'systemctl start systemd-timesyncd' command timed out or failed.${NC}"
+    # [FIX] 增加 "|| true" 确保命令失败或超时都不会触发 set -e
+    timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || true
+    systemctl start systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     
     stop_spinner
     
-    # [FIX] 增加 timeout 防止验证时挂起
-    if timeout 5s timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
+    # [FIX] 增加 "|| true"
+    if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
         log "${GREEN}✅ systemd-timesyncd (NTP) 已启用并激活。${NC}"
-    elif timeout 2s systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         log "${GREEN}✅ systemd-timesyncd (NTP) 服务正在运行。${NC}"
     else
         log "${RED}[ERROR] 尝试启用 systemd-timesyncd 失败！${NC}"
@@ -563,10 +576,10 @@ configure_swap() {
 
 configure_dns() {
     log "\n${YELLOW}=============== 7. DNS配置 ===============${NC}"
-    if timeout 2s systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]; then
+    if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
         log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
     fi
-    if timeout 2s systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if (systemctl is-active --quiet systemd-resolved 2>/dev/null); then
         log "${BLUE}配置systemd-resolved...${NC}"
         mkdir -p /etc/systemd/resolved.conf.d
         cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
@@ -574,7 +587,7 @@ configure_dns() {
 DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$(has_ipv6 && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}")
 FallbackDNS=1.0.0.1 8.8.4.4
 EOF
-        timeout 5s systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] systemd-resolved 重启失败或超时${NC}"
+        systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] systemd-resolved 重启失败${NC}"
     else
         log "${BLUE}配置resolv.conf...${NC}"
         chattr -i /etc/resolv.conf 2>/dev/null || true
@@ -617,12 +630,12 @@ configure_ssh() {
     
     if [[ "$ssh_changed" = true ]]; then
         if sshd -t 2>>"$LOG_FILE"; then
-            timeout 5s systemctl restart sshd >> "$LOG_FILE" 2>&1
+            systemctl restart sshd >> "$LOG_FILE" 2>&1
             log "${YELLOW}[WARN] SSH端口已更改，请用新端口重连！${NC}"
         else
             log "${RED}[ERROR] SSH配置错误，已恢复备份${NC}"
             cp "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)" /etc/ssh/sshd_config
-            timeout 5s systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
+            systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
         fi
     fi
 }
@@ -659,10 +672,10 @@ port = ${port_list}
 maxretry = 3
 EOF
     
-    timeout 5s systemctl enable fail2ban >> "$LOG_FILE" 2>&1
-    timeout 5s systemctl start fail2ban >> "$LOG_FILE" 2>&1
+    systemctl enable fail2ban >> "$LOG_FILE" 2>&1
+    systemctl start fail2ban >> "$LOG_FILE" 2>&1
     
-    if timeout 2s systemctl is-active --quiet fail2ban; then
+    if (systemctl is-active --quiet fail2ban); then
         log "${GREEN}✅ Fail2ban已启动，保护端口: ${port_list}${NC}"
     else
         log "${RED}[ERROR] Fail2ban启动失败${NC}"
