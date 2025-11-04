@@ -2,16 +2,15 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.14
+# 版本: 7.9.15
 # ------------------------------------------------------------------------------
+# 改进日志 (v7.9.15):
+# - [FIX] 修正 'parse_args' 函数中一个不影响功能的变量名笔误
+#
 # 改进日志 (v7.9.14):
-# - [CRITICAL-FIX] 遵从您的要求，移除 'chrony' 回退逻辑
 # - [健壮] 'configure_time_sync' 现在会优先尝试启用 'systemd-timesyncd'，
 #   如果失败，则尝试 'apt-get install systemd-timesyncd'，然后再次尝试启用。
 # - [健壮] 修正 'verify_time_sync' 逻辑，将 'chrony' 视为警告 (WARN)
-#
-# 改进日志 (v7.9.10):
-# - [FIX] 修复 'tput civis' 命令失败导致 'set -e' 终止脚本的Bug
 # ==============================================================================
 set -euo pipefail
 
@@ -325,7 +324,7 @@ parse_args() {
             --bbr) BBR_MODE="default"; shift ;;
             --bbr-optimized) BBR_MODE="optimized"; shift ;;
             --no-bbr) BBR_MODE="none"; shift ;;
-            --fail2ban) ENABLE_FAIL2BAN=true; [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2AN_EXTRA_PORT="$2"; shift; }; shift ;;
+            --fail2ban) ENABLE_FAIL2BAN=true; [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }; shift ;;
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
             --ssh-port) NEW_SSH_PORT="$2"; shift 2 ;;
             --ssh-password) NEW_SSH_PASSWORD="$2"; shift 2 ;;
@@ -453,7 +452,7 @@ configure_time_sync() {
        systemctl is-active --quiet ntp 2>/dev/null || \
        systemctl is-active --quiet ntpd 2>/dev/null); then
         log "${YELLOW}[WARN] 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过。${NC}"
-        log "${YELLOW}       (脚本被配置为不使用 chrony)${NC}"
+        log "${YELLOW}       (脚本被配置为仅使用 systemd-timesyncd)${NC}"
         return
     fi
 
@@ -468,6 +467,7 @@ configure_time_sync() {
     if systemctl cat systemd-timesyncd >/dev/null 2>&1; then
         start_spinner "启用 systemd-timesyncd (NTP)... "
         systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+        
         if timedatectl set-ntp true >> "$LOG_FILE" 2>&1; then
             timesyncd_enabled=true
         else
@@ -506,7 +506,6 @@ configure_time_sync() {
         log "${RED}       (脚本被配置为不回退到 chrony)${NC}"
     fi
 }
-
 
 configure_bbr() {
     log "\n${YELLOW}=============== 5. BBR配置 ===============${NC}"
