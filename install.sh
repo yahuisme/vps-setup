@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.11
+# 版本: 7.9.14
 # ------------------------------------------------------------------------------
-# 改进日志 (v7.9.11):
-# - [CRITICAL-FIX] 彻底重写 'configure_time_sync' 函数，解决其在 Debian 13 上的失败问题
-# - [健壮] 增加 'systemctl unmask systemd-timesyncd' 步骤
-# - [健壮] 检查 'timedatectl' 命令的真实返回值，而不是隐藏错误
-# - [健壮] 增加了 'systemctl enable --now' 作为 'timedatectl' 的备用方案
+# 改进日志 (v7.9.14):
+# - [CRITICAL-FIX] 遵从您的要求，移除 'chrony' 回退逻辑
+# - [健壮] 'configure_time_sync' 现在会优先尝试启用 'systemd-timesyncd'，
+#   如果失败，则尝试 'apt-get install systemd-timesyncd'，然后再次尝试启用。
+# - [健壮] 修正 'verify_time_sync' 逻辑，将 'chrony' 视为警告 (WARN)
 #
 # 改进日志 (v7.9.10):
 # - [FIX] 修复 'tput civis' 命令失败导致 'set -e' 终止脚本的Bug
@@ -238,14 +238,15 @@ verify_dns() {
     record_verification "DNS" "$status" "$message"
 }
 
-# [新增] 验证时间同步
+# [修改] 验证时间同步 (v7.9.14)
 verify_time_sync() {
     if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
         record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
-    elif (systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null); then
-        record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
     elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
+    # [FIX] chrony/ntp 是警告，因为用户不想用它们
+    elif (systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null); then
+        record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
     else
         record_verification "时间同步" "FAIL" "NTP服务未运行"
     fi
@@ -324,7 +325,7 @@ parse_args() {
             --bbr) BBR_MODE="default"; shift ;;
             --bbr-optimized) BBR_MODE="optimized"; shift ;;
             --no-bbr) BBR_MODE="none"; shift ;;
-            --fail2ban) ENABLE_FAIL2BAN=true; [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }; shift ;;
+            --fail2ban) ENABLE_FAIL2BAN=true; [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2AN_EXTRA_PORT="$2"; shift; }; shift ;;
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
             --ssh-port) NEW_SSH_PORT="$2"; shift 2 ;;
             --ssh-password) NEW_SSH_PASSWORD="$2"; shift 2 ;;
@@ -443,58 +444,66 @@ configure_timezone() {
     log "${GREEN}✅ 时区: ${TIMEZONE}${NC}"
 }
 
-# [修改] 健壮性更强的函数
+# [修改 v7.9.14] 严格按照 "仅 systemd-timesyncd" 逻辑
 configure_time_sync() {
     log "\n${YELLOW}=============== 4. 时间同步配置 ===============${NC}"
     
-    # 检查是否有其他NTP服务在运行
+    # 1. 检查 'chrony' 或 'ntp' (如果已安装, 尊重用户)
     if (systemctl is-active --quiet chrony 2>/dev/null || \
        systemctl is-active --quiet ntp 2>/dev/null || \
        systemctl is-active --quiet ntpd 2>/dev/null); then
-        log "${GREEN}✅ 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过 systemd-timesyncd 配置。${NC}"
+        log "${YELLOW}[WARN] 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过。${NC}"
+        log "${YELLOW}       (脚本被配置为不使用 chrony)${NC}"
         return
     fi
-    
+
     if ! command -v timedatectl >/dev/null 2>&1; then
-        log "${YELLOW}[WARN] 未找到 timedatectl 命令, 无法自动启用NTP。${NC}"
+        log "${RED}[ERROR] 未找到 timedatectl 命令, 无法配置 systemd-timesyncd。${NC}"
         return
     fi
 
-    # 检查服务是否存在
-    if ! systemctl cat systemd-timesyncd >/dev/null 2>&1; then
-        log "${YELLOW}[WARN] 未找到 systemd-timesyncd.service, 无法启用。${NC}"
-        log "${YELLOW}       请考虑安装 'chrony'。${NC}"
-        return
+    local timesyncd_enabled=false
+    
+    # 2. 尝试启用 (如果服务已存在)
+    if systemctl cat systemd-timesyncd >/dev/null 2>&1; then
+        start_spinner "启用 systemd-timesyncd (NTP)... "
+        systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+        if timedatectl set-ntp true >> "$LOG_FILE" 2>&1; then
+            timesyncd_enabled=true
+        else
+            systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+        fi
+        stop_spinner
     fi
+    
+    # 3. 检查是否成功，如果不成功 (或服务不存在)，则尝试安装
+    if [ "$timesyncd_enabled" = false ] && ! (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
+        log "${YELLOW}[WARN] systemd-timesyncd 未运行或不存在，尝试安装...${NC}"
+        start_spinner "安装 systemd-timesyncd... "
+        # 确保 apt-get update 运行过
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd >> "$LOG_FILE" 2>&1
+        stop_spinner
 
-    start_spinner "启用 systemd-timesyncd (NTP)... "
-    
-    local ntp_set_success=false
-    # 尝试 unmask (以防万一)
-    systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
-    
-    # 尝试 set-ntp true (这是首选方法)
-    if timedatectl set-ntp true >> "$LOG_FILE" 2>&1; then
-        ntp_set_success=true
-    else
-        # 备用方法：如果 timedatectl 失败，尝试手动 enable/start
-        log "${YELLOW}[WARN] 'timedatectl' 命令失败, 尝试 'systemctl enable --now'...${NC}"
-        systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+        # 4. 安装后再次尝试启用
+        start_spinner "再次尝试启用 systemd-timesyncd... "
+        systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+        if timedatectl set-ntp true >> "$LOG_FILE" 2>&1; then
+             : # 成功
+        else
+            systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+        fi
+        stop_spinner
     fi
     
-    stop_spinner
-    
-    # 验证
+    # 5. 最终验证
     if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
         log "${GREEN}✅ systemd-timesyncd (NTP) 已启用并激活。${NC}"
     elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         log "${GREEN}✅ systemd-timesyncd (NTP) 服务正在运行。${NC}"
     else
-        log "${RED}[ERROR] 尝试启用 systemd-timesyncd 失败！${NC}"
-        if [ "$ntp_set_success" = false ]; then
-             log "${RED}       'timedatectl set-ntp true' 命令执行失败。${NC}"
-        fi
-        log "${RED}       请检查 'timedatectl status' 和 'systemctl status systemd-timesyncd'${NC}"
+        log "${RED}[ERROR] 尝试启用 'systemd-timesyncd' 失败！${NC}"
+        log "${RED}       (脚本被配置为不回退到 chrony)${NC}"
     fi
 }
 
