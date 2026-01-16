@@ -35,7 +35,7 @@ apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahui
 
 ## 无交互自定义脚本
 ```
-apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap "1024" --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'woshimima' --fail2ban 12345 --non-interactive
+apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap "1024" --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'woshimima' --fail2ban 12345 --non-interactive
 ```
 运行无交互自定义脚本后依次配置：
 1. 自动检查并安装 sudo wget zip vim 常用应用
