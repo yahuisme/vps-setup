@@ -1,13 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# VPS 通用初始化脚本 (Debian & Ubuntu LTS) - Final Edition
-# 版本: 8.1.0
+# VPS 通用初始化脚本 (Debian & Ubuntu LTS) - Stable Edition
+# 版本: 8.1.1
 # ------------------------------------------------------------------------------
-# 改进日志 (v8.1.0):
-# - [修复] 恢复 parse_args 中缺失的 --ip6-dns 参数解析
-# - [优化] Fail2ban 配置逻辑增强：支持去重处理 extra_port 和 ssh_port
-# - [兼容] 完美支持 --fail2ban <port> 的参数格式
+# 改进日志 (v8.1.1):
+# - [CRITICAL] 修复 pre_flight_checks 中 set -e 导致的误判崩溃
 # ==============================================================================
 
 set -euo pipefail
@@ -199,11 +197,10 @@ parse_args() {
             --timezone) TIMEZONE="$2"; shift 2 ;;
             --swap) SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns) read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"; shift 2 ;;
-            --ip6-dns) read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"; shift 2 ;; # [修复] 加回 IPv6 DNS 参数
+            --ip6-dns) read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"; shift 2 ;;
             --no-optimize) NET_OPTIMIZE_MODE="none"; shift ;;
             --fail2ban) 
                 ENABLE_FAIL2BAN=true
-                # [优化] 检测下一个参数是否为端口号 (非 - 开头)
                 if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
                     FAIL2BAN_EXTRA_PORT="$2"
                     shift
@@ -230,7 +227,11 @@ pre_flight_checks() {
         log "${YELLOW}[WARN] 容器环境，跳过内核优化。${NC}"
         NET_OPTIMIZE_MODE="none"
     fi
-    [[ ! -f /etc/os-release ]] && exit 1
+    # [修复] 健壮的文件检查，防止 set -e 崩溃
+    if [[ ! -f /etc/os-release ]]; then
+        log "${RED}[ERROR] 无法找到 /etc/os-release${NC}"
+        exit 1
+    fi
 }
 
 configure_locale() {
@@ -432,15 +433,12 @@ configure_fail2ban() {
         stop_spinner
     fi
     
-    # 智能端口处理: 获取 SSH 端口
     local ssh_port=${NEW_SSH_PORT:-22}
     if [[ -z "$NEW_SSH_PORT" ]]; then
         ssh_port=$(grep -oP '^Port \K\d+' /etc/ssh/sshd_config | tail -n1 || echo 22)
     fi
     
-    # 构建端口列表 (去重)
     local port_list="$ssh_port"
-    # 如果指定了额外端口，且不等于 SSH 端口，则加入
     if [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" != "$ssh_port" ]]; then
         port_list="$ssh_port,$FAIL2BAN_EXTRA_PORT"
     fi
@@ -481,7 +479,7 @@ main() {
     parse_args "$@"
     
     echo -e "${CYAN}==================================================${NC}"
-    echo -e "${CYAN}   VPS 初始化脚本 v8.1.0 (Final)                ${NC}"
+    echo -e "${CYAN}   VPS 初始化脚本 v8.1.1 (Stable)               ${NC}"
     echo -e "${CYAN}==================================================${NC}"
 
     if [[ "$non_interactive" == false ]]; then
@@ -507,12 +505,18 @@ main() {
     run_verification
     
     log "\n${GREEN}🎉 初始化完成! 正在重启...${NC}"
+    
+    # 移除错误捕获，防止重启命令本身返回非零值导致误报
+    trap - ERR
+
     if [[ "$non_interactive" == true ]]; then
-        reboot
+        reboot || log "${YELLOW}[WARN] 无法自动重启，请手动执行 'reboot'。${NC}"
     elif [[ "$non_interactive" == false ]]; then
         read -p "立即重启? [y/N] " -r < /dev/tty
-        [[ "$REPLY" =~ ^[Yy]$ ]] && reboot
+        [[ "$REPLY" =~ ^[Yy]$ ]] && { reboot || log "${YELLOW}[WARN] 无法自动重启。${NC}"; }
     fi
+    
+    exit 0
 }
 
 main "$@"
