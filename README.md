@@ -1,74 +1,74 @@
 # vps-setup
-提升 VPS 原版系统开箱使用便捷性设置脚本
+提升 VPS 原版系统开箱使用便捷性的设置脚本。
 
-脚本支持 Debian 10 -13 和 Ubuntu 20.04 - 24.04
+脚本支持 Debian 10–13 和 Ubuntu 20.04–24.04。
 
 ## 功能特点
+
 - 常用软件包自动安装
-- 主机名交互配置
-- 时区自动配置
-- 检查并开启时间同步
-- BBR 自动开启
+- 主机名、时区和 DNS 配置
+- 时间同步和 BBR 配置
 - Swap 自动配置
-- DNS 自动配置
-- ssh 端口和密码配置
+- SSH 端口和密码配置
 - Fail2ban 自动配置
-- vim 编辑器优化配置
+- Vim 编辑器优化
 - 系统更新和清理
 
 ## 一键脚本
-```
-apt install curl -y && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh)
-```
-运行一键脚本后依次配置：
-1. 自动检查并安装 sudo wget zip vim 常用应用
-2. 询问是否设置主机名
-3. 自动检测并设置 VPS 所在时区
-4. 自动检查并开启时间同步
-5. 默认开启 BBR
-6. 自动配置 Swap
-7. 自动配置 DNS（默认 ipv4 1.1.1.1 8.8.8.8 ; ipv6 2606:4700:4700::1111 2001:4860:4860::8888）
-8. 询问是否修改 ssh 端口和密码
-9. 自动安装并配置 Fail2ban，默认防护 22 和设置的其它 ssh 端口
-10. 自动优化 vim 编辑器配置
-11. 系统更新及清理
 
-## 无交互自定义脚本
-```
-apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap "1024" --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'woshimima' --fail2ban 12345 --non-interactive
-```
-运行无交互自定义脚本后依次配置：
-1. 自动检查并安装 sudo wget zip vim 常用应用
-2. 自动配置自定义主机名
-3. 自动配置自定义时区
-4. 自动检查并开启时间同步
-5. 自动配置自定义 Swap
-6. 默认开启 BBR 并根据 VPS 配置智能优化 TCP 网络参数
-7. 自动配置自定义 DNS
-8. 自动配置自定义 ssh 端口和 ssh 密码
-9. 自动安装并配置 Fail2ban，防护 22 端口和自定义 ssh 端口
-10. 自动优化 vim 编辑器配置
-11. 系统更新及清理
-
-## 一键 DD 脚本
-
-https://github.com/bin456789/reinstall
-
-
-一键 DD 脚本
-```
-curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh && bash reinstall.sh debian 13 --ssh-port 12345 --password woshimima && reboot
+```bash
+apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh)
 ```
 
-DD脚本的系统版本、 ssh 端口和 password 请自行修改
+脚本会依次执行软件包安装、主机名、时区、时间同步、BBR、Swap、DNS、SSH、Fail2ban、Vim 配置，以及系统更新和清理。
 
-## 特别提醒
+## 无交互安装
 
-> **重要：Fail2ban 默认使用永久封禁（`bantime = -1`）。**
-> SSH 连续认证失败达到 3 次后，来源 IP 将不会自动解封。请确认自己的管理 IP 不会被误封，或使用以下命令手动解封：
->
-> ```bash
-> sudo fail2ban-client set sshd unbanip <IP>
-> ```
+以下示例需要按实际情况修改参数。`--ip-dns` 和 `--ip6-dns` 的两个地址使用空格分隔。
 
-修改 SSH 端口前，请先在云平台安全组和服务器防火墙中放行新端口；脚本无法从 VPS 内部验证云平台安全组。脚本会在重启 SSH 后检查新端口是否监听，失败则恢复 SSH 配置。脚本会检查端口占用，并在修改 `/etc/resolv.conf` 前备份；如果该文件是符号链接，脚本会停止 DNS 修改以避免破坏系统的 DNS 管理。
+```bash
+apt-get update -y && apt-get install -y curl && curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap 1024 --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'CHANGE_ME_TO_A_TEMPORARY_STRONG_PASSWORD' --fail2ban 12345 --non-interactive
+```
+
+`--ssh-password` 会将密码放在命令行参数中，可能出现在 shell 历史或进程信息中。请使用临时强密码，并在初始化后更换。
+
+## 参数
+
+```text
+--hostname <name>       设置主机名
+--timezone <tz>         设置时区
+--swap <auto|MB|0>      设置 Swap 大小；0 表示禁用
+--ip-dns "主DNS 备用DNS" 设置 IPv4 DNS
+--ip6-dns "主DNS 备用DNS" 设置 IPv6 DNS
+--bbr                   启用默认 BBR
+--bbr-optimized         启用优化 BBR
+--no-bbr                禁用 BBR
+--fail2ban [port]       启用 Fail2ban，可附加端口
+--no-fail2ban           禁用 Fail2ban
+--ssh-port <port>       设置 SSH 端口
+--ssh-password <pass>   设置 root 密码
+--non-interactive       非交互模式
+-h, --help              显示帮助
+```
+
+## 重装系统
+
+需要重装系统时，可使用：
+
+<https://github.com/bin456789/reinstall>
+
+```bash
+curl -O https://github.com/bin456789/reinstall/raw/main/reinstall.sh && bash reinstall.sh debian 13 --ssh-port 12345 --password 'CHANGE_ME_TO_A_TEMPORARY_STRONG_PASSWORD' && reboot
+```
+
+请自行修改系统版本、SSH 端口和密码；重装会清除原系统数据。
+
+## 注意事项
+
+- Fail2ban 默认永久封禁 SSH 认证失败来源（`bantime = -1`），管理 IP 误封后需手动解封：
+  ```bash
+  sudo fail2ban-client set sshd unbanip <IP>
+  ```
+- 修改 SSH 端口前，请先在云平台安全组和服务器防火墙中放行新端口。脚本无法验证云安全组，只能检查 SSH 是否监听新端口；请保持当前连接，并先用新端口验证登录成功。
+- 脚本最后会执行 `apt full-upgrade`、`autoremove --purge` 和 `apt clean`。已有业务或自定义软件时，请先确认升级和清理不会产生影响。
+- 修改 `/etc/resolv.conf` 前会备份；如果该文件是符号链接，脚本会停止 DNS 修改，以避免破坏系统 DNS 管理。
