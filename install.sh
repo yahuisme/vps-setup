@@ -654,7 +654,15 @@ configure_swap() {
         fi
     fi
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
+    # 上次失败可能留下仍处于 active 状态的临时 Swap，必须先关闭才能删除。
+    if [[ -e "$new_swap" ]]; then
+        swapoff "$new_swap" 2>/dev/null || true
+    fi
     rm -f "$new_swap"
+    if [[ -e "$new_swap" ]]; then
+        log "${RED}[ERROR] 无法删除上次遗留的临时 Swap文件。${NC}"
+        return 1
+    fi
     if command -v fallocate &>/dev/null; then
         start_spinner "快速创建Swap... "
         fallocate -l "${swap_mb}M" "$new_swap" >> "$LOG_FILE" 2>&1
