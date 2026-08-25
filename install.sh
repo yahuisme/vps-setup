@@ -37,10 +37,6 @@ VERIFICATION_PASSED=0
 VERIFICATION_FAILED=0
 VERIFICATION_WARNINGS=0
 
-# ==============================================================================
-# --- 核心辅助函数 ---
-# ==============================================================================
-
 log() {
     echo -e "$1"
 }
@@ -171,10 +167,6 @@ verify_privileges() {
     return 0
 }
 
-# ==============================================================================
-# --- 改进的验证函数 ---
-# ==============================================================================
-
 record_verification() {
     local component="$1" status="$2" message="$3"
     case "$status" in
@@ -294,10 +286,6 @@ run_verification() {
     log "\n${BLUE}验证结果: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${YELLOW}警告 ${VERIFICATION_WARNINGS}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
 }
 
-# ==============================================================================
-# --- 参数解析 ---
-# ==============================================================================
-
 usage() {
     cat << EOF
 ${YELLOW}用法: $0 [选项]${NC}
@@ -377,10 +365,6 @@ parse_args() {
         esac
     done
 }
-
-# ==============================================================================
-# --- 功能函数 ---
-# ==============================================================================
 
 pre_flight_checks() {
     log "${BLUE}[INFO] 系统预检查...${NC}"
@@ -538,20 +522,14 @@ configure_time_sync() {
         stop_spinner
     fi
     
-    # 5. 最终验证
-    if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
-        log "${GREEN}✅ systemd-timesyncd (NTP) 已启用并激活。${NC}"
-    elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
-        log "${GREEN}✅ systemd-timesyncd (NTP) 服务正在运行。${NC}"
+    if timedatectl status 2>/dev/null | grep -q 'NTP service: active' || systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        log "${GREEN}✅ 时间同步配置完成${NC}"
     else
-        log "${RED}[ERROR] 尝试启用 'systemd-timesyncd' 失败！${NC}"
-        log "${RED}       (脚本被配置为不回退到 chrony)${NC}"
+        log "${RED}[ERROR] 时间同步配置未生效${NC}"
+        return 1
     fi
 }
 
-# ==============================================================================
-# --- 重点修改区域：configure_bbr ---
-# ==============================================================================
 configure_bbr() {
     log "\n${YELLOW}=============== 5. BBR配置 (优化版) ===============${NC}"
     local config_file="/etc/sysctl.d/99-bbr.conf"
@@ -750,6 +728,12 @@ EOF
 
 configure_ssh() {
     log "\n${YELLOW}=============== 8. SSH配置 ===============${NC}"
+
+    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
+        start_spinner "安装 openssh-server... "
+        DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >> "$LOG_FILE" 2>&1
+        stop_spinner
+    fi
     
     [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
     
@@ -918,18 +902,10 @@ main() {
     install_packages
     configure_hostname
     configure_timezone
-    configure_time_sync # [新增]
+    configure_time_sync
     configure_bbr
     configure_swap
     configure_dns
-    
-    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
-        if ! dpkg -l openssh-server >/dev/null 2>&1; then
-            start_spinner "安装openssh-server... "
-            DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >> "$LOG_FILE" 2>&1
-            stop_spinner
-        fi
-    fi
     
     configure_ssh
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
