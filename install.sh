@@ -96,12 +96,26 @@ show_progress() {
 }
 
 get_public_ipv4() {
-    local ip
-    for cmd in "curl -s -4 --max-time 5" "wget -qO- -4 --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && echo "$ip" && return
-        done
+    local ip url octet valid
+    for url in "https://api.ipify.org" "https://ip.sb"; do
+        if command -v curl >/dev/null 2>&1; then
+            ip=$(curl -fsS4 --max-time 5 "$url" 2>/dev/null) || continue
+        elif command -v wget >/dev/null 2>&1; then
+            ip=$(wget -qO- -4 --timeout=5 "$url" 2>/dev/null) || continue
+        else
+            return 1
+        fi
+        ip=${ip//[[:space:]]/}
+        valid=true
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            IFS=. read -ra octets <<< "$ip"
+            for octet in "${octets[@]}"; do
+                [[ "$octet" -le 255 ]] || valid=false
+            done
+            [[ "$valid" == true ]] && { echo "$ip"; return 0; }
+        fi
     done
+    return 1
 }
 
 has_ipv6() {
@@ -546,8 +560,11 @@ configure_bbr() {
     
     if [[ "$BBR_MODE" = "none" ]]; then
         log "${BLUE}[INFO] 跳过BBR配置${NC}"
-        rm -f "$config_file"
-        sysctl -p >> "$LOG_FILE" 2>&1 || true
+        cat > "$config_file" << 'EOF'
+net.ipv4.tcp_congestion_control = cubic
+EOF
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >> "$LOG_FILE" 2>&1 || true
+        sysctl -p "$config_file" >> "$LOG_FILE" 2>&1 || true
         return
     fi
     
@@ -624,7 +641,16 @@ EOF
             ;;
     esac
     
-    sysctl -p "$config_file" >> "$LOG_FILE" 2>&1
+    if ! sysctl -p "$config_file" >> "$LOG_FILE" 2>&1; then
+        log "${YELLOW}[WARN] 部分 BBR 参数不受当前内核支持，将继续验证核心参数。${NC}"
+    fi
+    local current_cc current_qdisc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    if [[ "$current_cc" != "bbr" || "$current_qdisc" != "fq" ]]; then
+        log "${RED}[ERROR] BBR 核心参数未生效: ${current_cc}/${current_qdisc}${NC}"
+        return 1
+    fi
     log "${GREEN}✅ BBR配置完成${NC}"
 }
 
@@ -643,23 +669,23 @@ configure_swap() {
     fi
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
+    local new_swap="${swap_file}.new"
     if [[ -f "$swap_file" ]]; then
         local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
         if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
             log "${GREEN}✅ Swap文件已存在 (${current_size_mb}MB)${NC}"
             return
         fi
-        swapoff "$swap_file" 2>/dev/null || true
-        rm -f "$swap_file"
     fi
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
+    rm -f "$new_swap"
     if command -v fallocate &>/dev/null; then
         start_spinner "快速创建Swap... "
-        fallocate -l "${swap_mb}M" "$swap_file" >> "$LOG_FILE" 2>&1
+        fallocate -l "${swap_mb}M" "$new_swap" >> "$LOG_FILE" 2>&1
         stop_spinner
     else
         log "${BLUE}使用dd创建，请稍候...${NC}"
-        dd if=/dev/zero of="$swap_file" bs=1M count="$swap_mb" status=progress 2>&1 | while IFS= read -r line; do
+        dd if=/dev/zero of="$new_swap" bs=1M count="$swap_mb" status=progress 2>&1 | while IFS= read -r line; do
             if [[ "$line" =~ ([0-9]+)\ bytes.*copied ]]; then
                 local copied_bytes=${BASH_REMATCH[1]}
                 local copied_mb=$((copied_bytes / 1024 / 1024))
@@ -668,26 +694,39 @@ configure_swap() {
         done
         echo ""
     fi
-    chmod 600 "$swap_file"
-    mkswap "$swap_file" >> "$LOG_FILE" 2>&1
-    swapon "$swap_file" >> "$LOG_FILE" 2>&1
-    grep -q "$swap_file" /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
+    chmod 600 "$new_swap"
+    mkswap "$new_swap" >> "$LOG_FILE" 2>&1
+    swapon "$new_swap" >> "$LOG_FILE" 2>&1
+    if [[ -f "$swap_file" ]]; then
+        if ! swapoff "$swap_file" 2>/dev/null; then
+            swapoff "$new_swap" 2>/dev/null || true
+            rm -f "$new_swap"
+            log "${RED}[ERROR] 无法关闭现有 Swap，保留原配置。${NC}"
+            return 1
+        fi
+    fi
+    mv -f "$new_swap" "$swap_file"
+    grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
     log "${GREEN}✅ ${swap_mb}MB Swap已配置${NC}"
 }
 
 configure_dns() {
     log "\n${YELLOW}=============== 7. DNS配置 ===============${NC}"
+    local ipv6_enabled=false
+    has_ipv6 && ipv6_enabled=true
     if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
         log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
     fi
-    if (systemctl is-active --quiet systemd-resolved 2>/dev/null); then
-        log "${BLUE}配置systemd-resolved...${NC}"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         mkdir -p /etc/systemd/resolved.conf.d
-        cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << EOF
+        local resolved_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
+        local resolved_tmp="${resolved_file}.vps-setup.$$"
+        cat > "$resolved_tmp" << EOF
 [Resolve]
-DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$(has_ipv6 && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}")
+DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$( [[ "$ipv6_enabled" == true ]] && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}" )
 FallbackDNS=1.0.0.1 8.8.4.4
 EOF
+        mv -f "$resolved_tmp" "$resolved_file"
         systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] systemd-resolved 重启失败${NC}"
     else
         log "${BLUE}配置resolv.conf...${NC}"
@@ -700,12 +739,13 @@ EOF
             return 1
         }
         chattr -i /etc/resolv.conf 2>/dev/null || true
-        cat > /etc/resolv.conf << EOF
+        local resolv_tmp="/etc/resolv.conf.vps-setup.$$"
+        cat > "$resolv_tmp" << EOF
 nameserver ${PRIMARY_DNS_V4}
 nameserver ${SECONDARY_DNS_V4}
-$(has_ipv6 && echo "nameserver ${PRIMARY_DNS_V6}")
-$(has_ipv6 && echo "nameserver ${SECONDARY_DNS_V6}")
+$( [[ "$ipv6_enabled" == true ]] && printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6" )
 EOF
+        mv -f "$resolv_tmp" /etc/resolv.conf
     fi
     log "${GREEN}✅ DNS配置完成${NC}"
 }
@@ -723,7 +763,13 @@ configure_ssh() {
         log "${RED}[SECURITY WARNING] 使用 --ssh-password 参数会将密码记录在shell历史中，存在安全风险！${NC}"
     fi
 
-    local ssh_changed=false
+    local ssh_changed=false ssh_backup=""
+    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
+        if [[ ! -f /etc/ssh/sshd_config ]] || ! command -v sshd >/dev/null 2>&1; then
+            log "${RED}[ERROR] 未找到 SSH 配置或 sshd，无法修改 SSH。${NC}"
+            return 1
+        fi
+    fi
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
         local current_ssh_port
         current_ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
@@ -731,27 +777,41 @@ configure_ssh() {
             log "${RED}[ERROR] SSH端口 ${NEW_SSH_PORT} 已被其他服务占用，未修改 SSH 配置。${NC}"
             return 1
         fi
-        cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
+        ssh_backup="/etc/ssh/sshd_config.backup.$(date +%Y%m%d-%H%M%S).$$"
+        cp -a /etc/ssh/sshd_config "$ssh_backup"
         sed -i '/^[#\s]*Port\s\+/d' /etc/ssh/sshd_config
         echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
         ssh_changed=true
         log "${GREEN}✅ SSH端口设为: ${NEW_SSH_PORT}${NC}"
     fi
     
-    if [[ -n "$NEW_SSH_PASSWORD" ]]; then
-        echo "root:${NEW_SSH_PASSWORD}" | chpasswd >> "$LOG_FILE" 2>&1
-        log "${GREEN}✅ root密码已设置${NC}"
-    fi
-    
     if [[ "$ssh_changed" = true ]]; then
         if sshd -t 2>>"$LOG_FILE"; then
-            systemctl restart sshd >> "$LOG_FILE" 2>&1
+            if ! systemctl restart sshd >> "$LOG_FILE" 2>&1; then
+                log "${RED}[ERROR] SSH 服务重启失败，正在恢复配置。${NC}"
+                cp -a "$ssh_backup" /etc/ssh/sshd_config
+                systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
+                return 1
+            fi
+            sleep 1
+            if ! ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
+                log "${RED}[ERROR] SSH 未监听新端口，正在恢复配置。${NC}"
+                cp -a "$ssh_backup" /etc/ssh/sshd_config
+                systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
+                return 1
+            fi
             log "${YELLOW}[WARN] SSH端口已更改，请用新端口重连！${NC}"
         else
             log "${RED}[ERROR] SSH配置错误，已恢复备份${NC}"
-            cp "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)" /etc/ssh/sshd_config
+            cp -a "$ssh_backup" /etc/ssh/sshd_config
             systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
+            return 1
         fi
+    fi
+
+    if [[ -n "$NEW_SSH_PASSWORD" ]]; then
+        echo "root:${NEW_SSH_PASSWORD}" | chpasswd >> "$LOG_FILE" 2>&1
+        log "${GREEN}✅ root密码已设置${NC}"
     fi
 }
 
@@ -773,7 +833,10 @@ configure_fail2ban() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1
     stop_spinner
     
-    cat > /etc/fail2ban/jail.local << EOF
+    local jail_file="/etc/fail2ban/jail.local" jail_tmp="/etc/fail2ban/jail.local.vps-setup.$$"
+    local jail_backup=""
+    [[ -f "$jail_file" ]] && jail_backup="${jail_file}.backup.$(date +%Y%m%d-%H%M%S).$$" && cp -a "$jail_file" "$jail_backup"
+    cat > "$jail_tmp" << EOF
 [DEFAULT]
 # 永久封禁：输错 SSH 密码达到 maxretry 后，来源 IP 不会自动解封。
 bantime = -1
@@ -787,14 +850,25 @@ enabled = true
 port = ${port_list}
 maxretry = 3
 EOF
+    mv -f "$jail_tmp" "$jail_file"
+    if ! fail2ban-client -t >> "$LOG_FILE" 2>&1; then
+        log "${RED}[ERROR] Fail2ban 配置校验失败${NC}"
+        if [[ -n "$jail_backup" ]]; then
+            cp -a "$jail_backup" "$jail_file"
+        else
+            rm -f "$jail_file"
+        fi
+        return 1
+    fi
     
     systemctl enable fail2ban >> "$LOG_FILE" 2>&1
-    systemctl start fail2ban >> "$LOG_FILE" 2>&1
+    systemctl restart fail2ban >> "$LOG_FILE" 2>&1
     
     if (systemctl is-active --quiet fail2ban); then
         log "${GREEN}✅ Fail2ban已启动，保护端口: ${port_list}${NC}"
     else
         log "${RED}[ERROR] Fail2ban启动失败${NC}"
+        return 1
     fi
 }
 
