@@ -2,15 +2,15 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.16 (BBR 参数深度优化版)
-# ------------------------------------------------------------------------------
-# 改进日志 (v7.9.16):
-# - [优化] configure_bbr: 引入 tcp_tw_reuse, tcp_slow_start_after_idle 等关键参数
-# - [优化] configure_bbr: 补全 TCP 读写缓冲区配置，提升高带宽下的吞吐性能
+# 版本: 7.9.17
+# - [输出] BBR 显示实际内存档位和完整参数摘要
+# - [输出] 其它配置阶段统一使用分段标题、步骤提示和完成结果
+
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
+SCRIPT_VERSION="7.9.17"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES="sudo wget zip vim curl"
@@ -39,6 +39,25 @@ VERIFICATION_WARNINGS=0
 
 log() {
     echo -e "$1"
+}
+
+section_header() {
+    local number="$1" title="$2"
+    log "\n${YELLOW}╭──────────────────────────────────────────────╮${NC}"
+    log "${YELLOW}│  ${number}. ${title}${NC}"
+    log "${YELLOW}╰──────────────────────────────────────────────╯${NC}"
+}
+
+step_info() {
+    log "${BLUE}  ▸ $1${NC}"
+}
+
+result_ok() {
+    log "${GREEN}  ✔ $1${NC}"
+}
+
+result_warn() {
+    log "${YELLOW}  ⚠ $1${NC}"
 }
 
 handle_error() {
@@ -386,10 +405,12 @@ pre_flight_checks() {
 }
 
 install_packages() {
-    log "\n${YELLOW}=============== 1. 软件包安装 ===============${NC}"
+    section_header "1" "软件包安装"
+    step_info "更新软件包列表"
     start_spinner "更新软件包列表... "
     DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
     stop_spinner
+    step_info "安装基础软件包：${INSTALL_PACKAGES}"
     start_spinner "安装基础软件包... "
     DEBIAN_FRONTEND=noninteractive apt-get install -y $INSTALL_PACKAGES >> "$LOG_FILE" 2>&1
     stop_spinner
@@ -413,13 +434,13 @@ set noswapfile
 EOF
         [[ -d /root ]] && ! grep -q "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && echo "source /etc/vim/vimrc.local" >> /root/.vimrc
     fi
-    log "${GREEN}✅ 软件包安装完成${NC}"
+    result_ok "基础软件包安装完成：${INSTALL_PACKAGES}"
 }
 
 configure_hostname() {
-    log "\n${YELLOW}=============== 2. 主机名配置 ===============${NC}"
+    section_header "2" "主机名配置"
     local current_hostname=$(hostname)
-    log "${BLUE}当前主机名: ${current_hostname}${NC}"
+    log "${BLUE}  当前主机名：${current_hostname}${NC}"
     local final_hostname="$current_hostname"
     if [[ -n "$NEW_HOSTNAME" ]]; then
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
@@ -466,14 +487,15 @@ configure_hostname() {
 }
 
 configure_timezone() {
-    log "\n${YELLOW}=============== 3. 时区配置 ===============${NC}"
+    section_header "3" "时区配置"
+    step_info "设置时区：${TIMEZONE}"
     timedatectl set-timezone "$TIMEZONE" >> "$LOG_FILE" 2>&1
-    log "${GREEN}✅ 时区: ${TIMEZONE}${NC}"
+    result_ok "时区已设置：${TIMEZONE}"
 }
 
 # [修改 v7.9.14] 严格按照 "仅 systemd-timesyncd" 逻辑
 configure_time_sync() {
-    log "\n${YELLOW}=============== 4. 时间同步配置 ===============${NC}"
+    section_header "4" "时间同步配置"
     
     # 1. 检查 'chrony' 或 'ntp' (如果已安装, 尊重用户)
     if (systemctl is-active --quiet chrony 2>/dev/null || \
@@ -531,11 +553,11 @@ configure_time_sync() {
 }
 
 configure_bbr() {
-    log "\n${YELLOW}=============== 5. BBR配置 (优化版) ===============${NC}"
+    section_header "5" "BBR 配置（优化版）"
     local config_file="/etc/sysctl.d/99-bbr.conf"
     
     if [[ "$BBR_MODE" = "none" ]]; then
-        log "${BLUE}[INFO] 跳过BBR配置${NC}"
+        log "${BLUE}[INFO] BBR 已禁用，将切换拥塞控制为 cubic${NC}"
         cat > "$config_file" << 'EOF'
 net.ipv4.tcp_congestion_control = cubic
 EOF
@@ -560,21 +582,29 @@ EOF
                 log "${YELLOW}[WARN] 内存较低，建议使用默认BBR模式${NC}"
             fi
             
-            # 动态计算参数 (根据内存分级)
-            local rmem_wmem somaxconn
+            local rmem_wmem somaxconn memory_tier
             if [[ $mem_mb -ge 4096 ]]; then
-                # 4GB+ 内存
-                rmem_wmem=67108864  # 64MB
-                somaxconn=65535
+                memory_tier="4GB+"; rmem_wmem=67108864; somaxconn=65535
             elif [[ $mem_mb -ge 1024 ]]; then
-                # 1GB-4GB 内存
-                rmem_wmem=33554432  # 32MB
-                somaxconn=32768
+                memory_tier="1GB-4GB"; rmem_wmem=33554432; somaxconn=32768
             else
-                # <1GB 内存
-                rmem_wmem=16777216  # 16MB
-                somaxconn=16384
+                memory_tier="<1GB"; rmem_wmem=16777216; somaxconn=16384
             fi
+
+            log "${BLUE}  内存档位：${memory_tier} | 缓冲区：${rmem_wmem} bytes | 连接队列：${somaxconn}${NC}"
+            log "${CYAN}  将写入的 BBR 参数：${NC}"
+            log "    net.core.default_qdisc              = fq"
+            log "    net.ipv4.tcp_congestion_control      = bbr"
+            log "    net.core.rmem_max / wmem_max         = ${rmem_wmem}"
+            log "    net.ipv4.tcp_rmem                    = 4096 87380 ${rmem_wmem}"
+            log "    net.ipv4.tcp_wmem                    = 4096 65536 ${rmem_wmem}"
+            log "    net.core.somaxconn / tcp_syn_backlog = ${somaxconn}"
+            log "    net.core.netdev_max_backlog          = ${somaxconn}"
+            log "    tcp_fin_timeout / tw_reuse           = 30 / 1"
+            log "    tcp_slow_start_after_idle            = 0"
+            log "    ip_local_port_range                  = 10000 65535"
+            log "    tcp_keepalive_time / intvl / probes  = 600 / 15 / 5"
+            log "    tcp_notsent_lowat / mtu_probing      = 16384 / 1"
             
             cat > "$config_file" << EOF
 # --- BBR 核心 ---
@@ -609,7 +639,7 @@ net.ipv4.tcp_mtu_probing = 1
 EOF
             ;;
         *)
-            log "${BLUE}配置标准BBR...${NC}"
+            log "${BLUE}配置标准 BBR：仅启用 bbr + fq${NC}"
             cat > "$config_file" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -627,21 +657,23 @@ EOF
         log "${RED}[ERROR] BBR 核心参数未生效: ${current_cc}/${current_qdisc}${NC}"
         return 1
     fi
-    log "${GREEN}✅ BBR配置完成${NC}"
+    result_ok "BBR 核心参数已生效：${current_cc} / ${current_qdisc}"
+    log "${BLUE}  配置文件：${config_file}${NC}"
 }
 
 configure_swap() {
-    log "\n${YELLOW}=============== 6. Swap配置 ===============${NC}"
-    [[ "$SWAP_SIZE_MB" = "0" ]] && { log "${BLUE}Swap已禁用${NC}"; return; }
+    section_header "6" "Swap 配置"
+    [[ "$SWAP_SIZE_MB" = "0" ]] && { log "${BLUE}  Swap：禁用${NC}"; return; }
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
         local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
         if [[ $mem_mb -lt 1024 ]]; then swap_mb=$mem_mb
         elif [[ $mem_mb -lt 4096 ]]; then swap_mb=2048
         else swap_mb=4096; fi
-        log "${BLUE}自动设置Swap: ${swap_mb}MB${NC}"
+        log "${BLUE}  自动计算目标 Swap：${swap_mb}MB${NC}"
     else
         swap_mb="$SWAP_SIZE_MB"
+        log "${BLUE}  指定目标 Swap：${swap_mb}MB${NC}"
     fi
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
@@ -661,7 +693,7 @@ configure_swap() {
     if [[ -f "$swap_file" ]]; then
         local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
         if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
-            log "${GREEN}✅ Swap文件已存在 (${current_size_mb}MB)${NC}"
+            log "${GREEN}  ✔ Swap 文件已存在：${current_size_mb}MB${NC}"
             return
         fi
     fi
@@ -715,11 +747,11 @@ configure_swap() {
         return 1
     fi
     grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
-    log "${GREEN}✅ ${swap_mb}MB Swap已配置${NC}"
+    log "${GREEN}  ✔ Swap 已配置：${swap_mb}MB${NC}"
 }
 
 configure_dns() {
-    log "\n${YELLOW}=============== 7. DNS配置 ===============${NC}"
+    section_header "7" "DNS 配置"
     local ipv6_enabled=false
     has_ipv6 && ipv6_enabled=true
     if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
@@ -755,11 +787,11 @@ $( [[ "$ipv6_enabled" == true ]] && printf 'nameserver %s\nnameserver %s\n' "$PR
 EOF
         mv -f "$resolv_tmp" /etc/resolv.conf
     fi
-    log "${GREEN}✅ DNS配置完成${NC}"
+    result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([ "$ipv6_enabled" = true ] && echo "，IPv6 已启用")"
 }
 
 configure_ssh() {
-    log "\n${YELLOW}=============== 8. SSH配置 ===============${NC}"
+    section_header "8" "SSH 配置"
 
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
         start_spinner "安装 openssh-server... "
@@ -830,7 +862,7 @@ configure_ssh() {
 }
 
 configure_fail2ban() {
-    log "\n${YELLOW}=============== 9. Fail2ban配置 ===============${NC}"
+    section_header "9" "Fail2ban 配置"
     
     local ports=("22")
     [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]] && ports+=("$NEW_SSH_PORT")
@@ -879,7 +911,7 @@ EOF
     systemctl restart fail2ban >> "$LOG_FILE" 2>&1
     
     if (systemctl is-active --quiet fail2ban); then
-        log "${GREEN}✅ Fail2ban已启动，保护端口: ${port_list}${NC}"
+        result_ok "Fail2ban 已启动，保护端口：${port_list}"
     else
         log "${RED}[ERROR] Fail2ban启动失败${NC}"
         return 1
@@ -887,7 +919,7 @@ EOF
 }
 
 system_update() {
-    log "\n${YELLOW}=============== 10. 系统更新 ===============${NC}"
+    section_header "10" "系统更新与清理"
     start_spinner "系统升级... "
     DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
     stop_spinner
@@ -895,7 +927,7 @@ system_update() {
     apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
     apt-get clean >> "$LOG_FILE" 2>&1
     stop_spinner
-    log "${GREEN}✅ 系统更新完成${NC}"
+    result_ok "系统更新与清理完成"
 }
 
 # ==============================================================================
@@ -907,17 +939,16 @@ main() {
     
     parse_args "$@"
 
-    {
-        echo -e "${CYAN}==================== VPS初始化 ====================${NC}"
-        echo -e "主机名: ${NEW_HOSTNAME:-自动/交互}"
-        echo -e "时区: ${TIMEZONE}"
-        echo -e "Swap: ${SWAP_SIZE_MB}"
-        echo -e "BBR: ${BBR_MODE}"
-        echo -e "DNS: ${PRIMARY_DNS_V4}, ${SECONDARY_DNS_V4}"
-        echo -e "Fail2ban: ${ENABLE_FAIL2BAN}"
-        [[ -n "$NEW_SSH_PORT" ]] && echo -e "SSH端口: ${NEW_SSH_PORT}"
-        echo -e "${CYAN}===================================================${NC}"
-    } >&2
+    section_header "配置摘要" "VPS 初始化配置"
+    log "${CYAN}  当前配置摘要：${NC}"
+    log "    主机名：${NEW_HOSTNAME:-保持当前/交互}"
+    log "    时区：${TIMEZONE}"
+    log "    BBR：${BBR_MODE}"
+    log "    Swap：${SWAP_SIZE_MB}"
+    log "    DNS：${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
+    log "    Fail2ban：${ENABLE_FAIL2BAN}"
+    [[ -n "$NEW_SSH_PORT" ]] && log "    SSH 端口：${NEW_SSH_PORT}"
+    separator
 
     if [[ "$non_interactive" = false ]]; then
         read -p "开始配置? [Y/n] " -r < /dev/tty
