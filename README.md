@@ -61,3 +61,12 @@ curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh 
 ```
 
 DD脚本的系统版本、 ssh 端口和 password 请自行修改
+
+> **重要：Fail2ban 默认使用永久封禁（`bantime = -1`）。**
+> SSH 连续认证失败达到 3 次后，来源 IP 将不会自动解封。请确认自己的管理 IP 不会被误封，或使用以下命令手动解封：
+>
+> ```bash
+> sudo fail2ban-client set sshd unbanip <IP>
+> ```
+
+修改 SSH 端口前，请先在云平台安全组和服务器防火墙中放行新端口。脚本会检查端口占用，并在修改 `/etc/resolv.conf` 前备份；如果该文件是符号链接，脚本会停止 DNS 修改以避免破坏系统的 DNS 管理。

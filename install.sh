@@ -147,9 +147,9 @@ is_kernel_version_ge() {
 
 verify_privileges() {
     local checks=0
-    [[ $EUID -eq 0 ]] && ((checks++))
-    [[ -w /etc/passwd ]] && ((checks++))
-    [[ $EUID -eq 0 ]] || groups | grep -qE '\b(sudo|wheel|admin)\b' && ((checks++))
+    [[ $EUID -eq 0 ]] && checks=$((checks + 1))
+    [[ -w /etc/passwd ]] && checks=$((checks + 1))
+    [[ $EUID -eq 0 ]] || { groups | grep -qE '\b(sudo|wheel|admin)\b' && checks=$((checks + 1)); }
     if [[ $checks -lt 2 ]]; then
         log "${RED}[ERROR] 权限不足，需要root权限或完整sudo权限${NC}"
         return 1
@@ -164,9 +164,9 @@ verify_privileges() {
 record_verification() {
     local component="$1" status="$2" message="$3"
     case "$status" in
-        "PASS") log "    ${GREEN}✓${NC} ${component}: ${message}"; ((VERIFICATION_PASSED++)) ;;
-        "WARN") log "    ${YELLOW}⚠${NC} ${component}: ${message}"; ((VERIFICATION_WARNINGS++)) ;;
-        "FAIL") log "    ${RED}✗${NC} ${component}: ${message}"; ((VERIFICATION_FAILED++)) ;;
+        "PASS") log "    ${GREEN}✓${NC} ${component}: ${message}"; VERIFICATION_PASSED=$((VERIFICATION_PASSED + 1)) ;;
+        "WARN") log "    ${YELLOW}⚠${NC} ${component}: ${message}"; VERIFICATION_WARNINGS=$((VERIFICATION_WARNINGS + 1)) ;;
+        "FAIL") log "    ${RED}✗${NC} ${component}: ${message}"; VERIFICATION_FAILED=$((VERIFICATION_FAILED + 1)) ;;
     esac
 }
 
@@ -258,7 +258,10 @@ run_verification() {
     verify_swap
     verify_dns
     local installed=0 total=0
-    for pkg in $INSTALL_PACKAGES; do ((total++)); dpkg -l "$pkg" >/dev/null 2>&1 && ((installed++)); done
+    for pkg in $INSTALL_PACKAGES; do
+        total=$((total + 1))
+        dpkg -l "$pkg" >/dev/null 2>&1 && installed=$((installed + 1))
+    done
     [[ $installed -eq $total ]] && record_verification "软件包" "PASS" "全部已安装 ($installed/$total)" || record_verification "软件包" "FAIL" "部分缺失 ($installed/$total)"
     if [[ -n "$NEW_SSH_PORT" ]]; then
         local current_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
@@ -308,21 +311,53 @@ EOF
 }
 
 parse_args() {
+    require_value() {
+        [[ $# -ge 2 && -n "${2:-}" && "$2" != -* ]] || {
+            echo -e "${RED}选项 $1 需要一个参数${NC}" >&2
+            exit 2
+        }
+    }
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage ;;
-            --hostname) NEW_HOSTNAME="$2"; shift 2 ;;
-            --timezone) TIMEZONE="$2"; shift 2 ;;
-            --swap) SWAP_SIZE_MB="$2"; shift 2 ;;
-            --ip-dns) read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"; shift 2 ;;
-            --ip6-dns) read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"; shift 2 ;;
+            --hostname) require_value "$@"; NEW_HOSTNAME="$2"; shift 2 ;;
+            --timezone)
+                require_value "$@"
+                if command -v timedatectl >/dev/null 2>&1 && ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$2"; then
+                    echo -e "${RED}无效时区: $2${NC}" >&2
+                    exit 2
+                fi
+                TIMEZONE="$2"; shift 2 ;;
+            --swap)
+                require_value "$@"
+                [[ "$2" = "auto" || "$2" =~ ^[0-9]+$ ]] || { echo -e "${RED}--swap 必须是 auto、0 或正整数 MB${NC}" >&2; exit 2; }
+                SWAP_SIZE_MB="$2"; shift 2 ;;
+            --ip-dns)
+                require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
+                [[ -n "$PRIMARY_DNS_V4" && -n "$SECONDARY_DNS_V4" ]] || { echo -e "${RED}--ip-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
+                shift 2 ;;
+            --ip6-dns)
+                require_value "$@"; read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"
+                [[ -n "$PRIMARY_DNS_V6" && -n "$SECONDARY_DNS_V6" ]] || { echo -e "${RED}--ip6-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
+                shift 2 ;;
             --bbr) BBR_MODE="default"; shift ;;
             --bbr-optimized) BBR_MODE="optimized"; shift ;;
             --no-bbr) BBR_MODE="none"; shift ;;
-            --fail2ban) ENABLE_FAIL2BAN=true; [[ -n "${2:-}" && ! "$2" =~ ^- ]] && { FAIL2BAN_EXTRA_PORT="$2"; shift; }; shift ;;
+            --fail2ban)
+                ENABLE_FAIL2BAN=true
+                if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { echo -e "${RED}Fail2ban 端口必须是 1-65535 的端口${NC}" >&2; exit 2; }
+                    FAIL2BAN_EXTRA_PORT="$2"
+                    shift
+                fi
+                shift ;;
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
-            --ssh-port) NEW_SSH_PORT="$2"; shift 2 ;;
-            --ssh-password) NEW_SSH_PASSWORD="$2"; shift 2 ;;
+            --ssh-port)
+                require_value "$@"
+                [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { echo -e "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
+                NEW_SSH_PORT="$2"; shift 2 ;;
+            --ssh-password) require_value "$@"; NEW_SSH_PASSWORD="$2"; shift 2 ;;
             --non-interactive) non_interactive=true; shift ;;
             *) echo -e "${RED}未知选项: $1${NC}"; usage ;;
         esac
@@ -656,6 +691,14 @@ EOF
         systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] systemd-resolved 重启失败${NC}"
     else
         log "${BLUE}配置resolv.conf...${NC}"
+        if [[ -L /etc/resolv.conf ]]; then
+            log "${RED}[ERROR] /etc/resolv.conf 是符号链接，为避免破坏系统 DNS 管理，已停止修改。${NC}"
+            return 1
+        fi
+        cp -a /etc/resolv.conf "/etc/resolv.conf.backup.$(date +%Y%m%d-%H%M%S)" 2>>"$LOG_FILE" || {
+            log "${RED}[ERROR] 无法备份 /etc/resolv.conf，已停止修改。${NC}"
+            return 1
+        }
         chattr -i /etc/resolv.conf 2>/dev/null || true
         cat > /etc/resolv.conf << EOF
 nameserver ${PRIMARY_DNS_V4}
@@ -682,6 +725,12 @@ configure_ssh() {
 
     local ssh_changed=false
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
+        local current_ssh_port
+        current_ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
+        if [[ " $current_ssh_port " != *" ${NEW_SSH_PORT} "* ]] && ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
+            log "${RED}[ERROR] SSH端口 ${NEW_SSH_PORT} 已被其他服务占用，未修改 SSH 配置。${NC}"
+            return 1
+        fi
         cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
         sed -i '/^[#\s]*Port\s\+/d' /etc/ssh/sshd_config
         echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
@@ -726,6 +775,7 @@ configure_fail2ban() {
     
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
+# 永久封禁：输错 SSH 密码达到 maxretry 后，来源 IP 不会自动解封。
 bantime = -1
 findtime = 300
 maxretry = 3
