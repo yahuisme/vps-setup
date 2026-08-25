@@ -524,8 +524,6 @@ configure_time_sync() {
     if [ "$timesyncd_enabled" = false ] && ! (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         log "${YELLOW}[WARN] systemd-timesyncd 未运行或不存在，尝试安装...${NC}"
         start_spinner "安装 systemd-timesyncd... "
-        # 确保 apt-get update 运行过
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
         DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd >> "$LOG_FILE" 2>&1
         stop_spinner
 
