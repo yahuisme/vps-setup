@@ -2,15 +2,15 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.17
-# - [输出] BBR 显示实际内存档位和完整参数摘要
-# - [输出] 其它配置阶段统一使用分段标题、步骤提示和完成结果
-
+# 版本: 7.9.18
+# - [重构] 拆分 BBR 参数档位、显示、写入与验证逻辑
+# - [输出] 最终验证显示 BBR 关键运行时参数
+# - [界面] 统一部分警告输出样式
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
-SCRIPT_VERSION="7.9.17"
+SCRIPT_VERSION="7.9.18"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES="sudo wget zip vim curl"
@@ -41,6 +41,10 @@ log() {
     echo -e "$1"
 }
 
+result_warn() {
+    log "${YELLOW}  ⚠ $1${NC}"
+}
+
 section_header() {
     local number="$1" title="$2"
     log "\n${YELLOW}╭──────────────────────────────────────────────╮${NC}"
@@ -56,9 +60,6 @@ result_ok() {
     log "${GREEN}  ✔ $1${NC}"
 }
 
-result_warn() {
-    log "${YELLOW}  ⚠ $1${NC}"
-}
 
 handle_error() {
     local exit_code=$? line_number=$1
@@ -280,6 +281,7 @@ run_verification() {
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
     verify_time_sync
     verify_bbr
+    [[ "$BBR_MODE" = "optimized" ]] && show_bbr_runtime_details
     verify_swap
     verify_dns
     local installed=0 total=0
@@ -552,6 +554,104 @@ configure_time_sync() {
     fi
 }
 
+bbr_profile() {
+    local mem_mb="$1"
+    if [[ "$mem_mb" -ge 4096 ]]; then
+        BBR_MEMORY_TIER="4GB+"
+        BBR_RMEM_WMEM=67108864
+        BBR_SOMAXCONN=65535
+    elif [[ "$mem_mb" -ge 1024 ]]; then
+        BBR_MEMORY_TIER="1GB-4GB"
+        BBR_RMEM_WMEM=33554432
+        BBR_SOMAXCONN=32768
+    else
+        BBR_MEMORY_TIER="<1GB"
+        BBR_RMEM_WMEM=16777216
+        BBR_SOMAXCONN=16384
+    fi
+}
+
+show_bbr_plan() {
+    log "${BLUE}  内存档位：${BBR_MEMORY_TIER} | 缓冲区：${BBR_RMEM_WMEM} bytes | 连接队列：${BBR_SOMAXCONN}${NC}"
+    log "${CYAN}  将写入的 BBR 参数：${NC}"
+    log "    net.core.default_qdisc              = fq"
+    log "    net.ipv4.tcp_congestion_control      = bbr"
+    log "    net.core.rmem_max / wmem_max         = ${BBR_RMEM_WMEM}"
+    log "    net.ipv4.tcp_rmem                    = 4096 87380 ${BBR_RMEM_WMEM}"
+    log "    net.ipv4.tcp_wmem                    = 4096 65536 ${BBR_RMEM_WMEM}"
+    log "    net.core.somaxconn / tcp_syn_backlog = ${BBR_SOMAXCONN}"
+    log "    net.core.netdev_max_backlog          = ${BBR_SOMAXCONN}"
+    log "    tcp_fin_timeout / tw_reuse           = 30 / 1"
+    log "    tcp_slow_start_after_idle            = 0"
+    log "    ip_local_port_range                  = 10000 65535"
+    log "    tcp_keepalive_time / intvl / probes  = 600 / 15 / 5"
+    log "    tcp_notsent_lowat / mtu_probing      = 16384 / 1"
+}
+
+write_optimized_bbr_config() {
+    local config_file="$1"
+    cat > "$config_file" << EOF
+# --- BBR 核心 ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- 缓冲区优化 (配合 TCP 读写) ---
+net.core.rmem_max = ${BBR_RMEM_WMEM}
+net.core.wmem_max = ${BBR_RMEM_WMEM}
+net.ipv4.tcp_rmem = 4096 87380 ${BBR_RMEM_WMEM}
+net.ipv4.tcp_wmem = 4096 65536 ${BBR_RMEM_WMEM}
+
+# --- 连接队列与积压 ---
+net.core.somaxconn = ${BBR_SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog = ${BBR_SOMAXCONN}
+net.core.netdev_max_backlog = ${BBR_SOMAXCONN}
+
+# --- 连接复用与超时 (关键优化) ---
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.ip_local_port_range = 10000 65535
+
+# --- 保活探测 ---
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+
+# --- 其他 ---
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_mtu_probing = 1
+EOF
+}
+
+verify_bbr_runtime() {
+    local config_file="$1" current_cc current_qdisc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    if [[ "$current_cc" != "bbr" || "$current_qdisc" != "fq" ]]; then
+        log "${RED}[ERROR] BBR 核心参数未生效: ${current_cc}/${current_qdisc}${NC}"
+        return 1
+    fi
+    result_ok "BBR 核心参数已生效：${current_cc} / ${current_qdisc}"
+    log "${BLUE}  配置文件：${config_file}${NC}"
+}
+
+show_bbr_runtime_details() {
+    local key value
+    log "${CYAN}  BBR 关键运行时参数：${NC}"
+    for key in \
+        net.ipv4.tcp_congestion_control \
+        net.core.default_qdisc \
+        net.ipv4.tcp_tw_reuse \
+        net.ipv4.tcp_fin_timeout \
+        net.ipv4.tcp_keepalive_time \
+        net.ipv4.tcp_keepalive_intvl \
+        net.ipv4.tcp_keepalive_probes \
+        net.ipv4.tcp_mtu_probing; do
+        value=$(sysctl -n "$key" 2>/dev/null || echo "N/A")
+        log "    ${key} = ${value}"
+    done
+}
+
 configure_bbr() {
     section_header "5" "BBR 配置（优化版）"
     local config_file="/etc/sysctl.d/99-bbr.conf"
@@ -582,61 +682,9 @@ EOF
                 log "${YELLOW}[WARN] 内存较低，建议使用默认BBR模式${NC}"
             fi
             
-            local rmem_wmem somaxconn memory_tier
-            if [[ $mem_mb -ge 4096 ]]; then
-                memory_tier="4GB+"; rmem_wmem=67108864; somaxconn=65535
-            elif [[ $mem_mb -ge 1024 ]]; then
-                memory_tier="1GB-4GB"; rmem_wmem=33554432; somaxconn=32768
-            else
-                memory_tier="<1GB"; rmem_wmem=16777216; somaxconn=16384
-            fi
-
-            log "${BLUE}  内存档位：${memory_tier} | 缓冲区：${rmem_wmem} bytes | 连接队列：${somaxconn}${NC}"
-            log "${CYAN}  将写入的 BBR 参数：${NC}"
-            log "    net.core.default_qdisc              = fq"
-            log "    net.ipv4.tcp_congestion_control      = bbr"
-            log "    net.core.rmem_max / wmem_max         = ${rmem_wmem}"
-            log "    net.ipv4.tcp_rmem                    = 4096 87380 ${rmem_wmem}"
-            log "    net.ipv4.tcp_wmem                    = 4096 65536 ${rmem_wmem}"
-            log "    net.core.somaxconn / tcp_syn_backlog = ${somaxconn}"
-            log "    net.core.netdev_max_backlog          = ${somaxconn}"
-            log "    tcp_fin_timeout / tw_reuse           = 30 / 1"
-            log "    tcp_slow_start_after_idle            = 0"
-            log "    ip_local_port_range                  = 10000 65535"
-            log "    tcp_keepalive_time / intvl / probes  = 600 / 15 / 5"
-            log "    tcp_notsent_lowat / mtu_probing      = 16384 / 1"
-            
-            cat > "$config_file" << EOF
-# --- BBR 核心 ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# --- 缓冲区优化 (配合 TCP 读写) ---
-net.core.rmem_max = ${rmem_wmem}
-net.core.wmem_max = ${rmem_wmem}
-net.ipv4.tcp_rmem = 4096 87380 ${rmem_wmem}
-net.ipv4.tcp_wmem = 4096 65536 ${rmem_wmem}
-
-# --- 连接队列与积压 ---
-net.core.somaxconn = ${somaxconn}
-net.ipv4.tcp_max_syn_backlog = ${somaxconn}
-net.core.netdev_max_backlog = ${somaxconn}
-
-# --- 连接复用与超时 (关键优化) ---
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.ip_local_port_range = 10000 65535
-
-# --- 保活探测 ---
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 5
-
-# --- 其他 ---
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_mtu_probing = 1
-EOF
+            bbr_profile "$mem_mb"
+            show_bbr_plan
+            write_optimized_bbr_config "$config_file"
             ;;
         *)
             log "${BLUE}配置标准 BBR：仅启用 bbr + fq${NC}"
@@ -648,17 +696,9 @@ EOF
     esac
     
     if ! sysctl -p "$config_file" >> "$LOG_FILE" 2>&1; then
-        log "${YELLOW}[WARN] 部分 BBR 参数不受当前内核支持，将继续验证核心参数。${NC}"
+        result_warn "部分 BBR 参数不受当前内核支持，将继续验证核心参数"
     fi
-    local current_cc current_qdisc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
-    if [[ "$current_cc" != "bbr" || "$current_qdisc" != "fq" ]]; then
-        log "${RED}[ERROR] BBR 核心参数未生效: ${current_cc}/${current_qdisc}${NC}"
-        return 1
-    fi
-    result_ok "BBR 核心参数已生效：${current_cc} / ${current_qdisc}"
-    log "${BLUE}  配置文件：${config_file}${NC}"
+    verify_bbr_runtime "$config_file"
 }
 
 configure_swap() {
@@ -755,7 +795,7 @@ configure_dns() {
     local ipv6_enabled=false
     has_ipv6 && ipv6_enabled=true
     if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
-        log "${YELLOW}[WARN] 云环境检测，DNS可能被覆盖${NC}"
+        result_warn "云环境可能覆盖 DNS 配置"
     fi
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         mkdir -p /etc/systemd/resolved.conf.d
