@@ -50,7 +50,7 @@ apt install curl -y && curl -o install.sh -fsSL https://raw.githubusercontent.co
 10. 自动优化 vim 编辑器配置
 11. 系统更新及清理
 
-## 配合 bin456789 一键 DD 脚本
+## 一键 DD 脚本
 
 https://github.com/bin456789/reinstall
 
@@ -61,6 +61,8 @@ curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh 
 ```
 
 DD脚本的系统版本、 ssh 端口和 password 请自行修改
+
+## 特别提醒
 
 > **重要：Fail2ban 默认使用永久封禁（`bantime = -1`）。**
 > SSH 连续认证失败达到 3 次后，来源 IP 将不会自动解封。请确认自己的管理 IP 不会被误封，或使用以下命令手动解封：
