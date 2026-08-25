@@ -672,16 +672,22 @@ configure_swap() {
     fi
     chmod 600 "$new_swap"
     mkswap "$new_swap" >> "$LOG_FILE" 2>&1
-    swapon "$new_swap" >> "$LOG_FILE" 2>&1
     if [[ -f "$swap_file" ]]; then
         if ! swapoff "$swap_file" 2>/dev/null; then
-            swapoff "$new_swap" 2>/dev/null || true
             rm -f "$new_swap"
             log "${RED}[ERROR] 无法关闭现有 Swap，保留原配置。${NC}"
             return 1
         fi
     fi
-    mv -f "$new_swap" "$swap_file"
+    # 不能移动仍处于 active 状态的 swap 文件；先关闭旧文件，再替换路径。
+    if ! mv -f "$new_swap" "$swap_file"; then
+        log "${RED}[ERROR] Swap文件替换失败，未启用新配置。${NC}"
+        return 1
+    fi
+    if ! swapon "$swap_file" >> "$LOG_FILE" 2>&1; then
+        log "${RED}[ERROR] 新 Swap 启用失败。${NC}"
+        return 1
+    fi
     grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
     log "${GREEN}✅ ${swap_mb}MB Swap已配置${NC}"
 }
