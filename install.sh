@@ -645,7 +645,19 @@ configure_swap() {
     fi
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
-    local new_swap="${swap_file}.new"
+    # 使用唯一临时路径，避免上次中断遗留的 active swap 阻塞本次运行。
+    local new_swap="${swap_file}.new.$$"
+    # 清理所有旧版本或中断运行遗留的临时 Swap（包括 active 状态）。
+    for stale_swap in "${swap_file}.new"*; do
+        [[ -e "$stale_swap" ]] || continue
+        [[ "$stale_swap" = "$new_swap" ]] && continue
+        swapoff "$stale_swap" 2>/dev/null || true
+        rm -f "$stale_swap"
+        if [[ -e "$stale_swap" ]]; then
+            log "${RED}[ERROR] 无法清理遗留的临时 Swap文件: ${stale_swap}${NC}"
+            return 1
+        fi
+    done
     if [[ -f "$swap_file" ]]; then
         local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
         if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
@@ -654,32 +666,38 @@ configure_swap() {
         fi
     fi
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
-    # 上次失败可能留下仍处于 active 状态的临时 Swap，必须先关闭才能删除。
-    if [[ -e "$new_swap" ]]; then
-        swapoff "$new_swap" 2>/dev/null || true
-    fi
-    rm -f "$new_swap"
-    if [[ -e "$new_swap" ]]; then
-        log "${RED}[ERROR] 无法删除上次遗留的临时 Swap文件。${NC}"
-        return 1
-    fi
+    # 创建阶段失败时也清理临时文件，避免下次运行留下脏状态。
     if command -v fallocate &>/dev/null; then
         start_spinner "快速创建Swap... "
-        fallocate -l "${swap_mb}M" "$new_swap" >> "$LOG_FILE" 2>&1
+        if ! fallocate -l "${swap_mb}M" "$new_swap" >> "$LOG_FILE" 2>&1; then
+            stop_spinner
+            rm -f "$new_swap"
+            log "${RED}[ERROR] Swap文件创建失败。${NC}"
+            return 1
+        fi
         stop_spinner
     else
         log "${BLUE}使用dd创建，请稍候...${NC}"
-        dd if=/dev/zero of="$new_swap" bs=1M count="$swap_mb" status=progress 2>&1 | while IFS= read -r line; do
+        if ! dd if=/dev/zero of="$new_swap" bs=1M count="$swap_mb" status=progress 2>&1 | while IFS= read -r line; do
             if [[ "$line" =~ ([0-9]+)\ bytes.*copied ]]; then
                 local copied_bytes=${BASH_REMATCH[1]}
                 local copied_mb=$((copied_bytes / 1024 / 1024))
                 show_progress $copied_mb $swap_mb
             fi
         done
+        then
+            rm -f "$new_swap"
+            log "${RED}[ERROR] Swap文件创建失败。${NC}"
+            return 1
+        fi
         echo ""
     fi
     chmod 600 "$new_swap"
-    mkswap "$new_swap" >> "$LOG_FILE" 2>&1
+    if ! mkswap "$new_swap" >> "$LOG_FILE" 2>&1; then
+        rm -f "$new_swap"
+        log "${RED}[ERROR] Swap格式化失败。${NC}"
+        return 1
+    fi
     if [[ -f "$swap_file" ]]; then
         if ! swapoff "$swap_file" 2>/dev/null; then
             rm -f "$new_swap"
