@@ -1,5 +1,5 @@
 # vps-setup
-便捷高效的 VPS 系统开箱一键优化设置脚本。脚本支持 Debian 和 Ubuntu，其它系统请自行测试。
+便捷高效的全新 VPS 开箱一键优化设置脚本。脚本面向 Debian 10–13、Ubuntu 20.04/22.04/24.04 的全新系统；其它系统请自行测试。脚本会安装软件、修改系统配置并执行系统升级，不建议直接用于已有业务的生产 VPS。
 
 ## 功能特点
 
@@ -22,7 +22,7 @@ apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.gi
 
 ## 无交互安装
 
-以下示例需要按实际情况修改参数。`--ip-dns` 和 `--ip6-dns` 的两个地址使用空格分隔。
+以下示例需要按实际情况修改参数。`--ip-dns` 和 `--ip6-dns` 的两个地址使用空格分隔。`--ssh-password` 仅适合全新 VPS 的临时初始化，建议登录验证后立即改用密钥并关闭密码登录。
 
 ```bash
 apt-get update -y && apt-get install -y curl && curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap 1024 --bbr-optimized --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --ssh-password 'CHANGE_ME_TO_A_TEMPORARY_STRONG_PASSWORD' --fail2ban 12345 --non-interactive
@@ -63,7 +63,7 @@ curl -O https://github.com/bin456789/reinstall/raw/main/reinstall.sh && bash rei
 
 ## 注意事项
 
-- Fail2ban 默认永久封禁 SSH 认证失败来源（`bantime = -1`），管理 IP 误封后需手动解封：
+- Fail2ban 默认永久封禁 SSH 认证失败来源（`bantime = -1`），管理 IP 误封后需手动解封；脚本配置写入独立的 `jail.d/99-vps-setup.local`，不会覆盖其它 Jail：
   ```bash
   sudo fail2ban-client set sshd unbanip <IP>
   ```

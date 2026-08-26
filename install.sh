@@ -3,9 +3,6 @@
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
 # 版本: 7.9.18
-# - [重构] 拆分 BBR 参数档位、显示、写入与验证逻辑
-# - [输出] 最终验证显示 BBR 关键运行时参数
-# - [界面] 统一部分警告输出样式
 # ==============================================================================
 set -euo pipefail
 
@@ -63,7 +60,6 @@ result_ok() {
 
 handle_error() {
     local exit_code=$? line_number=$1
-    # [FIX] 增加 2>/dev/null || true 确保 tput 失败时不会再次触发错误
     command -v tput >/dev/null 2>&1 && tput cnorm 2>/dev/null || true
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     printf '%b\n' "$error_message"
@@ -81,7 +77,6 @@ start_spinner() {
     printf '%b' "${CYAN}${1:-}${NC}"
     ( while :; do for c in '/' '-' '\\' '|'; do printf '\b%s' "$c"; sleep 0.1; done; done ) &
     spinner_pid=$!
-    # [FIX] 增加 2>/dev/null || true 防止 'tput civis' 失败时终止脚本
     tput civis 2>/dev/null || true
 }
 
@@ -91,7 +86,6 @@ stop_spinner() {
         wait "$spinner_pid" 2>/dev/null || true
         spinner_pid=0
     fi
-    # [FIX] 增加 2>/dev/null || true
     if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
         tput cnorm 2>/dev/null || true
         printf '%b\n' "\b${GREEN}✔${NC}"
@@ -175,18 +169,6 @@ is_kernel_version_ge() {
     [[ "$(compare_version "$current" "$required")" = "$required" ]]
 }
 
-verify_privileges() {
-    local checks=0
-    [[ $EUID -eq 0 ]] && checks=$((checks + 1))
-    [[ -w /etc/passwd ]] && checks=$((checks + 1))
-    [[ $EUID -eq 0 ]] || { groups | grep -qE '\b(sudo|wheel|admin)\b' && checks=$((checks + 1)); }
-    if [[ $checks -lt 2 ]]; then
-        log "${RED}[ERROR] 权限不足，需要root权限或完整sudo权限${NC}"
-        return 1
-    fi
-    return 0
-}
-
 record_verification() {
     local component="$1" status="$2" message="$3"
     case "$status" in
@@ -264,7 +246,6 @@ verify_time_sync() {
         record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
     elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
         record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
-    # [FIX] chrony/ntp 是警告，因为用户不想用它们
     elif (systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null); then
         record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
     else
@@ -275,7 +256,6 @@ verify_time_sync() {
 run_verification() {
     log "\n${YELLOW}=============== 配置验证 ===============${NC}"
     VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
-    # 验证时临时关闭 set -e
     set +e
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
@@ -302,7 +282,6 @@ run_verification() {
             record_verification "Fail2ban" "FAIL" "服务异常"
         fi
     fi
-    # 恢复 set -e
     set -e
     log "\n${BLUE}验证结果: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${YELLOW}警告 ${VERIFICATION_WARNINGS}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
 }
@@ -333,13 +312,39 @@ EOF
     exit 0
 }
 
-parse_args() {
-    require_value() {
-        [[ $# -ge 2 && -n "${2:-}" && "$2" != -* ]] || {
-            printf '%b\n' "${RED}选项 $1 需要一个参数${NC}" >&2
-            exit 2
-        }
+require_value() {
+    [[ $# -ge 2 && -n "${2:-}" && "$2" != -* ]] || {
+        printf '%b\n' "${RED}选项 $1 需要一个参数${NC}" >&2
+        exit 2
     }
+}
+
+valid_ipv4() {
+    local ip="$1" octet
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS=. read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" -le 255 ]] || return 1
+    done
+}
+
+valid_ipv6() {
+    local ip="$1" group groups
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]] || return 1
+    [[ "$ip" != *::*::* && "$ip" != *:::* ]] || return 1
+    groups="${ip//:/ }"
+    read -ra groups <<< "$groups"
+    for group in "${groups[@]}"; do
+        [[ -z "$group" || "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    if [[ "$ip" == *::* ]]; then
+        [[ ${#groups[@]} -lt 8 ]]
+    else
+        [[ ${#groups[@]} -eq 8 ]]
+    fi
+}
+
+parse_args() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -358,11 +363,11 @@ parse_args() {
                 SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
-                [[ -n "$PRIMARY_DNS_V4" && -n "$SECONDARY_DNS_V4" ]] || { printf '%b\n' "${RED}--ip-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
+                valid_ipv4 "$PRIMARY_DNS_V4" && valid_ipv4 "$SECONDARY_DNS_V4" || { printf '%b\n' "${RED}--ip-dns 需要两个有效 IPv4 地址${NC}" >&2; exit 2; }
                 shift 2 ;;
             --ip6-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"
-                [[ -n "$PRIMARY_DNS_V6" && -n "$SECONDARY_DNS_V6" ]] || { printf '%b\n' "${RED}--ip6-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
+                valid_ipv6 "$PRIMARY_DNS_V6" && valid_ipv6 "$SECONDARY_DNS_V6" || { printf '%b\n' "${RED}--ip6-dns 需要两个有效 IPv6 地址${NC}" >&2; exit 2; }
                 shift 2 ;;
             --bbr) BBR_MODE="default"; shift ;;
             --bbr-optimized) BBR_MODE="optimized"; shift ;;
@@ -389,7 +394,7 @@ parse_args() {
 
 pre_flight_checks() {
     log "${BLUE}[INFO] 系统预检查...${NC}"
-    verify_privileges || exit 1
+
     if is_container; then
         log "${YELLOW}[WARN] 容器环境，某些功能可能受限${NC}"
         [[ "$non_interactive" = false ]] && { read -p "继续? [y/N] " -r < /dev/tty; [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0; }
@@ -454,12 +459,10 @@ configure_hostname() {
             NEW_HOSTNAME=""
         fi
     
-    # [FIX] 修复非交互模式下的逻辑漏洞
     elif [[ "$non_interactive" = true ]]; then
         local auto_ip
         auto_ip=$(get_public_ipv4) # 先获取
         
-        # [FIX] 检查 auto_ip 是否为空
         if [[ -n "$auto_ip" ]]; then 
             final_hostname=$(echo "$auto_ip" | tr '.' '-')
             hostnamectl set-hostname "$final_hostname" >> "$LOG_FILE" 2>&1
@@ -495,7 +498,6 @@ configure_timezone() {
     result_ok "时区已设置：${TIMEZONE}"
 }
 
-# [修改 v7.9.14] 严格按照 "仅 systemd-timesyncd" 逻辑
 configure_time_sync() {
     section_header "4" "时间同步配置"
     
@@ -705,18 +707,17 @@ configure_swap() {
     section_header "6" "Swap 配置"
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
         log "${BLUE}  Swap：禁用${NC}"
-        local swap_file="/swapfile" active_swap
-        while IFS= read -r active_swap; do
-            [[ -n "$active_swap" ]] || continue
-            if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
-                log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
+        local swap_file="/swapfile"
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
+            if ! swapoff "$swap_file" >> "$LOG_FILE" 2>&1; then
+                log "${RED}[ERROR] 无法关闭 ${swap_file}，保留原配置。${NC}"
                 return 1
             fi
-        done < <(swapon --show=NAME --noheadings 2>/dev/null)
+        fi
         rm -f "$swap_file"
-        sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)|d' /etc/fstab
-        if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" || -e "$swap_file" ]]; then
-            log "${RED}[ERROR] Swap 未能完全禁用。${NC}"
+        sed -i '\|^[[:space:]]*/swapfile[[:space:]]|d' /etc/fstab
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file" || [[ -e "$swap_file" ]]; then
+            log "${RED}[ERROR] ${swap_file} 未能完全禁用。${NC}"
             return 1
         fi
         log "${GREEN}  ✔ Swap 已禁用并移除${NC}"
@@ -735,9 +736,7 @@ configure_swap() {
     fi
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
-    # 使用唯一临时路径，避免上次中断遗留的 active swap 阻塞本次运行。
     local new_swap="${swap_file}.new.$$"
-    # 清理所有旧版本或中断运行遗留的临时 Swap（包括 active 状态）。
     for stale_swap in "${swap_file}.new"*; do
         [[ -e "$stale_swap" ]] || continue
         [[ "$stale_swap" = "$new_swap" ]] && continue
@@ -788,22 +787,27 @@ configure_swap() {
         log "${RED}[ERROR] Swap格式化失败。${NC}"
         return 1
     fi
+    local old_swap="${swap_file}.old.$$"
     if [[ -f "$swap_file" ]]; then
-        if ! swapoff "$swap_file" 2>/dev/null; then
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file" && ! swapoff "$swap_file" 2>/dev/null; then
             rm -f "$new_swap"
             log "${RED}[ERROR] 无法关闭现有 Swap，保留原配置。${NC}"
             return 1
         fi
+        mv -f "$swap_file" "$old_swap"
     fi
-    # 不能移动仍处于 active 状态的 swap 文件；先关闭旧文件，再替换路径。
     if ! mv -f "$new_swap" "$swap_file"; then
+        [[ -f "$old_swap" ]] && mv -f "$old_swap" "$swap_file"
         log "${RED}[ERROR] Swap文件替换失败，未启用新配置。${NC}"
         return 1
     fi
     if ! swapon "$swap_file" >> "$LOG_FILE" 2>&1; then
+        rm -f "$swap_file"
+        [[ -f "$old_swap" ]] && { mv -f "$old_swap" "$swap_file"; swapon "$swap_file" >> "$LOG_FILE" 2>&1 || true; }
         log "${RED}[ERROR] 新 Swap 启用失败。${NC}"
         return 1
     fi
+    rm -f "$old_swap"
     grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
     log "${GREEN}  ✔ Swap 已配置：${swap_mb}MB${NC}"
 }
@@ -832,7 +836,7 @@ EOF
             log "${RED}[ERROR] /etc/resolv.conf 是符号链接，为避免破坏系统 DNS 管理，已停止修改。${NC}"
             return 1
         fi
-        cp -a /etc/resolv.conf "/etc/resolv.conf.backup.$(date +%Y%m%d-%H%M%S)" 2>>"$LOG_FILE" || {
+        cp -a /etc/resolv.conf "/etc/resolv.conf.backup.$(date +%Y%m%d-%H%M%S).$$" 2>>"$LOG_FILE" || {
             log "${RED}[ERROR] 无法备份 /etc/resolv.conf，已停止修改。${NC}"
             return 1
         }
@@ -843,7 +847,11 @@ nameserver ${PRIMARY_DNS_V4}
 nameserver ${SECONDARY_DNS_V4}
 $( [[ "$ipv6_enabled" == true ]] && printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6" )
 EOF
-        mv -f "$resolv_tmp" /etc/resolv.conf
+        if ! mv -f "$resolv_tmp" /etc/resolv.conf; then
+            rm -f "$resolv_tmp"
+            log "${RED}[ERROR] 无法替换 /etc/resolv.conf${NC}"
+            return 1
+        fi
     fi
     result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([ "$ipv6_enabled" = true ] && echo "，IPv6 已启用")"
 }
@@ -937,9 +945,9 @@ configure_fail2ban() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1
     stop_spinner
     
-    local jail_file="/etc/fail2ban/jail.local" jail_tmp="/etc/fail2ban/jail.local.vps-setup.$$"
-    local jail_backup=""
-    [[ -f "$jail_file" ]] && jail_backup="${jail_file}.backup.$(date +%Y%m%d-%H%M%S).$$" && cp -a "$jail_file" "$jail_backup"
+    local jail_file="/etc/fail2ban/jail.d/99-vps-setup.local"
+    local jail_tmp="${jail_file}.vps-setup.$$"
+    mkdir -p "${jail_file%/*}"
     cat > "$jail_tmp" << EOF
 [DEFAULT]
 # 永久封禁：输错 SSH 密码达到 maxretry 后，来源 IP 不会自动解封。
@@ -957,16 +965,17 @@ EOF
     mv -f "$jail_tmp" "$jail_file"
     if ! fail2ban-client -t >> "$LOG_FILE" 2>&1; then
         log "${RED}[ERROR] Fail2ban 配置校验失败${NC}"
-        if [[ -n "$jail_backup" ]]; then
-            cp -a "$jail_backup" "$jail_file"
-        else
-            rm -f "$jail_file"
-        fi
+        rm -f "$jail_file"
         return 1
     fi
     
     systemctl enable fail2ban >> "$LOG_FILE" 2>&1
-    systemctl restart fail2ban >> "$LOG_FILE" 2>&1
+    if ! systemctl restart fail2ban >> "$LOG_FILE" 2>&1; then
+        rm -f "$jail_file"
+        systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || true
+        log "${RED}[ERROR] Fail2ban 重启失败，已移除脚本配置。${NC}"
+        return 1
+    fi
     
     if (systemctl is-active --quiet fail2ban); then
         result_ok "Fail2ban 已启动，保护端口：${port_list}"
