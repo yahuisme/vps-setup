@@ -324,7 +324,8 @@ valid_ipv4() {
     [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
     IFS=. read -ra octets <<< "$ip"
     for octet in "${octets[@]}"; do
-        [[ "$octet" -le 255 ]] || return 1
+        # Force base-10 so 08/09 do not trigger Bash's octal parsing.
+        (( 10#$octet <= 255 )) || return 1
     done
 }
 
@@ -342,6 +343,11 @@ valid_ipv6() {
     else
         [[ ${#groups[@]} -eq 8 ]]
     fi
+}
+
+ensure_swap_fstab_entry() {
+    grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab ||
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
 }
 
 parse_args() {
@@ -461,7 +467,7 @@ configure_hostname() {
     
     elif [[ "$non_interactive" = true ]]; then
         local auto_ip
-        auto_ip=$(get_public_ipv4) # 先获取
+        auto_ip=$(get_public_ipv4) || true
         
         if [[ -n "$auto_ip" ]]; then 
             final_hostname=$(echo "$auto_ip" | tr '.' '-')
@@ -707,17 +713,19 @@ configure_swap() {
     section_header "6" "Swap 配置"
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
         log "${BLUE}  Swap：禁用${NC}"
-        local swap_file="/swapfile"
-        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
-            if ! swapoff "$swap_file" >> "$LOG_FILE" 2>&1; then
-                log "${RED}[ERROR] 无法关闭 ${swap_file}，保留原配置。${NC}"
+        local swap_file="/swapfile" active_swap
+        while IFS= read -r active_swap; do
+            [[ -n "$active_swap" ]] || continue
+            if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
+                log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
                 return 1
             fi
-        fi
+        done < <(swapon --show=NAME --noheadings 2>/dev/null)
         rm -f "$swap_file"
-        sed -i '\|^[[:space:]]*/swapfile[[:space:]]|d' /etc/fstab
-        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file" || [[ -e "$swap_file" ]]; then
-            log "${RED}[ERROR] ${swap_file} 未能完全禁用。${NC}"
+        # --swap 0 means disable all fstab swap entries, not only /swapfile.
+        sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)|d' /etc/fstab
+        if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" ]]; then
+            log "${RED}[ERROR] Swap 未能完全禁用。${NC}"
             return 1
         fi
         log "${GREEN}  ✔ Swap 已禁用并移除${NC}"
@@ -750,8 +758,18 @@ configure_swap() {
     if [[ -f "$swap_file" ]]; then
         local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
         if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
-            log "${GREEN}  ✔ Swap 文件已存在：${current_size_mb}MB${NC}"
-            return
+            if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
+                ensure_swap_fstab_entry
+                log "${GREEN}  ✔ Swap 文件已存在并已启用：${current_size_mb}MB${NC}"
+                return
+            fi
+            chmod 600 "$swap_file"
+            if swapon "$swap_file" >> "$LOG_FILE" 2>&1; then
+                ensure_swap_fstab_entry
+                log "${GREEN}  ✔ 已启用现有 Swap 文件：${current_size_mb}MB${NC}"
+                return
+            fi
+            log "${YELLOW}[WARN] 现有 Swap 文件无法启用，将重新创建。${NC}"
         fi
     fi
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
@@ -808,7 +826,7 @@ configure_swap() {
         return 1
     fi
     rm -f "$old_swap"
-    grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
+    ensure_swap_fstab_entry
     log "${GREEN}  ✔ Swap 已配置：${swap_mb}MB${NC}"
 }
 
@@ -930,15 +948,18 @@ configure_ssh() {
 configure_fail2ban() {
     section_header "9" "Fail2ban 配置"
     
-    local ports=("22")
+    local ports=()
     [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ ]] && ports+=("$NEW_SSH_PORT")
     [[ -n "$FAIL2BAN_EXTRA_PORT" && "$FAIL2BAN_EXTRA_PORT" =~ ^[0-9]+$ ]] && ports+=("$FAIL2BAN_EXTRA_PORT")
-    
-    if [[ "$non_interactive" = true && -z "$NEW_SSH_PORT" && -f /etc/ssh/sshd_config ]]; then
-        local detected_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
-        [[ -n "$detected_port" ]] && ports+=("$detected_port")
+
+    # Use the effective sshd configuration so includes and drop-ins are honored.
+    if [[ -z "$NEW_SSH_PORT" ]] && command -v sshd >/dev/null 2>&1; then
+        while IFS= read -r detected_port; do
+            [[ "$detected_port" =~ ^[0-9]+$ ]] && ports+=("$detected_port")
+        done < <(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}')
     fi
-    
+    [[ ${#ports[@]} -gt 0 ]] || ports=("22")
+
     local port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
     
     start_spinner "安装Fail2ban... "
@@ -947,7 +968,16 @@ configure_fail2ban() {
     
     local jail_file="/etc/fail2ban/jail.d/99-vps-setup.local"
     local jail_tmp="${jail_file}.vps-setup.$$"
+    local jail_backup="${jail_file}.backup.$(date +%Y%m%d-%H%M%S).$$"
     mkdir -p "${jail_file%/*}"
+    [[ -f "$jail_file" ]] && cp -a "$jail_file" "$jail_backup"
+    restore_fail2ban_jail() {
+        if [[ -f "$jail_backup" ]]; then
+            mv -f "$jail_backup" "$jail_file"
+        else
+            rm -f "$jail_file"
+        fi
+    }
     cat > "$jail_tmp" << EOF
 [DEFAULT]
 # 永久封禁：输错 SSH 密码达到 maxretry 后，来源 IP 不会自动解封。
@@ -965,17 +995,18 @@ EOF
     mv -f "$jail_tmp" "$jail_file"
     if ! fail2ban-client -t >> "$LOG_FILE" 2>&1; then
         log "${RED}[ERROR] Fail2ban 配置校验失败${NC}"
-        rm -f "$jail_file"
+        restore_fail2ban_jail
         return 1
     fi
     
     systemctl enable fail2ban >> "$LOG_FILE" 2>&1
     if ! systemctl restart fail2ban >> "$LOG_FILE" 2>&1; then
-        rm -f "$jail_file"
+        restore_fail2ban_jail
         systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || true
-        log "${RED}[ERROR] Fail2ban 重启失败，已移除脚本配置。${NC}"
+        log "${RED}[ERROR] Fail2ban 重启失败，已恢复原配置。${NC}"
         return 1
     fi
+    rm -f "$jail_backup"
     
     if (systemctl is-active --quiet fail2ban); then
         result_ok "Fail2ban 已启动，保护端口：${port_list}"
