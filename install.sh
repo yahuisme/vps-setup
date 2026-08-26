@@ -27,8 +27,8 @@ NEW_SSH_PORT=""
 NEW_SSH_PASSWORD=""
 
 # --- 颜色和全局变量 ---
-readonly GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m' CYAN='\033[0;36m' NC='\033[0m'
+readonly GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[1;33m'
+readonly BLUE=$'\033[0;34m' CYAN=$'\033[0;36m' NC=$'\033[0m'
 
 non_interactive=false
 spinner_pid=0
@@ -38,7 +38,7 @@ VERIFICATION_FAILED=0
 VERIFICATION_WARNINGS=0
 
 log() {
-    echo -e "$1"
+    printf '%b\n' "$1"
 }
 
 result_warn() {
@@ -66,7 +66,7 @@ handle_error() {
     # [FIX] 增加 2>/dev/null || true 确保 tput 失败时不会再次触发错误
     command -v tput >/dev/null 2>&1 && tput cnorm 2>/dev/null || true
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
-    echo -e "$error_message"
+    printf '%b\n' "$error_message"
     [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE"
     [[ $spinner_pid -ne 0 ]] && kill "$spinner_pid" 2>/dev/null
     exit "$exit_code"
@@ -75,11 +75,11 @@ handle_error() {
 start_spinner() {
     # 如果 tput 不可用或非 TTY，则不显示 spinner
     if ! command -v tput >/dev/null 2>&1 || [[ ! -t 1 ]]; then
-        echo -e "${CYAN}${1:-}${NC}"
+        printf '%b\n' "${CYAN}${1:-}${NC}"
         return
     fi
-    echo -n -e "${CYAN}${1:-}${NC}"
-    ( while :; do for c in '/' '-' '\' '|'; do echo -ne "\b$c"; sleep 0.1; done; done ) &
+    printf '%b' "${CYAN}${1:-}${NC}"
+    ( while :; do for c in '/' '-' '\\' '|'; do printf '\b%s' "$c"; sleep 0.1; done; done ) &
     spinner_pid=$!
     # [FIX] 增加 2>/dev/null || true 防止 'tput civis' 失败时终止脚本
     tput civis 2>/dev/null || true
@@ -94,9 +94,9 @@ stop_spinner() {
     # [FIX] 增加 2>/dev/null || true
     if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
         tput cnorm 2>/dev/null || true
-        echo -e "\b${GREEN}✔${NC}"
+        printf '%b\n' "\b${GREEN}✔${NC}"
     else
-        echo -e "${GREEN}✔${NC}"
+        printf '%b\n' "${GREEN}✔${NC}"
     fi
 }
 
@@ -336,7 +336,7 @@ EOF
 parse_args() {
     require_value() {
         [[ $# -ge 2 && -n "${2:-}" && "$2" != -* ]] || {
-            echo -e "${RED}选项 $1 需要一个参数${NC}" >&2
+            printf '%b\n' "${RED}选项 $1 需要一个参数${NC}" >&2
             exit 2
         }
     }
@@ -348,21 +348,21 @@ parse_args() {
             --timezone)
                 require_value "$@"
                 if command -v timedatectl >/dev/null 2>&1 && ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$2"; then
-                    echo -e "${RED}无效时区: $2${NC}" >&2
+                    printf '%b\n' "${RED}无效时区: $2${NC}" >&2
                     exit 2
                 fi
                 TIMEZONE="$2"; shift 2 ;;
             --swap)
                 require_value "$@"
-                [[ "$2" = "auto" || "$2" =~ ^[0-9]+$ ]] || { echo -e "${RED}--swap 必须是 auto、0 或正整数 MB${NC}" >&2; exit 2; }
+                [[ "$2" = "auto" || "$2" =~ ^[0-9]+$ ]] || { printf '%b\n' "${RED}--swap 必须是 auto、0 或正整数 MB${NC}" >&2; exit 2; }
                 SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
-                [[ -n "$PRIMARY_DNS_V4" && -n "$SECONDARY_DNS_V4" ]] || { echo -e "${RED}--ip-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
+                [[ -n "$PRIMARY_DNS_V4" && -n "$SECONDARY_DNS_V4" ]] || { printf '%b\n' "${RED}--ip-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
                 shift 2 ;;
             --ip6-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"
-                [[ -n "$PRIMARY_DNS_V6" && -n "$SECONDARY_DNS_V6" ]] || { echo -e "${RED}--ip6-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
+                [[ -n "$PRIMARY_DNS_V6" && -n "$SECONDARY_DNS_V6" ]] || { printf '%b\n' "${RED}--ip6-dns 需要两个 DNS 地址${NC}" >&2; exit 2; }
                 shift 2 ;;
             --bbr) BBR_MODE="default"; shift ;;
             --bbr-optimized) BBR_MODE="optimized"; shift ;;
@@ -370,7 +370,7 @@ parse_args() {
             --fail2ban)
                 ENABLE_FAIL2BAN=true
                 if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
-                    [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { echo -e "${RED}Fail2ban 端口必须是 1-65535 的端口${NC}" >&2; exit 2; }
+                    [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { printf '%b\n' "${RED}Fail2ban 端口必须是 1-65535 的端口${NC}" >&2; exit 2; }
                     FAIL2BAN_EXTRA_PORT="$2"
                     shift
                 fi
@@ -378,11 +378,11 @@ parse_args() {
             --no-fail2ban) ENABLE_FAIL2BAN=false; shift ;;
             --ssh-port)
                 require_value "$@"
-                [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { echo -e "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
+                [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { printf '%b\n' "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
                 NEW_SSH_PORT="$2"; shift 2 ;;
             --ssh-password) require_value "$@"; NEW_SSH_PASSWORD="$2"; shift 2 ;;
             --non-interactive) non_interactive=true; shift ;;
-            *) echo -e "${RED}未知选项: $1${NC}"; usage ;;
+            *) printf '%b\n' "${RED}未知选项: $1${NC}"; usage ;;
         esac
     done
 }
@@ -483,7 +483,7 @@ configure_hostname() {
         if grep -q "^127\.0\.1\.1" /etc/hosts; then
             sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${final_hostname}/" /etc/hosts
         else
-            echo -e "127.0.1.1\t${final_hostname}" >> /etc/hosts
+            printf '%b\n' "127.0.1.1\t${final_hostname}" >> /etc/hosts
         fi
     fi
 }
@@ -993,7 +993,7 @@ system_update() {
 # ==============================================================================
 main() {
     trap 'handle_error ${LINENO}' ERR
-    [[ $EUID -ne 0 ]] && { echo -e "${RED}需要root权限${NC}"; exit 1; }
+    [[ $EUID -ne 0 ]] && { printf '%b\n' "${RED}需要root权限${NC}"; exit 1; }
     
     parse_args "$@"
 
