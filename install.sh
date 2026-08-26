@@ -60,11 +60,15 @@ result_ok() {
 
 handle_error() {
     local exit_code=$? line_number=$1
+    if [[ $spinner_pid -ne 0 ]]; then
+        kill "$spinner_pid" 2>/dev/null || true
+        wait "$spinner_pid" 2>/dev/null || true
+        spinner_pid=0
+    fi
     command -v tput >/dev/null 2>&1 && tput cnorm 2>/dev/null || true
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     printf '%b\n' "$error_message"
     [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE"
-    [[ $spinner_pid -ne 0 ]] && kill "$spinner_pid" 2>/dev/null
     exit "$exit_code"
 }
 
@@ -963,7 +967,11 @@ configure_fail2ban() {
     local port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
     
     start_spinner "安装Fail2ban... "
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1; then
+        stop_spinner
+        log "${RED}[ERROR] Fail2ban 安装失败，请查看日志：${LOG_FILE}${NC}"
+        return 1
+    fi
     stop_spinner
     
     local jail_file="/etc/fail2ban/jail.d/99-vps-setup.local"
