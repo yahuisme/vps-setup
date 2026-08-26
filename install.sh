@@ -988,7 +988,6 @@ main() {
     log "    DNS：${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
     log "    Fail2ban：${ENABLE_FAIL2BAN}"
     [[ -n "$NEW_SSH_PORT" ]] && log "    SSH 端口：${NEW_SSH_PORT}"
-    separator
 
     if [[ "$non_interactive" = false ]]; then
         read -p "开始配置? [Y/n] " -r < /dev/tty
