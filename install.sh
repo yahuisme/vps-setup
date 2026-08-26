@@ -703,7 +703,25 @@ EOF
 
 configure_swap() {
     section_header "6" "Swap 配置"
-    [[ "$SWAP_SIZE_MB" = "0" ]] && { log "${BLUE}  Swap：禁用${NC}"; return; }
+    if [[ "$SWAP_SIZE_MB" = "0" ]]; then
+        log "${BLUE}  Swap：禁用${NC}"
+        local swap_file="/swapfile" active_swap
+        while IFS= read -r active_swap; do
+            [[ -n "$active_swap" ]] || continue
+            if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
+                log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
+                return 1
+            fi
+        done < <(swapon --show=NAME --noheadings 2>/dev/null)
+        rm -f "$swap_file"
+        sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)|d' /etc/fstab
+        if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" || -e "$swap_file" ]]; then
+            log "${RED}[ERROR] Swap 未能完全禁用。${NC}"
+            return 1
+        fi
+        log "${GREEN}  ✔ Swap 已禁用并移除${NC}"
+        return 0
+    fi
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
         local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
