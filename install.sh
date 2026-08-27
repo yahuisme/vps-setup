@@ -7,10 +7,11 @@
 set -euo pipefail
 
 # --- 默认配置 ---
-SCRIPT_VERSION="7.9.18"
+# shellcheck disable=SC2034
+SCRIPT_VERSION="7.9.19"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
-INSTALL_PACKAGES="sudo wget zip vim curl"
+INSTALL_PACKAGES=(sudo wget zip vim curl)
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
@@ -19,6 +20,8 @@ NEW_HOSTNAME=""
 BBR_MODE="default"
 ENABLE_FAIL2BAN=true
 FAIL2BAN_EXTRA_PORT=""
+UPGRADE_SYSTEM=false
+CLEAN_SYSTEM=false
 # --- SSH 相关配置 ---
 NEW_SSH_PORT=""
 NEW_SSH_PASSWORD=""
@@ -65,7 +68,9 @@ handle_error() {
         wait "$spinner_pid" 2>/dev/null || true
         spinner_pid=0
     fi
-    command -v tput >/dev/null 2>&1 && tput cnorm 2>/dev/null || true
+    if command -v tput >/dev/null 2>&1; then
+        tput cnorm 2>/dev/null || true
+    fi
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     printf '%b\n' "$error_message"
     [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE"
@@ -133,16 +138,8 @@ get_public_ipv4() {
 }
 
 has_ipv6() {
-    if ip -6 route show default 2>/dev/null | grep -q 'default' || ip -6 addr show 2>/dev/null | grep -q 'inet6.*scope global'; then
-        return 0
-    fi
-    if command -v ping &>/dev/null; then
-        ping -6 -c 1 -W 3 dns.google >/dev/null 2>&1 && return 0
-    fi
-    if command -v curl &>/dev/null; then
-        curl -6 -s --head --max-time 5 "https://[2606:4700:4700::1111]/" >/dev/null 2>&1 && return 0
-    fi
-    return 1
+    ip -6 route show default 2>/dev/null | grep -q 'default' ||
+        ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
 }
 
 check_disk_space() {
@@ -192,10 +189,15 @@ verify_config() {
 }
 
 verify_bbr() {
-    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
-    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
+    local current_cc current_qdisc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
     if [[ "$BBR_MODE" = "none" ]]; then
-        [[ "$current_cc" != "bbr" ]] && record_verification "BBR" "PASS" "已禁用" || record_verification "BBR" "WARN" "可能需要重启生效 (当前: ${current_cc})"
+        if [[ "$current_cc" != "bbr" ]]; then
+            record_verification "BBR" "PASS" "已禁用"
+        else
+            record_verification "BBR" "WARN" "可能需要重启生效 (当前: ${current_cc})"
+        fi
     elif [[ "$current_cc" = "bbr" && "$current_qdisc" = "fq" ]]; then
         record_verification "BBR" "PASS" "已启用 (${BBR_MODE}模式)"
     else
@@ -204,11 +206,20 @@ verify_bbr() {
 }
 
 verify_swap() {
-    local current_swap_mb=$(awk '/SwapTotal/ {print int($2/1024 + 0.5)}' /proc/meminfo)
+    local current_swap_mb
+    current_swap_mb=$(awk '/SwapTotal/ {print int($2/1024 + 0.5)}' /proc/meminfo)
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
-        [[ $current_swap_mb -eq 0 ]] && record_verification "Swap" "PASS" "已禁用" || record_verification "Swap" "FAIL" "期望禁用但仍有${current_swap_mb}MB"
+        if [[ $current_swap_mb -eq 0 ]]; then
+            record_verification "Swap" "PASS" "已禁用"
+        else
+            record_verification "Swap" "FAIL" "期望禁用但仍有${current_swap_mb}MB"
+        fi
     else
-        [[ $current_swap_mb -gt 0 ]] && record_verification "Swap" "PASS" "${current_swap_mb}MB" || record_verification "Swap" "FAIL" "未配置"
+        if [[ $current_swap_mb -gt 0 ]]; then
+            record_verification "Swap" "PASS" "${current_swap_mb}MB"
+        else
+            record_verification "Swap" "FAIL" "未配置"
+        fi
     fi
 }
 
@@ -265,19 +276,27 @@ run_verification() {
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
     verify_time_sync
     verify_bbr
-    [[ "$BBR_MODE" = "optimized" ]] && show_bbr_runtime_details
+
     verify_swap
     verify_dns
     local installed=0 total=0
-    for pkg in $INSTALL_PACKAGES; do
+    for pkg in "${INSTALL_PACKAGES[@]}"; do
         total=$((total + 1))
         dpkg -l "$pkg" >/dev/null 2>&1 && installed=$((installed + 1))
     done
-    [[ $installed -eq $total ]] && record_verification "软件包" "PASS" "全部已安装 ($installed/$total)" || record_verification "软件包" "FAIL" "部分缺失 ($installed/$total)"
+    if [[ $installed -eq $total ]]; then
+        record_verification "软件包" "PASS" "全部已安装 ($installed/$total)"
+    else
+        record_verification "软件包" "FAIL" "部分缺失 ($installed/$total)"
+    fi
     if [[ -n "$NEW_SSH_PORT" ]]; then
-        local current_port=$(grep -oP '^\s*Port\s+\K\d+' /etc/ssh/sshd_config | tail -n1)
-        [[ -z "$current_port" ]] && current_port="22"
-        verify_config "SSH端口" "$NEW_SSH_PORT" "$current_port"
+        local current_port
+        current_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}')
+        if grep -Fxq "$NEW_SSH_PORT" <<< "$current_port"; then
+            record_verification "SSH端口" "PASS" "已监听/配置为 '${NEW_SSH_PORT}'"
+        else
+            record_verification "SSH端口" "FAIL" "期望 '${NEW_SSH_PORT}'，实际 '${current_port:-未知}'"
+        fi
     fi
     if [[ "$ENABLE_FAIL2BAN" = true ]]; then
         if (systemctl is-active --quiet fail2ban 2>/dev/null); then
@@ -301,13 +320,15 @@ ${BLUE}核心选项:${NC}
   --ip6-dns <'主 备'>     设置IPv6 DNS
 ${BLUE}BBR选项:${NC}
   --bbr                  启用默认BBR (默认)
-  --bbr-optimized        启用优化BBR (高配置)
+  --bbr-optimized        兼容旧参数，启用精简BBR
   --no-bbr               禁用BBR
 ${BLUE}安全选项:${NC}
   --fail2ban [port]      启用Fail2ban
   --no-fail2ban          禁用Fail2ban
   --ssh-port <port>      设置SSH端口
   --ssh-password <pass> 设置root密码
+  --upgrade             执行系统 full-upgrade
+  --cleanup             执行 autoremove 和 apt clean
 ${BLUE}其他:${NC}
   -h, --help             显示帮助
   --non-interactive      非交互模式
@@ -396,6 +417,8 @@ parse_args() {
                 [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 65535 ]] || { printf '%b\n' "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
                 NEW_SSH_PORT="$2"; shift 2 ;;
             --ssh-password) require_value "$@"; NEW_SSH_PASSWORD="$2"; shift 2 ;;
+            --upgrade) UPGRADE_SYSTEM=true; shift ;;
+            --cleanup) CLEAN_SYSTEM=true; shift ;;
             --non-interactive) non_interactive=true; shift ;;
             *) printf '%b\n' "${RED}未知选项: $1${NC}"; usage ;;
         esac
@@ -427,9 +450,9 @@ install_packages() {
     start_spinner "更新软件包列表... "
     DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
     stop_spinner
-    step_info "安装基础软件包：${INSTALL_PACKAGES}"
+    step_info "安装基础软件包：${INSTALL_PACKAGES[*]}"
     start_spinner "安装基础软件包... "
-    DEBIAN_FRONTEND=noninteractive apt-get install -y $INSTALL_PACKAGES >> "$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
     stop_spinner
     if command -v vim &>/dev/null; then
         cat > /etc/vim/vimrc.local << 'EOF'
@@ -451,12 +474,13 @@ set noswapfile
 EOF
         [[ -d /root ]] && ! grep -q "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && echo "source /etc/vim/vimrc.local" >> /root/.vimrc
     fi
-    result_ok "基础软件包安装完成：${INSTALL_PACKAGES}"
+    result_ok "基础软件包安装完成：${INSTALL_PACKAGES[*]}"
 }
 
 configure_hostname() {
     section_header "2" "主机名配置"
-    local current_hostname=$(hostname)
+    local current_hostname
+    current_hostname=$(hostname)
     log "${BLUE}  当前主机名：${current_hostname}${NC}"
     local final_hostname="$current_hostname"
     if [[ -n "$NEW_HOSTNAME" ]]; then
@@ -484,7 +508,7 @@ configure_hostname() {
     elif [[ "$non_interactive" = false ]]; then
         read -p "修改主机名? [y/N] " -r < /dev/tty
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            read -p "输入新主机名: " new_name < /dev/tty
+            read -r -p "输入新主机名: " new_name < /dev/tty
             if [[ -n "$new_name" && "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
                 hostnamectl set-hostname "$new_name" >> "$LOG_FILE" 2>&1
                 final_hostname="$new_name"
@@ -566,75 +590,6 @@ configure_time_sync() {
     fi
 }
 
-bbr_profile() {
-    local mem_mb="$1"
-    if [[ "$mem_mb" -ge 4096 ]]; then
-        BBR_MEMORY_TIER="4GB+"
-        BBR_RMEM_WMEM=67108864
-        BBR_SOMAXCONN=65535
-    elif [[ "$mem_mb" -ge 1024 ]]; then
-        BBR_MEMORY_TIER="1GB-4GB"
-        BBR_RMEM_WMEM=33554432
-        BBR_SOMAXCONN=32768
-    else
-        BBR_MEMORY_TIER="<1GB"
-        BBR_RMEM_WMEM=16777216
-        BBR_SOMAXCONN=16384
-    fi
-}
-
-show_bbr_plan() {
-    log "${BLUE}  内存档位：${BBR_MEMORY_TIER} | 缓冲区：${BBR_RMEM_WMEM} bytes | 连接队列：${BBR_SOMAXCONN}${NC}"
-    log "${CYAN}  将写入的 BBR 参数：${NC}"
-    log "    net.core.default_qdisc              = fq"
-    log "    net.ipv4.tcp_congestion_control      = bbr"
-    log "    net.core.rmem_max / wmem_max         = ${BBR_RMEM_WMEM}"
-    log "    net.ipv4.tcp_rmem                    = 4096 87380 ${BBR_RMEM_WMEM}"
-    log "    net.ipv4.tcp_wmem                    = 4096 65536 ${BBR_RMEM_WMEM}"
-    log "    net.core.somaxconn / tcp_syn_backlog = ${BBR_SOMAXCONN}"
-    log "    net.core.netdev_max_backlog          = ${BBR_SOMAXCONN}"
-    log "    tcp_fin_timeout / tw_reuse           = 30 / 1"
-    log "    tcp_slow_start_after_idle            = 0"
-    log "    ip_local_port_range                  = 10000 65535"
-    log "    tcp_keepalive_time / intvl / probes  = 600 / 15 / 5"
-    log "    tcp_notsent_lowat / mtu_probing      = 16384 / 1"
-}
-
-write_optimized_bbr_config() {
-    local config_file="$1"
-    cat > "$config_file" << EOF
-# --- BBR 核心 ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# --- 缓冲区优化 (配合 TCP 读写) ---
-net.core.rmem_max = ${BBR_RMEM_WMEM}
-net.core.wmem_max = ${BBR_RMEM_WMEM}
-net.ipv4.tcp_rmem = 4096 87380 ${BBR_RMEM_WMEM}
-net.ipv4.tcp_wmem = 4096 65536 ${BBR_RMEM_WMEM}
-
-# --- 连接队列与积压 ---
-net.core.somaxconn = ${BBR_SOMAXCONN}
-net.ipv4.tcp_max_syn_backlog = ${BBR_SOMAXCONN}
-net.core.netdev_max_backlog = ${BBR_SOMAXCONN}
-
-# --- 连接复用与超时 (关键优化) ---
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.ip_local_port_range = 10000 65535
-
-# --- 保活探测 ---
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 5
-
-# --- 其他 ---
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_mtu_probing = 1
-EOF
-}
-
 verify_bbr_runtime() {
     local config_file="$1" current_cc current_qdisc
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -647,25 +602,8 @@ verify_bbr_runtime() {
     log "${BLUE}  配置文件：${config_file}${NC}"
 }
 
-show_bbr_runtime_details() {
-    local key value
-    log "${CYAN}  BBR 关键运行时参数：${NC}"
-    for key in \
-        net.ipv4.tcp_congestion_control \
-        net.core.default_qdisc \
-        net.ipv4.tcp_tw_reuse \
-        net.ipv4.tcp_fin_timeout \
-        net.ipv4.tcp_keepalive_time \
-        net.ipv4.tcp_keepalive_intvl \
-        net.ipv4.tcp_keepalive_probes \
-        net.ipv4.tcp_mtu_probing; do
-        value=$(sysctl -n "$key" 2>/dev/null || echo "N/A")
-        log "    ${key} = ${value}"
-    done
-}
-
 configure_bbr() {
-    section_header "5" "BBR 配置（优化版）"
+    section_header "5" "BBR 配置"
     local config_file="/etc/sysctl.d/99-bbr.conf"
     
     if [[ "$BBR_MODE" = "none" ]]; then
@@ -683,29 +621,11 @@ EOF
         return 1
     fi
     
-    local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    log "${BLUE}检测到内存: ${mem_mb}MB${NC}"
-    
-    case "$BBR_MODE" in
-        "optimized")
-            log "${BLUE}配置优化BBR (高性能参数)...${NC}"
-            
-            if [[ $mem_mb -lt 1024 ]]; then
-                log "${YELLOW}[WARN] 内存较低，建议使用默认BBR模式${NC}"
-            fi
-            
-            bbr_profile "$mem_mb"
-            show_bbr_plan
-            write_optimized_bbr_config "$config_file"
-            ;;
-        *)
-            log "${BLUE}配置标准 BBR：仅启用 bbr + fq${NC}"
-            cat > "$config_file" << EOF
+    log "${BLUE}仅启用 BBR 核心参数：fq + bbr${NC}"
+    cat > "$config_file" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-            ;;
-    esac
     
     if ! sysctl -p "$config_file" >> "$LOG_FILE" 2>&1; then
         result_warn "部分 BBR 参数不受当前内核支持，将继续验证核心参数"
@@ -737,7 +657,8 @@ configure_swap() {
     fi
     local swap_mb
     if [[ "$SWAP_SIZE_MB" = "auto" ]]; then
-        local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+        local mem_mb
+        mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
         if [[ $mem_mb -lt 1024 ]]; then swap_mb=$mem_mb
         elif [[ $mem_mb -lt 4096 ]]; then swap_mb=2048
         else swap_mb=4096; fi
@@ -760,7 +681,8 @@ configure_swap() {
         fi
     done
     if [[ -f "$swap_file" ]]; then
-        local current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
+        local current_size_mb
+        current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
         if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
             if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
                 ensure_swap_fstab_entry
@@ -793,7 +715,7 @@ configure_swap() {
             if [[ "$line" =~ ([0-9]+)\ bytes.*copied ]]; then
                 local copied_bytes=${BASH_REMATCH[1]}
                 local copied_mb=$((copied_bytes / 1024 / 1024))
-                show_progress $copied_mb $swap_mb
+                show_progress "$copied_mb" "$swap_mb"
             fi
         done
         then
@@ -851,7 +773,10 @@ DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$( [[ "$ipv6_enabled" == true ]] && ech
 FallbackDNS=1.0.0.1 8.8.4.4
 EOF
         mv -f "$resolved_tmp" "$resolved_file"
-        systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || log "${YELLOW}[WARN] systemd-resolved 重启失败${NC}"
+        if ! systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1; then
+            log "${RED}[ERROR] systemd-resolved 重启失败，DNS 配置未确认生效${NC}"
+            return 1
+        fi
     else
         log "${BLUE}配置resolv.conf...${NC}"
         if [[ -L /etc/resolv.conf ]]; then
@@ -875,6 +800,15 @@ EOF
             return 1
         fi
     fi
+    if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        resolvectl dns >/dev/null 2>&1 || {
+            log "${RED}[ERROR] 无法验证 systemd-resolved DNS 状态${NC}"
+            return 1
+        }
+    elif [[ ! -s /etc/resolv.conf ]]; then
+        log "${RED}[ERROR] /etc/resolv.conf 为空，DNS 配置未生效${NC}"
+        return 1
+    fi
     result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([ "$ipv6_enabled" = true ] && echo "，IPv6 已启用")"
 }
 
@@ -890,14 +824,14 @@ configure_ssh() {
     [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
     
     if [[ -z "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = false ]]; then
-        read -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty
+        read -r -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty
         echo
     fi
     if [[ -n "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = true ]]; then
         log "${RED}[SECURITY WARNING] 使用 --ssh-password 参数会将密码记录在shell历史中，存在安全风险！${NC}"
     fi
 
-    local ssh_changed=false ssh_backup=""
+    local ssh_changed=false ssh_backup="" ssh_dropin="/etc/ssh/sshd_config.d/99-vps-setup.conf"
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
         if [[ ! -f /etc/ssh/sshd_config ]] || ! command -v sshd >/dev/null 2>&1; then
             log "${RED}[ERROR] 未找到 SSH 配置或 sshd，无法修改 SSH。${NC}"
@@ -911,10 +845,11 @@ configure_ssh() {
             log "${RED}[ERROR] SSH端口 ${NEW_SSH_PORT} 已被其他服务占用，未修改 SSH 配置。${NC}"
             return 1
         fi
-        ssh_backup="/etc/ssh/sshd_config.backup.$(date +%Y%m%d-%H%M%S).$$"
-        cp -a /etc/ssh/sshd_config "$ssh_backup"
-        sed -i '/^[#\s]*Port\s\+/d' /etc/ssh/sshd_config
-        echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+        ssh_backup="${ssh_dropin}.backup.$(date +%Y%m%d-%H%M%S).$$"
+        [[ -f "$ssh_dropin" ]] && cp -a "$ssh_dropin" "$ssh_backup"
+        mkdir -p "${ssh_dropin%/*}"
+        printf 'Port %s\n' "$NEW_SSH_PORT" > "${ssh_dropin}.tmp.$$"
+        mv -f "${ssh_dropin}.tmp.$$" "$ssh_dropin"
         ssh_changed=true
         log "${GREEN}✅ SSH端口设为: ${NEW_SSH_PORT}${NC}"
     fi
@@ -923,21 +858,22 @@ configure_ssh() {
         if sshd -t 2>>"$LOG_FILE"; then
             if ! systemctl restart sshd >> "$LOG_FILE" 2>&1; then
                 log "${RED}[ERROR] SSH 服务重启失败，正在恢复配置。${NC}"
-                cp -a "$ssh_backup" /etc/ssh/sshd_config
+                if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
                 systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
                 return 1
             fi
             sleep 1
             if ! ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
                 log "${RED}[ERROR] SSH 未监听新端口，正在恢复配置。${NC}"
-                cp -a "$ssh_backup" /etc/ssh/sshd_config
+                if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
                 systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
                 return 1
             fi
             log "${YELLOW}[WARN] SSH端口已更改，请用新端口重连！${NC}"
+            rm -f "$ssh_backup"
         else
             log "${RED}[ERROR] SSH配置错误，已恢复备份${NC}"
-            cp -a "$ssh_backup" /etc/ssh/sshd_config
+            if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
             systemctl restart sshd >> "$LOG_FILE" 2>&1 || true
             return 1
         fi
@@ -964,7 +900,8 @@ configure_fail2ban() {
     fi
     [[ ${#ports[@]} -gt 0 ]] || ports=("22")
 
-    local port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
+    local port_list
+    port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
     
     start_spinner "安装Fail2ban... "
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1; then
@@ -976,7 +913,8 @@ configure_fail2ban() {
     
     local jail_file="/etc/fail2ban/jail.d/99-vps-setup.local"
     local jail_tmp="${jail_file}.vps-setup.$$"
-    local jail_backup="${jail_file}.backup.$(date +%Y%m%d-%H%M%S).$$"
+    local jail_backup
+    jail_backup="${jail_file}.backup.$(date +%Y%m%d-%H%M%S).$$"
     mkdir -p "${jail_file%/*}"
     [[ -f "$jail_file" ]] && cp -a "$jail_file" "$jail_backup"
     restore_fail2ban_jail() {
@@ -1026,14 +964,22 @@ EOF
 
 system_update() {
     section_header "10" "系统更新与清理"
-    start_spinner "系统升级... "
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
-    stop_spinner
-    start_spinner "清理缓存... "
-    apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
-    apt-get clean >> "$LOG_FILE" 2>&1
-    stop_spinner
-    result_ok "系统更新与清理完成"
+    if [[ "$UPGRADE_SYSTEM" = true ]]; then
+        start_spinner "系统升级... "
+        DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
+        stop_spinner
+        result_ok "系统升级完成"
+    fi
+    if [[ "$CLEAN_SYSTEM" = true ]]; then
+        start_spinner "清理缓存... "
+        apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
+        apt-get clean >> "$LOG_FILE" 2>&1
+        stop_spinner
+        result_ok "系统清理完成"
+    fi
+    if [[ "$UPGRADE_SYSTEM" = false && "$CLEAN_SYSTEM" = false ]]; then
+        log "${BLUE}未请求系统升级或清理，跳过${NC}"
+    fi
 }
 
 # ==============================================================================
@@ -1054,6 +1000,7 @@ main() {
     log "    DNS：${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
     log "    Fail2ban：${ENABLE_FAIL2BAN}"
     [[ -n "$NEW_SSH_PORT" ]] && log "    SSH 端口：${NEW_SSH_PORT}"
+    log "    系统升级：${UPGRADE_SYSTEM}，系统清理：${CLEAN_SYSTEM}"
 
     if [[ "$non_interactive" = false ]]; then
         read -p "开始配置? [Y/n] " -r < /dev/tty

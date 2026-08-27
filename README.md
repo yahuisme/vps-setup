@@ -2,7 +2,7 @@
 
 Debian / Ubuntu VPS 初始化脚本。
 
-> 适用于 Debian 10–13、Ubuntu 20.04/22.04/24.04。脚本会修改系统配置并执行系统更新，建议在全新 VPS 上使用。
+> 适用于 Debian 10–13、Ubuntu 20.04/22.04/24.04。脚本会修改系统配置，建议在全新 VPS 上使用。
 
 ## 一键执行
 
@@ -17,7 +17,7 @@ apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.gi
 - 配置时间同步、BBR 和 Swap
 - 修改 SSH 端口和 root 密码
 - 安装 Fail2ban
-- 更新和清理系统
+- 按需升级或清理系统（默认跳过）
 
 ## 非交互模式
 
@@ -43,6 +43,8 @@ curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main
 --no-fail2ban            禁用 Fail2ban
 --ssh-port <port>        设置 SSH 端口
 --ssh-password <pass>    设置 root 密码
+--upgrade                执行系统 full-upgrade
+--cleanup                执行 autoremove 和 apt clean
 --non-interactive        非交互模式
 -h, --help               显示帮助
 ```
@@ -52,6 +54,7 @@ curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main
 - 修改 SSH 端口前，先在云平台安全组和防火墙放行新端口。
 - `--ssh-password` 会出现在 shell 历史或进程信息中，只建议临时使用。
 - `--swap 0` 会关闭全部 Swap，并移除 `/etc/fstab` 中的 Swap 条目。
+- 默认不会执行 `full-upgrade`、`autoremove --purge` 或 `apt clean`；需要时显式添加 `--upgrade` 或 `--cleanup`。
 - Fail2ban 默认永久封禁 SSH 认证失败来源，误封可执行：
 
   ```bash
