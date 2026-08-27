@@ -25,19 +25,7 @@ apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.gi
 ## 非交互执行
 
 ```bash
-apt-get update -y && apt-get install -y curl
-curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh
-chmod +x install.sh
-./install.sh \
-  --hostname "hostname" \
-  --timezone "Asia/Hong_Kong" \
-  --swap 1024 \
-  --bbr \
-  --ip-dns "94.140.14.14 1.1.1.1" \
-  --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" \
-  --ssh-port 12345 \
-  --fail2ban \
-  --non-interactive
+apt-get update -y && apt-get install -y curl && curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh && chmod +x install.sh && ./install.sh --hostname "hostname" --timezone "Asia/Hong_Kong" --swap 1024 --bbr --ip-dns "94.140.14.14 1.1.1.1" --ip6-dns "2a10:50c0::ad1:ff 2606:4700:4700::1111" --ssh-port 12345 --fail2ban --non-interactive
 ```
 
 ## 参数
