@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.18
+# 版本: v26.08.27
 # ==============================================================================
 set -euo pipefail
 
@@ -330,11 +330,17 @@ parse_args() {
                 SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
-                valid_ipv4 "$PRIMARY_DNS_V4" && valid_ipv4 "$SECONDARY_DNS_V4" || { printf '%b\n' "${RED}--ip-dns 需要两个有效 IPv4 地址${NC}" >&2; exit 2; }
+                if ! valid_ipv4 "$PRIMARY_DNS_V4" || ! valid_ipv4 "$SECONDARY_DNS_V4"; then
+                    printf '%b\n' "${RED}--ip-dns 需要两个有效 IPv4 地址${NC}" >&2
+                    exit 2
+                fi
                 shift 2 ;;
             --ip6-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"
-                valid_ipv6 "$PRIMARY_DNS_V6" && valid_ipv6 "$SECONDARY_DNS_V6" || { printf '%b\n' "${RED}--ip6-dns 需要两个有效 IPv6 地址${NC}" >&2; exit 2; }
+                if ! valid_ipv6 "$PRIMARY_DNS_V6" || ! valid_ipv6 "$SECONDARY_DNS_V6"; then
+                    printf '%b\n' "${RED}--ip6-dns 需要两个有效 IPv6 地址${NC}" >&2
+                    exit 2
+                fi
                 shift 2 ;;
             --bbr) BBR_MODE="default"; shift ;;
             --no-bbr) BBR_MODE="none"; shift ;;
@@ -376,10 +382,8 @@ pre_flight_checks() {
 
 install_packages() {
     section_header "1" "软件包安装"
-    step_info "更新软件包列表"
     step_info "更新软件包列表..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
-    step_info "安装基础软件包：${INSTALL_PACKAGES[*]}"
     step_info "安装基础软件包..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
     if command -v vim &>/dev/null; then
@@ -717,8 +721,9 @@ configure_ssh() {
         local unit
         for unit in ssh.service sshd.service; do
             if systemctl cat "$unit" >/dev/null 2>&1; then
-                systemctl restart "$unit" >> "$LOG_FILE" 2>&1
-                return $?
+                if systemctl restart "$unit" >> "$LOG_FILE" 2>&1; then
+                    return 0
+                fi
             fi
         done
         return 1
