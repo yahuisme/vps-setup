@@ -25,6 +25,7 @@ apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.gi
 ## 非交互执行
 
 ```bash
+apt-get update -y && apt-get install -y curl
 curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main/install.sh
 chmod +x install.sh
 ./install.sh \
