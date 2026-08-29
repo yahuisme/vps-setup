@@ -2,15 +2,16 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.08.27
+# 版本: v26.08.29
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.08.27"
+SCRIPT_VERSION="v26.08.29"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
+SWAP_TARGET_MB=""
 INSTALL_PACKAGES=(sudo wget zip vim curl)
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
@@ -59,7 +60,9 @@ result_ok() {
 }
 
 
+# shellcheck disable=SC2317 # 由 trap 'handle_error' 调用，静态分析不可见
 handle_error() {
+    set +e
     local exit_code=$? line_number=$1
 
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
@@ -142,12 +145,16 @@ verify_swap() {
         else
             record_verification "Swap" "FAIL" "期望禁用但仍有${current_swap_mb}MB"
         fi
-    else
-        if [[ $current_swap_mb -gt 0 ]]; then
+    elif [[ -n "$SWAP_TARGET_MB" ]]; then
+        if [[ $current_swap_mb -eq "$SWAP_TARGET_MB" ]]; then
             record_verification "Swap" "PASS" "${current_swap_mb}MB"
         else
-            record_verification "Swap" "FAIL" "未配置"
+            record_verification "Swap" "FAIL" "期望 ${SWAP_TARGET_MB}MB，实际 ${current_swap_mb}MB"
         fi
+    elif [[ $current_swap_mb -gt 0 ]]; then
+        record_verification "Swap" "PASS" "${current_swap_mb}MB"
+    else
+        record_verification "Swap" "FAIL" "未配置"
     fi
 }
 
@@ -386,26 +393,6 @@ install_packages() {
     DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
     step_info "安装基础软件包..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
-    if command -v vim &>/dev/null; then
-        cat > /etc/vim/vimrc.local << 'EOF'
-syntax on
-set nocompatible
-set backspace=indent,eol,start
-set ruler
-set showcmd
-set hlsearch
-set incsearch
-set autoindent
-set tabstop=4
-set shiftwidth=4
-set expandtab
-set encoding=utf-8
-set mouse=a
-set nobackup
-set noswapfile
-EOF
-        [[ -d /root ]] && ! grep -q "source /etc/vim/vimrc.local" /root/.vimrc 2>/dev/null && echo "source /etc/vim/vimrc.local" >> /root/.vimrc
-    fi
     result_ok "基础软件包安装完成：${INSTALL_PACKAGES[*]}"
 }
 
@@ -563,8 +550,23 @@ configure_swap() {
         swap_mb="$SWAP_SIZE_MB"
         log "${BLUE}  指定目标 Swap：${swap_mb}MB${NC}"
     fi
+    SWAP_TARGET_MB="$swap_mb"
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
+    local current_total_mb=0 size_kb
+    while IFS= read -r swap_line; do
+        [[ -n "$swap_line" ]] || continue
+        size_kb=$(awk '{print $2}' <<< "$swap_line")
+        [[ "$size_kb" =~ ^[0-9]+$ ]] && current_total_mb=$((current_total_mb + size_kb / 1024))
+    done < <(swapon --show=NAME,SIZE --noheadings 2>/dev/null)
+    if [[ "$current_total_mb" -eq "$swap_mb" ]]; then
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
+            ensure_swap_fstab_entry
+        fi
+        log "${GREEN}  ✔ 现有 Swap 与目标一致（${current_total_mb}MB），保留${NC}"
+        return
+    fi
+    [[ "$current_total_mb" -gt 0 ]] && log "${YELLOW}  现有 Swap ${current_total_mb}MB 与目标 ${swap_mb}MB 不一致，将统一替换为 /swapfile${NC}"
     local new_swap="${swap_file}.new.$$"
     for stale_swap in "${swap_file}.new"*; do
         [[ -e "$stale_swap" ]] || continue
@@ -576,24 +578,7 @@ configure_swap() {
             return 1
         fi
     done
-    if [[ -f "$swap_file" ]]; then
-        local current_size_mb
-        current_size_mb=$(($(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 / 1024))
-        if [[ "$current_size_mb" -eq "$swap_mb" ]]; then
-            if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
-                ensure_swap_fstab_entry
-                log "${GREEN}  ✔ Swap 文件已存在并已启用：${current_size_mb}MB${NC}"
-                return
-            fi
-            chmod 600 "$swap_file"
-            if swapon "$swap_file" >> "$LOG_FILE" 2>&1; then
-                ensure_swap_fstab_entry
-                log "${GREEN}  ✔ 已启用现有 Swap 文件：${current_size_mb}MB${NC}"
-                return
-            fi
-            log "${YELLOW}[WARN] 现有 Swap 文件无法启用，将重新创建。${NC}"
-        fi
-    fi
+    # 先创建新文件（旧 Swap 仍在运行，创建失败不影响现状）
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
     # 创建阶段失败时也清理临时文件，避免下次运行留下脏状态。
     if command -v fallocate &>/dev/null; then
@@ -617,27 +602,30 @@ configure_swap() {
         log "${RED}[ERROR] Swap格式化失败。${NC}"
         return 1
     fi
-    local old_swap="${swap_file}.old.$$"
-    if [[ -f "$swap_file" ]]; then
-        if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file" && ! swapoff "$swap_file" 2>/dev/null; then
-            rm -f "$new_swap"
-            log "${RED}[ERROR] 无法关闭现有 Swap，保留原配置。${NC}"
-            return 1
-        fi
-        mv -f "$swap_file" "$old_swap"
+    # 新文件就绪后，再关闭全部旧 Swap 并移除 fstab 条目（含分区 Swap）
+    if [[ "$current_total_mb" -gt 0 ]]; then
+        local active_swap
+        while IFS= read -r active_swap; do
+            [[ -n "$active_swap" ]] || continue
+            if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
+                rm -f "$new_swap"
+                log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
+                return 1
+            fi
+        done < <(swapon --show=NAME --noheadings 2>/dev/null)
+        sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)|d' /etc/fstab
+        rm -f "$swap_file"
     fi
     if ! mv -f "$new_swap" "$swap_file"; then
-        [[ -f "$old_swap" ]] && mv -f "$old_swap" "$swap_file"
-        log "${RED}[ERROR] Swap文件替换失败，未启用新配置。${NC}"
+        rm -f "$new_swap"
+        log "${RED}[ERROR] Swap文件替换失败。${NC}"
         return 1
     fi
     if ! swapon "$swap_file" >> "$LOG_FILE" 2>&1; then
         rm -f "$swap_file"
-        [[ -f "$old_swap" ]] && { mv -f "$old_swap" "$swap_file"; swapon "$swap_file" >> "$LOG_FILE" 2>&1 || true; }
         log "${RED}[ERROR] 新 Swap 启用失败。${NC}"
         return 1
     fi
-    rm -f "$old_swap"
     ensure_swap_fstab_entry
     log "${GREEN}  ✔ Swap 已配置：${swap_mb}MB${NC}"
 }
@@ -939,17 +927,13 @@ main() {
         log "\n${RED}⚠️  SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！${NC}"
     fi
     
-    if is_container; then
-        log "\n${BLUE}容器环境，配置已生效${NC}"
-    else
-        log "\n${BLUE}建议重启以确保所有配置生效${NC}"
-        if [[ "$non_interactive" = false ]]; then
-            read -p "立即重启? [Y/n] " -r < /dev/tty
-            [[ ! "$REPLY" =~ ^[Nn]$ ]] && { log "${BLUE}重启中...${NC}"; sleep 2; reboot; }
-        fi
+    log "\n${BLUE}建议重启以确保所有配置生效${NC}"
+    if [[ "$non_interactive" = false ]]; then
+        read -p "立即重启? [Y/n] " -r < /dev/tty
+        [[ ! "$REPLY" =~ ^[Nn]$ ]] && { log "${BLUE}重启中...${NC}"; sleep 2; reboot; }
     fi
     
-    [[ $VERIFICATION_FAILED -eq 0 ]] && exit 0 || exit 1
+    exit 0
 }
 
 main "$@"

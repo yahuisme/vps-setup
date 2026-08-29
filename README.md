@@ -2,7 +2,7 @@
 
 Debian / Ubuntu VPS 初始化脚本。
 
-**版本：v26.08.27**
+**版本：v26.08.29**
 
 支持：Debian 10–13、Ubuntu 20.04 / 22.04 / 24.04。
 
@@ -53,6 +53,7 @@ apt-get update -y && apt-get install -y curl && curl -fsSLo install.sh https://r
 - 仅支持完整 VPS / 虚拟机，不支持容器环境。
 - 修改 SSH 端口前，请先放行云平台安全组和防火墙端口。
 - `--ssh-password` 会暴露在 shell 历史和进程参数中，仅建议临时使用。
-- `--swap 0` 会关闭全部 Swap 并移除 `/etc/fstab` 中的 Swap 条目。
-- `/etc/resolv.conf` 由其他 DNS 管理器维护时，脚本会跳过直接修改并给出警告。
+- `--swap` 统一接管 Swap：`0` 禁用全部；指定大小时若现有总量不一致，替换为 `/swapfile` 目标大小。
+- Fail2ban 默认永久封禁：SSH 连错 3 次即封来源 IP（仅 `127.0.0.1/8` 豁免）。
+- `/etc/resolv.conf` 由其他 DNS 管理器维护时会跳过并警告。
 - 日志保存到 `/var/log/vps-init-日期时间.log`。
