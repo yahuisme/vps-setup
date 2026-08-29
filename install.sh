@@ -62,8 +62,8 @@ result_ok() {
 
 # shellcheck disable=SC2317 # 由 trap 'handle_error' 调用，静态分析不可见
 handle_error() {
-    set +e
     local exit_code=$? line_number=$1
+    set +e
 
     local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     printf '%b\n' "$error_message"
@@ -553,12 +553,12 @@ configure_swap() {
     SWAP_TARGET_MB="$swap_mb"
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
-    local current_total_mb=0 size_kb
+    local current_total_mb=0 size_bytes
     while IFS= read -r swap_line; do
         [[ -n "$swap_line" ]] || continue
-        size_kb=$(awk '{print $2}' <<< "$swap_line")
-        [[ "$size_kb" =~ ^[0-9]+$ ]] && current_total_mb=$((current_total_mb + size_kb / 1024))
-    done < <(swapon --show=NAME,SIZE --noheadings 2>/dev/null)
+        size_bytes=$(awk '{print $2}' <<< "$swap_line")
+        [[ "$size_bytes" =~ ^[0-9]+$ ]] && current_total_mb=$((current_total_mb + (size_bytes + 524288) / 1048576 ))
+    done < <(swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null)
     if [[ "$current_total_mb" -eq "$swap_mb" ]]; then
         if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
             ensure_swap_fstab_entry
