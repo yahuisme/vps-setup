@@ -32,6 +32,8 @@ readonly BLUE=$'\033[0;34m' CYAN=$'\033[0;36m' NC=$'\033[0m'
 
 non_interactive=false
 LOG_FILE=""
+# 后台 apt(如 unattended-upgrades)持锁时最多等待 600 秒，避免直接失败
+APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=600)
 VERIFICATION_PASSED=0
 VERIFICATION_FAILED=0
 VERIFICATION_WARNINGS=0
@@ -405,7 +407,7 @@ install_packages() {
     step_info "更新软件包列表..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
     step_info "安装基础软件包..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
     result_ok "基础软件包安装完成：${INSTALL_PACKAGES[*]}"
 }
 
@@ -473,7 +475,7 @@ configure_time_sync() {
     elif ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
         log "${YELLOW}[WARN] systemd-timesyncd 未运行或不存在，尝试安装...${NC}"
         step_info "安装 systemd-timesyncd..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y systemd-timesyncd >> "$LOG_FILE" 2>&1
         systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
         timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     fi
@@ -703,7 +705,7 @@ configure_ssh() {
 
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
         step_info "安装 openssh-server..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y openssh-server >> "$LOG_FILE" 2>&1
     fi
     
     [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
@@ -799,7 +801,7 @@ configure_fail2ban() {
     port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
     
     step_info "安装 Fail2ban..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >> "$LOG_FILE" 2>&1; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y fail2ban >> "$LOG_FILE" 2>&1; then
         log "${RED}[ERROR] Fail2ban 安装失败，请查看日志：${LOG_FILE}${NC}"
         return 1
     fi
@@ -859,12 +861,12 @@ system_update() {
     section_header "10" "系统更新与清理"
     if [[ "$UPGRADE_SYSTEM" = true ]]; then
         step_info "系统升级..."
-        DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
         result_ok "系统升级完成"
     fi
     if [[ "$CLEAN_SYSTEM" = true ]]; then
         step_info "清理缓存..."
-        apt-get autoremove --purge -y >> "$LOG_FILE" 2>&1
+        apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y >> "$LOG_FILE" 2>&1
         apt-get clean >> "$LOG_FILE" 2>&1
         result_ok "系统清理完成"
     fi
