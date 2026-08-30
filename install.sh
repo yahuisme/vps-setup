@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.08.29
+# 版本: v26.08.30
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.08.29"
+SCRIPT_VERSION="v26.08.30"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 SWAP_TARGET_MB=""
@@ -47,7 +47,11 @@ result_warn() {
 section_header() {
     local number="$1" title="$2"
     log "\n${YELLOW}╭──────────────────────────────────────────────╮${NC}"
-    log "${YELLOW}│  ${number}. ${title}${NC}"
+    if [[ -n "$title" ]]; then
+        log "${YELLOW}│  ${number}. ${title}${NC}"
+    else
+        log "${YELLOW}│  ${number}${NC}"
+    fi
     log "${YELLOW}╰──────────────────────────────────────────────╯${NC}"
 }
 
@@ -245,8 +249,9 @@ run_verification() {
 }
 
 usage() {
-    local exit_code="${1:-0}"
-    cat << EOF
+    local exit_code="${1:-0}" out=/dev/stdout
+    [[ "$exit_code" -eq 0 ]] || out=/dev/stderr
+    cat > "$out" << EOF
 ${YELLOW}用法: $0 [选项]${NC}
 ${BLUE}核心选项:${NC}
   --hostname <name>      设置主机名
@@ -293,6 +298,9 @@ valid_ipv6() {
     local ip="$1" group groups
     [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]] || return 1
     [[ "$ip" != *::*::* && "$ip" != *:::* ]] || return 1
+    # 单个首/尾冒号(非 ::) 属于非法地址，read 会吞掉边界空字段导致误判
+    [[ "$ip" != :* || "$ip" == ::* ]] || return 1
+    [[ "$ip" != *: || "$ip" == *:: ]] || return 1
     groups="${ip//:/ }"
     read -ra groups <<< "$groups"
     for group in "${groups[@]}"; do
@@ -382,7 +390,12 @@ pre_flight_checks() {
     [[ "$ID" = "ubuntu" && "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04)$ ]] && supported=true
     if [[ "$supported" = "false" ]]; then
         log "${YELLOW}[WARN] 系统: ${PRETTY_NAME} (建议使用Debian 10-13或Ubuntu 20.04-24.04)${NC}"
-        [[ "$non_interactive" = false ]] && { read -p "继续? [y/N] " -r < /dev/tty; [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0; }
+        if [[ "$non_interactive" = true ]]; then
+            log "${RED}[ERROR] 非交互模式不支持当前系统，已中止${NC}"
+            exit 1
+        fi
+        read -p "继续? [y/N] " -r < /dev/tty
+        [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0
     fi
     log "${GREEN}✅ 系统: ${PRETTY_NAME}${NC}"
 }
@@ -661,7 +674,6 @@ EOF
             log "${RED}[ERROR] 无法备份 /etc/resolv.conf，已停止修改。${NC}"
             return 1
         }
-        chattr -i /etc/resolv.conf 2>/dev/null || true
         local resolv_tmp="/etc/resolv.conf.vps-setup.$$"
         cat > "$resolv_tmp" << EOF
 nameserver ${PRIMARY_DNS_V4}
@@ -724,8 +736,8 @@ configure_ssh() {
     fi
     if [[ -n "$NEW_SSH_PORT" && "$NEW_SSH_PORT" =~ ^[0-9]+$ && "$NEW_SSH_PORT" -gt 0 && "$NEW_SSH_PORT" -lt 65536 ]]; then
         local current_ssh_port
-        current_ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
-        if [[ " $current_ssh_port " != *" ${NEW_SSH_PORT} "* ]] && ss -H -ltn 2>/dev/null | awk -v port="$NEW_SSH_PORT" '$4 ~ (":" port "$|\\]:" port "$|\\*:" port "$|0\\.0\\.0\\.0:" port "$|\\[::\\]:" port "$)" {found=1} END {exit !found}'; then
+        current_ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {printf "%s ", $2}')
+        if [[ " $current_ssh_port " != *" ${NEW_SSH_PORT} "* ]] && ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
             log "${RED}[ERROR] SSH端口 ${NEW_SSH_PORT} 已被其他服务占用，未修改 SSH 配置。${NC}"
             return 1
         fi
@@ -747,7 +759,7 @@ configure_ssh() {
                 return 1
             fi
             sleep 1
-            if ! ss -H -ltn 2>/dev/null | awk -v port="$NEW_SSH_PORT" '$4 ~ (":" port "$|\\]:" port "$|\\*:" port "$|0\\.0\\.0\\.0:" port "$|\\[::\\]:" port "$)" {found=1} END {exit !found}'; then
+            if ! ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
                 log "${RED}[ERROR] SSH 未监听新端口，正在恢复配置。${NC}"
                 if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
                 restart_ssh_service || true
@@ -875,7 +887,7 @@ main() {
         exit 2
     fi
 
-    section_header "配置摘要" "VPS 初始化配置"
+    section_header "配置摘要" ""
     log "${CYAN}  当前配置摘要：${NC}"
     log "    主机名：${NEW_HOSTNAME:-保持当前/交互}"
     log "    时区：${TIMEZONE}"
