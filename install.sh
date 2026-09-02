@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.08.30
+# 版本: v26.09.02
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.08.30"
+SCRIPT_VERSION="v26.09.02"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 SWAP_TARGET_MB=""
@@ -28,7 +28,7 @@ NEW_SSH_PASSWORD=""
 
 # --- 颜色和全局变量 ---
 readonly GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[1;33m'
-readonly BLUE=$'\033[0;34m' CYAN=$'\033[0;36m' NC=$'\033[0m'
+readonly BLUE=$'\033[0;34m' CYAN=$'\033[0;36m' BOLD=$'\033[1m' DIM=$'\033[2m' NC=$'\033[0m'
 
 non_interactive=false
 LOG_FILE=""
@@ -42,18 +42,73 @@ log() {
     printf '%b\n' "$1"
 }
 
+display_width() {
+    # 估算字符串的终端显示宽度（中文等宽字符按 2 列计），用于对齐；自动剥离 ANSI 颜色码
+    local s="$1" n ascii
+    s=$(printf '%s' "$s" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
+    n=$(printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m 2>/dev/null)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=$(printf '%s' "$s" | wc -m)
+    ascii=$(printf '%s' "$s" | LC_ALL=C tr -d '\200-\377' | wc -c)
+    echo $((2 * n - ascii))
+}
+
+format_duration() {
+    local seconds="$1" minutes
+    if (( seconds < 60 )); then
+        echo "${seconds} 秒"
+    else
+        minutes=$((seconds / 60)); seconds=$((seconds % 60))
+        echo "${minutes} 分 ${seconds} 秒"
+    fi
+}
+
 result_warn() {
     log "${YELLOW}  ⚠ $1${NC}"
 }
 
 section_header() {
-    local number="$1" title="$2"
-    log "\n${YELLOW}╭──────────────────────────────────────────────╮${NC}"
+    # 编号与标题（number 可为空）；close=false 时只画上框，便于插入内容行
+    local number="$1" title="$2" close="${3:-true}" text fill
     if [[ -n "$title" ]]; then
-        log "${YELLOW}│  ${number}. ${title}${NC}"
+        text="${number:+${number}. }${title}"
     else
-        log "${YELLOW}│  ${number}${NC}"
+        text="${number}"
     fi
+    local box_width=46
+    fill=$((box_width - $(display_width "$text") - 2))
+    (( fill < 1 )) && fill=1
+    log ""
+    log "${YELLOW}╭──────────────────────────────────────────────╮${NC}"
+    printf '%b' "${YELLOW}│  ${BOLD}${text}${NC}"
+    printf '%*s' "$fill" ""
+    printf '%b\n' "${YELLOW}│${NC}"
+    if [[ "$close" = true ]]; then
+        log "${YELLOW}╰──────────────────────────────────────────────╯${NC}"
+    fi
+}
+
+print_summary_row() {
+    # 配置摘要行：标签列宽 10，值右侧填充对齐右边界
+    local label="$1" value="$2" pad fill2
+    pad=$((10 - $(display_width "$label"))); (( pad < 1 )) && pad=1
+    fill2=$((32 - $(display_width "$value"))); (( fill2 < 1 )) && fill2=1
+    printf '%b' "${CYAN}│  ${label}"
+    printf '%*s' "$pad" ""
+    printf '%b' ": ${value}"
+    printf '%*s' "$fill2" ""
+    printf '%b\n' "${CYAN}│${NC}"
+}
+
+print_box_row() {
+    # 框内普通行：内容右侧填充对齐右边界（content 可含颜色码）
+    local content="$1" fill2
+    fill2=$((44 - $(display_width "$content"))); (( fill2 < 1 )) && fill2=1
+    printf '%b' "${CYAN}│  ${content}${NC}"
+    printf '%*s' "$fill2" ""
+    printf '%b\n' "${CYAN}│${NC}"
+}
+
+summary_close() {
     log "${YELLOW}╰──────────────────────────────────────────────╯${NC}"
 }
 
@@ -71,7 +126,7 @@ handle_error() {
     local exit_code=$? line_number=$1
     set +e
 
-    local error_message="\n${RED}[ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
+    local error_message="\n${RED}✗ [ERROR] 脚本在第 ${line_number} 行失败 (退出码: ${exit_code})${NC}"
     printf '%b\n' "$error_message"
     [[ -n "$LOG_FILE" ]] && echo "[ERROR] Script failed at line ${line_number} (exit code: ${exit_code})" >> "$LOG_FILE"
     exit "$exit_code"
@@ -210,7 +265,7 @@ verify_time_sync() {
 }
 
 run_verification() {
-    log "\n${YELLOW}=============== 配置验证 ===============${NC}"
+    section_header "" "配置验证"
     VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
     set +e
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
@@ -247,33 +302,38 @@ run_verification() {
         fi
     fi
     set -e
-    log "\n${BLUE}验证结果: ${GREEN}通过 ${VERIFICATION_PASSED}${NC}, ${YELLOW}警告 ${VERIFICATION_WARNINGS}${NC}, ${RED}失败 ${VERIFICATION_FAILED}${NC}"
+    log "\n${BOLD}验证结果:${NC}  ${GREEN}✔ 通过 ${VERIFICATION_PASSED}${NC}    ${YELLOW}⚠ 警告 ${VERIFICATION_WARNINGS}${NC}    ${RED}✗ 失败 ${VERIFICATION_FAILED}${NC}"
 }
 
 usage() {
     local exit_code="${1:-0}" out=/dev/stdout
     [[ "$exit_code" -eq 0 ]] || out=/dev/stderr
     cat > "$out" << EOF
-${YELLOW}用法: $0 [选项]${NC}
-${BLUE}核心选项:${NC}
-  --hostname <name>      设置主机名
-  --timezone <tz>        设置时区
-  --swap <size_mb>       设置Swap大小，'auto'/'0'
-  --ip-dns <'主 备'>      设置IPv4 DNS
-  --ip6-dns <'主 备'>     设置IPv6 DNS
-${BLUE}BBR选项:${NC}
-  --bbr                  启用 BBR (默认)
-  --no-bbr               禁用BBR
-${BLUE}安全选项:${NC}
-  --fail2ban             启用 Fail2ban，保护 SSH
-  --no-fail2ban          禁用Fail2ban
-  --ssh-port <port>      设置SSH端口
-  --ssh-password <pass> 设置root密码
-  --upgrade             执行系统 full-upgrade
-  --cleanup             执行 autoremove 和 apt clean
-${BLUE}其他:${NC}
-  -h, --help             显示帮助
-  --non-interactive      非交互模式
+${BOLD}用法: $0 [选项]${NC}
+
+${YELLOW}▸ 核心${NC}
+  --hostname <name>        设置主机名
+  --timezone <tz>          设置时区
+  --swap <size_mb>         设置 Swap 大小（auto / 0 / MB）
+  --ip-dns <'主 备'>        设置 IPv4 DNS
+  --ip6-dns <'主 备'>       设置 IPv6 DNS
+
+${YELLOW}▸ BBR${NC}
+  --bbr                    启用 BBR（默认）
+  --no-bbr                 禁用 BBR
+
+${YELLOW}▸ 安全${NC}
+  --fail2ban               启用 Fail2ban，保护 SSH
+  --no-fail2ban            禁用 Fail2ban
+  --ssh-port <port>        设置 SSH 端口
+  --ssh-password <pass>    设置 root 密码
+  --upgrade                执行系统 full-upgrade
+  --cleanup                执行 autoremove 和 apt clean
+
+${YELLOW}▸ 其他${NC}
+  -h, --help               显示帮助
+  --non-interactive        非交互模式
+
 ${GREEN}示例: $0 --bbr --ssh-port 2222${NC}
 EOF
     exit "$exit_code"
@@ -324,7 +384,7 @@ parse_args() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -h|--help) usage 0 ;;
+            -h|--help) [[ $# -eq 1 ]] || usage 2; usage 0 ;;
             --hostname)
                 require_value "$@"
                 [[ "$2" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || {
@@ -343,7 +403,7 @@ parse_args() {
                 TIMEZONE="$2"; shift 2 ;;
             --swap)
                 require_value "$@"
-                [[ "$2" = "auto" || "$2" =~ ^[0-9]+$ ]] || { printf '%b\n' "${RED}--swap 必须是 auto、0 或正整数 MB${NC}" >&2; exit 2; }
+                [[ "$2" = "auto" || "$2" =~ ^(0|[1-9][0-9]*)$ ]] || { printf '%b\n' "${RED}--swap 必须是 auto、0 或正整数 MB${NC}" >&2; exit 2; }
                 SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
@@ -379,7 +439,7 @@ parse_args() {
 }
 
 pre_flight_checks() {
-    log "${BLUE}[INFO] 系统预检查...${NC}"
+    step_info "系统预检查..."
 
     if is_container; then
         log "${RED}[ERROR] 不支持在容器环境执行，请在完整 VPS 或虚拟机中运行${NC}"
@@ -399,13 +459,13 @@ pre_flight_checks() {
         read -p "继续? [y/N] " -r < /dev/tty
         [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0
     fi
-    log "${GREEN}✅ 系统: ${PRETTY_NAME}${NC}"
+    result_ok "系统: ${PRETTY_NAME}"
 }
 
 install_packages() {
     section_header "1" "软件包安装"
     step_info "更新软件包列表..."
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" update -qq >> "$LOG_FILE" 2>&1
     step_info "安装基础软件包..."
     DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
     result_ok "基础软件包安装完成：${INSTALL_PACKAGES[*]}"
@@ -470,18 +530,16 @@ configure_time_sync() {
     # 启用现有服务，必要时安装后再启用。
     if systemctl cat systemd-timesyncd >/dev/null 2>&1; then
         step_info "启用 systemd-timesyncd..."
-        systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
-        timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     elif ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
         log "${YELLOW}[WARN] systemd-timesyncd 未运行或不存在，尝试安装...${NC}"
         step_info "安装 systemd-timesyncd..."
         DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y systemd-timesyncd >> "$LOG_FILE" 2>&1
-        systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
-        timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     fi
+    systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
+    timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     
     if timedatectl status 2>/dev/null | grep -q 'NTP service: active' || systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-        log "${GREEN}✅ 时间同步配置完成${NC}"
+        result_ok "时间同步配置完成"
     else
         log "${RED}[ERROR] 时间同步配置未生效${NC}"
         return 1
@@ -531,21 +589,33 @@ EOF
     verify_bbr_runtime "$config_file"
 }
 
+disable_active_swap() {
+    # 关闭全部已激活 Swap；失败时清理 $1（可选临时文件）并返回 1
+    local cleanup_file="${1:-}" active_swap
+    while IFS= read -r active_swap; do
+        [[ -n "$active_swap" ]] || continue
+        if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
+            [[ -n "$cleanup_file" ]] && rm -f "$cleanup_file"
+            log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
+            return 1
+        fi
+    done < <(swapon --show=NAME --noheadings 2>/dev/null)
+}
+
+remove_fstab_swap_entries() {
+    # 删除 fstab 中所有非注释 swap 条目（含分区与文件 Swap）
+    sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]\|$)|d' /etc/fstab
+}
+
 configure_swap() {
     section_header "6" "Swap 配置"
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
         log "${BLUE}  Swap：禁用${NC}"
-        local swap_file="/swapfile" active_swap
-        while IFS= read -r active_swap; do
-            [[ -n "$active_swap" ]] || continue
-            if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
-                log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
-                return 1
-            fi
-        done < <(swapon --show=NAME --noheadings 2>/dev/null)
+        local swap_file="/swapfile"
+        disable_active_swap
         rm -f "$swap_file"
         # --swap 0 means disable all fstab swap entries, not only /swapfile.
-        sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)|d' /etc/fstab
+        remove_fstab_swap_entries
         if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" ]]; then
             log "${RED}[ERROR] Swap 未能完全禁用。${NC}"
             return 1
@@ -596,20 +666,13 @@ configure_swap() {
     # 先创建新文件（旧 Swap 仍在运行，创建失败不影响现状）
     log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
     # 创建阶段失败时也清理临时文件，避免下次运行留下脏状态。
-    if command -v fallocate &>/dev/null; then
-        step_info "快速创建 Swap..."
-        if ! fallocate -l "${swap_mb}M" "$new_swap" >> "$LOG_FILE" 2>&1; then
-            rm -f "$new_swap"
-            log "${RED}[ERROR] Swap文件创建失败。${NC}"
-            return 1
-        fi
-    else
-        step_info "使用 dd 创建 Swap，请稍候..."
-        if ! dd if=/dev/zero of="$new_swap" bs=1M count="$swap_mb" status=none >> "$LOG_FILE" 2>&1; then
-            rm -f "$new_swap"
-            log "${RED}[ERROR] Swap文件创建失败。${NC}"
-            return 1
-        fi
+    # fallocate 不可用或失败（如 overlay 文件系统）时回退 dd。
+    step_info "创建 Swap 文件（fallocate 优先，失败回退 dd）..."
+    if ! { command -v fallocate &>/dev/null && fallocate -l "${swap_mb}M" "$new_swap" >> "$LOG_FILE" 2>&1; } && \
+       ! dd if=/dev/zero of="$new_swap" bs=1M count="$swap_mb" status=none >> "$LOG_FILE" 2>&1; then
+        rm -f "$new_swap"
+        log "${RED}[ERROR] Swap文件创建失败。${NC}"
+        return 1
     fi
     chmod 600 "$new_swap"
     if ! mkswap "$new_swap" >> "$LOG_FILE" 2>&1; then
@@ -619,16 +682,8 @@ configure_swap() {
     fi
     # 新文件就绪后，再关闭全部旧 Swap 并移除 fstab 条目（含分区 Swap）
     if [[ "$current_total_mb" -gt 0 ]]; then
-        local active_swap
-        while IFS= read -r active_swap; do
-            [[ -n "$active_swap" ]] || continue
-            if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
-                rm -f "$new_swap"
-                log "${RED}[ERROR] 无法关闭现有 Swap：${active_swap}，保留原配置。${NC}"
-                return 1
-            fi
-        done < <(swapon --show=NAME --noheadings 2>/dev/null)
-        sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)|d' /etc/fstab
+        disable_active_swap "$new_swap" || return 1
+        remove_fstab_swap_entries
         rm -f "$swap_file"
     fi
     if ! mv -f "$new_swap" "$swap_file"; then
@@ -667,7 +722,7 @@ EOF
             return 1
         fi
     else
-        log "${BLUE}配置resolv.conf...${NC}"
+        step_info "配置 resolv.conf..."
         if [[ -L /etc/resolv.conf ]]; then
             result_warn "/etc/resolv.conf 是符号链接，跳过直接修改，请由当前 DNS 管理器配置"
             return 0
@@ -703,11 +758,6 @@ EOF
 configure_ssh() {
     section_header "8" "SSH 配置"
 
-    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
-        step_info "安装 openssh-server..."
-        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y openssh-server >> "$LOG_FILE" 2>&1
-    fi
-    
     [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空跳过): " -r NEW_SSH_PORT < /dev/tty; }
     
     if [[ -z "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = false ]]; then
@@ -716,6 +766,11 @@ configure_ssh() {
     fi
     if [[ -n "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = true ]]; then
         log "${RED}[SECURITY WARNING] 使用 --ssh-password 参数会将密码记录在shell历史中，存在安全风险！${NC}"
+    fi
+
+    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
+        step_info "安装 openssh-server..."
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y openssh-server >> "$LOG_FILE" 2>&1
     fi
 
     local ssh_changed=false ssh_backup="" ssh_dropin="/etc/ssh/sshd_config.d/99-vps-setup.conf"
@@ -749,7 +804,7 @@ configure_ssh() {
         printf 'Port %s\n' "$NEW_SSH_PORT" > "${ssh_dropin}.tmp.$$"
         mv -f "${ssh_dropin}.tmp.$$" "$ssh_dropin"
         ssh_changed=true
-        log "${GREEN}✅ SSH端口设为: ${NEW_SSH_PORT}${NC}"
+        result_ok "SSH 端口设为: ${NEW_SSH_PORT}"
     fi
     
     if [[ "$ssh_changed" = true ]]; then
@@ -779,7 +834,7 @@ configure_ssh() {
 
     if [[ -n "$NEW_SSH_PASSWORD" ]]; then
         echo "root:${NEW_SSH_PASSWORD}" | chpasswd >> "$LOG_FILE" 2>&1
-        log "${GREEN}✅ root密码已设置${NC}"
+        result_ok "root 密码已设置"
     fi
 }
 
@@ -826,12 +881,11 @@ bantime = -1
 findtime = 300
 maxretry = 3
 backend = systemd
-ignoreip = 127.0.0.1/8
+ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled = true
 port = ${port_list}
-maxretry = 3
 EOF
     mv -f "$jail_tmp" "$jail_file"
     if ! fail2ban-client -t >> "$LOG_FILE" 2>&1; then
@@ -889,16 +943,17 @@ main() {
         exit 2
     fi
 
-    section_header "配置摘要" ""
-    log "${CYAN}  当前配置摘要：${NC}"
-    log "    主机名：${NEW_HOSTNAME:-保持当前/交互}"
-    log "    时区：${TIMEZONE}"
-    log "    BBR：${BBR_MODE}"
-    log "    Swap：${SWAP_SIZE_MB}"
-    log "    DNS：${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
-    log "    Fail2ban：${ENABLE_FAIL2BAN}"
-    [[ -n "$NEW_SSH_PORT" ]] && log "    SSH 端口：${NEW_SSH_PORT}"
-    log "    系统升级：${UPGRADE_SYSTEM}，系统清理：${CLEAN_SYSTEM}"
+    section_header "" "配置摘要" false
+    print_summary_row "主机名" "${NEW_HOSTNAME:-保持当前 / 交互}"
+    print_summary_row "时区" "$TIMEZONE"
+    print_summary_row "BBR" "$BBR_MODE"
+    print_summary_row "Swap" "$SWAP_SIZE_MB"
+    print_summary_row "DNS" "${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
+    print_summary_row "Fail2ban" "$ENABLE_FAIL2BAN"
+    [[ -n "$NEW_SSH_PORT" ]] && print_summary_row "SSH 端口" "$NEW_SSH_PORT"
+    print_summary_row "系统升级" "$UPGRADE_SYSTEM"
+    print_summary_row "系统清理" "$CLEAN_SYSTEM"
+    summary_close
 
     if [[ "$non_interactive" = false ]]; then
         read -p "开始配置? [Y/n] " -r < /dev/tty
@@ -932,10 +987,11 @@ main() {
         exit 1
     fi
     
-    log "\n${YELLOW}==================== 完成 ====================${NC}"
-    log "${GREEN}🎉 VPS初始化完成！${NC}"
-    log "执行时间: ${SECONDS}秒"
-    log "日志文件: ${LOG_FILE}"
+    section_header "" "完成" false
+    print_box_row "${GREEN}🎉 VPS 初始化完成！${NC}"
+    print_box_row "${DIM}执行时间: $(format_duration "$SECONDS")${NC}"
+    print_box_row "${DIM}日志文件: ${LOG_FILE}${NC}"
+    summary_close
     
     if [[ -n "$NEW_SSH_PORT" ]]; then
         log "\n${RED}⚠️  SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！${NC}"
