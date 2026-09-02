@@ -43,13 +43,19 @@ log() {
 }
 
 display_width() {
-    # 估算字符串的终端显示宽度（中文等宽字符按 2 列计），用于对齐；自动剥离 ANSI 颜色码
-    local s="$1" n ascii
+    # 估算字符串的终端显示宽度（中文等宽字符按 2 列计），用于对齐；自动剥离 ANSI 颜色码。
+    # 按字节解析 UTF-8，不依赖系统 locale（C locale 下同样正确）。
+    local s="$1"
     s=$(printf '%s' "$s" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
-    n=$(printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m 2>/dev/null)
-    [[ "$n" =~ ^[0-9]+$ ]] || n=$(printf '%s' "$s" | wc -m)
-    ascii=$(printf '%s' "$s" | LC_ALL=C tr -d '\200-\377' | wc -c)
-    echo $((2 * n - ascii))
+    printf '%s' "$s" | od -An -v -tu1 | awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            b = $i
+            if (b >= 192) { w += 2 }        # UTF-8 多字节首字节：按 2 列
+            else if (b < 128) { w += 1 }    # ASCII：1 列
+        }                                   # 128-191 续字节：跳过
+    }
+    END { print w }'
 }
 
 format_duration() {
@@ -990,7 +996,8 @@ main() {
     section_header "" "完成" false
     print_box_row "${GREEN}🎉 VPS 初始化完成！${NC}"
     print_box_row "${DIM}执行时间: $(format_duration "$SECONDS")${NC}"
-    print_box_row "${DIM}日志文件: ${LOG_FILE}${NC}"
+    print_box_row "${DIM}日志文件:${NC}"
+    print_box_row "${DIM}${LOG_FILE}${NC}"
     summary_close
     
     if [[ -n "$NEW_SSH_PORT" ]]; then
