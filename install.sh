@@ -234,7 +234,7 @@ parse_args() {
                 fi
                 shift 2 ;;
             --bbr) ENABLE_BBR=true; shift ;;
-            --no-bbr) BBR_MODE="none"; shift ;;
+            --no-bbr) ENABLE_BBR=false; shift ;;
             --fail2ban)
                 ENABLE_FAIL2BAN=true
                 shift ;;
@@ -368,7 +368,7 @@ configure_bbr() {
     section_header "5" "BBR 配置"
     local config_file="/etc/sysctl.d/99-bbr.conf"
     
-    if [[ "$BBR_MODE" = "none" ]]; then
+    if [[ "$ENABLE_BBR" = false ]]; then
         log "${BLUE}[INFO] BBR 已禁用，将切换拥塞控制为 cubic${NC}"
         cat > "$config_file" << 'EOF'
 net.ipv4.tcp_congestion_control = cubic
