@@ -2,16 +2,15 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.09.03
+# 版本: v26.09.04
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.09.03"
+SCRIPT_VERSION="v26.09.04"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
-SWAP_TARGET_MB=""
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
@@ -28,7 +27,7 @@ NEW_SSH_PASSWORD=""
 
 # --- 颜色和全局变量 ---
 readonly GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[1;33m'
-readonly BLUE=$'\033[0;34m' CYAN=$'\033[0;36m' BOLD=$'\033[1m' DIM=$'\033[2m' NC=$'\033[0m'
+readonly BLUE=$'\033[0;34m' CYAN=$'\033[0;36m' BOLD=$'\033[1m' NC=$'\033[0m'
 
 non_interactive=false
 LOG_FILE=""
@@ -263,9 +262,9 @@ pre_flight_checks() {
     source /etc/os-release
     local supported=false
     [[ "$ID" = "debian" && "$VERSION_ID" =~ ^(10|11|12|13)$ ]] && supported=true
-    [[ "$ID" = "ubuntu" && "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04)$ ]] && supported=true
+    [[ "$ID" = "ubuntu" && "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04|26\.04)$ ]] && supported=true
     if [[ "$supported" = "false" ]]; then
-        log "${YELLOW}[WARN] 系统: ${PRETTY_NAME} (建议使用Debian 10-13或Ubuntu 20.04-24.04)${NC}"
+        log "${YELLOW}[WARN] 系统: ${PRETTY_NAME} (建议使用Debian 10-13或Ubuntu 20.04-26.04)${NC}"
         if [[ "$non_interactive" = true ]]; then
             log "${RED}[ERROR] 非交互模式不支持当前系统，已中止${NC}"
             exit 1
@@ -295,7 +294,6 @@ configure_hostname() {
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
             hostnamectl set-hostname "$NEW_HOSTNAME" >> "$LOG_FILE" 2>&1
             final_hostname="$NEW_HOSTNAME"
-            log "${GREEN}✅ 主机名设为: ${NEW_HOSTNAME}${NC}"
         fi
     elif [[ "$non_interactive" = false ]]; then
         read -p "修改主机名? [y/N] " -r < /dev/tty
@@ -314,6 +312,9 @@ configure_hostname() {
         else
             printf '%b\n' "127.0.1.1\t${final_hostname}" >> /etc/hosts
         fi
+        result_ok "主机名设为: ${final_hostname}"
+    else
+        log "${BLUE}  主机名保持当前${NC}"
     fi
 }
 
@@ -375,6 +376,7 @@ net.ipv4.tcp_congestion_control = cubic
 EOF
         sysctl -w net.ipv4.tcp_congestion_control=cubic >> "$LOG_FILE" 2>&1 || true
         sysctl -p "$config_file" >> "$LOG_FILE" 2>&1 || true
+        result_ok "已切换拥塞控制为 cubic"
         return
     fi
     
@@ -418,7 +420,7 @@ configure_swap() {
     if [[ "$SWAP_SIZE_MB" = "0" ]]; then
         log "${BLUE}  Swap：禁用${NC}"
         local swap_file="/swapfile"
-        disable_active_swap
+        disable_active_swap || return 1
         rm -f "$swap_file"
         # --swap 0 means disable all fstab swap entries, not only /swapfile.
         remove_fstab_swap_entries
@@ -426,7 +428,7 @@ configure_swap() {
             log "${RED}[ERROR] Swap 未能完全禁用。${NC}"
             return 1
         fi
-        log "${GREEN}  ✔ Swap 已禁用并移除${NC}"
+        result_ok "Swap 已禁用并移除"
         return 0
     fi
     local swap_mb
@@ -441,7 +443,6 @@ configure_swap() {
         swap_mb="$SWAP_SIZE_MB"
         log "${BLUE}  指定目标 Swap：${swap_mb}MB${NC}"
     fi
-    SWAP_TARGET_MB="$swap_mb"
     check_disk_space $((swap_mb + 100)) || return 1
     local swap_file="/swapfile"
     local current_total_mb=0 size_bytes
@@ -454,7 +455,7 @@ configure_swap() {
         if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
             ensure_swap_fstab_entry
         fi
-        log "${GREEN}  ✔ 现有 Swap 与目标一致（${current_total_mb}MB），保留${NC}"
+        result_ok "现有 Swap 与目标一致（${current_total_mb}MB），保留"
         return
     fi
     [[ "$current_total_mb" -gt 0 ]] && log "${YELLOW}  现有 Swap ${current_total_mb}MB 与目标 ${swap_mb}MB 不一致，将统一替换为 /swapfile${NC}"
@@ -503,7 +504,7 @@ configure_swap() {
         return 1
     fi
     ensure_swap_fstab_entry
-    log "${GREEN}  ✔ Swap 已配置：${swap_mb}MB${NC}"
+    result_ok "Swap 已配置：${swap_mb}MB"
 }
 
 configure_dns() {
@@ -558,7 +559,7 @@ EOF
         log "${RED}[ERROR] /etc/resolv.conf 为空，DNS 配置未生效${NC}"
         return 1
     fi
-    result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([ "$ipv6_enabled" = true ] && echo "，IPv6 已启用")"
+    result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([[ "$ipv6_enabled" = true ]] && echo "，IPv6 已启用")"
 }
 
 configure_ssh() {
@@ -591,6 +592,10 @@ configure_ssh() {
         done
         return 1
     }
+    rollback_ssh() {
+        if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
+        restart_ssh_service || true
+    }
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
         if [[ ! -f /etc/ssh/sshd_config ]] || ! command -v sshd >/dev/null 2>&1; then
             log "${RED}[ERROR] 未找到 SSH 配置或 sshd，无法修改 SSH。${NC}"
@@ -617,23 +622,20 @@ configure_ssh() {
         if sshd -t 2>>"$LOG_FILE"; then
             if ! restart_ssh_service; then
                 log "${RED}[ERROR] SSH 服务重启失败，正在恢复配置。${NC}"
-                if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
-                restart_ssh_service || true
+                rollback_ssh
                 return 1
             fi
             sleep 1
             if ! ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
                 log "${RED}[ERROR] SSH 未监听新端口，正在恢复配置。${NC}"
-                if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
-                restart_ssh_service || true
+                rollback_ssh
                 return 1
             fi
             log "${YELLOW}[WARN] SSH端口已更改，请用新端口重连！${NC}"
             rm -f "$ssh_backup"
         else
             log "${RED}[ERROR] SSH配置错误，已恢复备份${NC}"
-            if [[ -f "$ssh_backup" ]]; then cp -a "$ssh_backup" "$ssh_dropin"; else rm -f "$ssh_dropin"; fi
-            restart_ssh_service || true
+            rollback_ssh
             return 1
         fi
     fi
@@ -790,7 +792,7 @@ main() {
     log "  • 日志文件 : ${LOG_FILE}"
     
     if [[ -n "$NEW_SSH_PORT" ]]; then
-        log "\n${RED}⚠️  SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！${NC}"
+        result_warn "SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！"
     fi
     
     log "\n${BLUE}建议重启以确保所有配置生效${NC}"
