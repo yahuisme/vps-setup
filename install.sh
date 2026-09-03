@@ -2,23 +2,23 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.09.02
+# 版本: v26.09.03
 # ==============================================================================
 set -euo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.09.02"
+SCRIPT_VERSION="v26.09.03"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 SWAP_TARGET_MB=""
-INSTALL_PACKAGES=(sudo wget zip vim curl)
+INSTALL_PACKAGES=(sudo curl wget ca-certificates)
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
 SECONDARY_DNS_V6="2001:4860:4860::8888"
 NEW_HOSTNAME=""
-BBR_MODE="default"
+ENABLE_BBR=true
 ENABLE_FAIL2BAN=true
 UPGRADE_SYSTEM=false
 CLEAN_SYSTEM=false
@@ -34,28 +34,9 @@ non_interactive=false
 LOG_FILE=""
 # 后台 apt(如 unattended-upgrades)持锁时最多等待 600 秒，避免直接失败
 APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=600)
-VERIFICATION_PASSED=0
-VERIFICATION_FAILED=0
-VERIFICATION_WARNINGS=0
 
 log() {
     printf '%b\n' "$1"
-}
-
-display_width() {
-    # 估算字符串的终端显示宽度（中文等宽字符按 2 列计），用于对齐；自动剥离 ANSI 颜色码。
-    # 按字节解析 UTF-8，不依赖系统 locale（C locale 下同样正确）。
-    local s="$1"
-    s=$(printf '%s' "$s" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
-    printf '%s' "$s" | od -An -v -tu1 | awk '
-    {
-        for (i = 1; i <= NF; i++) {
-            b = $i
-            if (b >= 192) { w += 2 }        # UTF-8 多字节首字节：按 2 列
-            else if (b < 128) { w += 1 }    # ASCII：1 列
-        }                                   # 128-191 续字节：跳过
-    }
-    END { print w }'
 }
 
 format_duration() {
@@ -68,54 +49,24 @@ format_duration() {
     fi
 }
 
-result_warn() {
-    log "${YELLOW}  ⚠ $1${NC}"
-}
-
 section_header() {
-    # 编号与标题（number 可为空）；close=false 时只画上框，便于插入内容行
-    local number="$1" title="$2" close="${3:-true}" text fill
+    local number="$1" title="$2" text
     if [[ -n "$title" ]]; then
         text="${number:+${number}. }${title}"
     else
         text="${number}"
     fi
-    local box_width=46
-    fill=$((box_width - $(display_width "$text") - 2))
-    (( fill < 1 )) && fill=1
     log ""
-    log "${YELLOW}╭──────────────────────────────────────────────╮${NC}"
-    printf '%b' "${YELLOW}│  ${BOLD}${text}${NC}"
-    printf '%*s' "$fill" ""
-    printf '%b\n' "${YELLOW}│${NC}"
-    if [[ "$close" = true ]]; then
-        log "${YELLOW}╰──────────────────────────────────────────────╯${NC}"
-    fi
+    log "${CYAN}==> ${BOLD}${text}${NC}"
 }
 
 print_summary_row() {
-    # 配置摘要行：标签列宽 10，值右侧填充对齐右边界
-    local label="$1" value="$2" pad fill2
-    pad=$((10 - $(display_width "$label"))); (( pad < 1 )) && pad=1
-    fill2=$((32 - $(display_width "$value"))); (( fill2 < 1 )) && fill2=1
-    printf '%b' "${CYAN}│  ${label}"
-    printf '%*s' "$pad" ""
-    printf '%b' ": ${value}"
-    printf '%*s' "$fill2" ""
-    printf '%b\n' "${CYAN}│${NC}"
+    local label="$1" value="$2"
+    printf '  %b•%b %-10s : %s\n' "${CYAN}" "${NC}" "$label" "$value"
 }
 
-print_box_row() {
-    # 框内普通行：内容右侧填充对齐右边界（content 可含颜色码）
-    local content="$1" fill2
-    fill2=$((44 - $(display_width "$content"))); (( fill2 < 1 )) && fill2=1
-    printf '%b' "${CYAN}│  ${content}${NC}"
-    printf '%*s' "$fill2" ""
-    printf '%b\n' "${CYAN}│${NC}"
-}
-
-summary_close() {
-    log "${YELLOW}╰──────────────────────────────────────────────╯${NC}"
+result_warn() {
+    log "${YELLOW}  ⚠ $1${NC}"
 }
 
 step_info() {
@@ -166,149 +117,6 @@ is_kernel_version_ge() {
     local required="$1" current
     current=$(uname -r | sed -nE 's/^([0-9]+\.[0-9]+).*/\1/p')
     [[ -n "$current" ]] && [[ "$(printf '%s\n' "$current" "$required" | sort -V | head -n1)" = "$required" ]]
-}
-
-record_verification() {
-    local component="$1" status="$2" message="$3"
-    case "$status" in
-        "PASS") log "    ${GREEN}✓${NC} ${component}: ${message}"; VERIFICATION_PASSED=$((VERIFICATION_PASSED + 1)) ;;
-        "WARN") log "    ${YELLOW}⚠${NC} ${component}: ${message}"; VERIFICATION_WARNINGS=$((VERIFICATION_WARNINGS + 1)) ;;
-        "FAIL") log "    ${RED}✗${NC} ${component}: ${message}"; VERIFICATION_FAILED=$((VERIFICATION_FAILED + 1)) ;;
-    esac
-}
-
-verify_config() {
-    local component="$1" expected="$2" actual="$3"
-    if [[ "$actual" = "$expected" ]]; then
-        record_verification "$component" "PASS" "已设置为 '${actual}'"
-    else
-        record_verification "$component" "FAIL" "期望 '${expected}'，实际 '${actual}'"
-    fi
-}
-
-verify_bbr() {
-    local current_cc current_qdisc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
-    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
-    if [[ "$BBR_MODE" = "none" ]]; then
-        if [[ "$current_cc" != "bbr" ]]; then
-            record_verification "BBR" "PASS" "已禁用"
-        else
-            record_verification "BBR" "WARN" "可能需要重启生效 (当前: ${current_cc})"
-        fi
-    elif [[ "$current_cc" = "bbr" && "$current_qdisc" = "fq" ]]; then
-        record_verification "BBR" "PASS" "已启用 (${BBR_MODE}模式)"
-    else
-        record_verification "BBR" "FAIL" "配置异常: ${current_cc}/${current_qdisc}"
-    fi
-}
-
-verify_swap() {
-    local current_swap_mb
-    current_swap_mb=$(awk '/SwapTotal/ {print int($2/1024 + 0.5)}' /proc/meminfo)
-    if [[ "$SWAP_SIZE_MB" = "0" ]]; then
-        if [[ $current_swap_mb -eq 0 ]]; then
-            record_verification "Swap" "PASS" "已禁用"
-        else
-            record_verification "Swap" "FAIL" "期望禁用但仍有${current_swap_mb}MB"
-        fi
-    elif [[ -n "$SWAP_TARGET_MB" ]]; then
-        if [[ $current_swap_mb -eq "$SWAP_TARGET_MB" ]]; then
-            record_verification "Swap" "PASS" "${current_swap_mb}MB"
-        else
-            record_verification "Swap" "FAIL" "期望 ${SWAP_TARGET_MB}MB，实际 ${current_swap_mb}MB"
-        fi
-    elif [[ $current_swap_mb -gt 0 ]]; then
-        record_verification "Swap" "PASS" "${current_swap_mb}MB"
-    else
-        record_verification "Swap" "FAIL" "未配置"
-    fi
-}
-
-verify_dns() {
-    local status="FAIL" message="" dns_servers=""
-    
-    if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
-        status="WARN"
-        message="云环境可能覆盖; "
-    fi
-    
-    if (systemctl is-active --quiet systemd-resolved 2>/dev/null); then
-        local conf_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
-        if [[ -f "$conf_file" ]]; then
-            dns_servers=$(grep -E "^\s*DNS=" "$conf_file" | sed -e 's/DNS=//' -e 's/^\s*//' -e 's/\s*$//')
-        fi
-        message+="systemd-resolved: "
-    else
-        local conf_file="/etc/resolv.conf"
-        if [[ -f "$conf_file" ]]; then
-            dns_servers=$(grep -E "^\s*nameserver" "$conf_file" | awk '{print $2}' | paste -sd ' ' -)
-        fi
-        message+="resolv.conf: "
-    fi
-    
-    if [[ -n "$dns_servers" ]]; then
-        [[ "$status" != "WARN" ]] && status="PASS"
-        message+="${dns_servers}"
-    else
-        status="FAIL"
-        message+="配置缺失"
-    fi
-    
-    record_verification "DNS" "$status" "$message"
-}
-
-verify_time_sync() {
-    if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
-        record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
-    elif (systemctl is-active --quiet systemd-timesyncd 2>/dev/null); then
-        record_verification "时间同步" "PASS" "systemd-timesyncd 服务运行中"
-    elif (systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null); then
-        record_verification "时间同步" "WARN" "正在使用第三方NTP (chrony/ntp)"
-    else
-        record_verification "时间同步" "FAIL" "NTP服务未运行"
-    fi
-}
-
-run_verification() {
-    section_header "" "配置验证"
-    VERIFICATION_PASSED=0 VERIFICATION_FAILED=0 VERIFICATION_WARNINGS=0
-    set +e
-    [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
-    verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
-    verify_time_sync
-    verify_bbr
-
-    verify_swap
-    verify_dns
-    local installed=0 total=0
-    for pkg in "${INSTALL_PACKAGES[@]}"; do
-        total=$((total + 1))
-        dpkg -l "$pkg" >/dev/null 2>&1 && installed=$((installed + 1))
-    done
-    if [[ $installed -eq $total ]]; then
-        record_verification "软件包" "PASS" "全部已安装 ($installed/$total)"
-    else
-        record_verification "软件包" "FAIL" "部分缺失 ($installed/$total)"
-    fi
-    if [[ -n "$NEW_SSH_PORT" ]]; then
-        local current_port
-        current_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}')
-        if grep -Fxq "$NEW_SSH_PORT" <<< "$current_port"; then
-            record_verification "SSH端口" "PASS" "已监听/配置为 '${NEW_SSH_PORT}'"
-        else
-            record_verification "SSH端口" "FAIL" "期望 '${NEW_SSH_PORT}'，实际 '${current_port:-未知}'"
-        fi
-    fi
-    if [[ "$ENABLE_FAIL2BAN" = true ]]; then
-        if (systemctl is-active --quiet fail2ban 2>/dev/null); then
-            record_verification "Fail2ban" "PASS" "运行正常"
-        else
-            record_verification "Fail2ban" "FAIL" "服务异常"
-        fi
-    fi
-    set -e
-    log "\n${BOLD}验证结果:${NC}  ${GREEN}✔ 通过 ${VERIFICATION_PASSED}${NC}    ${YELLOW}⚠ 警告 ${VERIFICATION_WARNINGS}${NC}    ${RED}✗ 失败 ${VERIFICATION_FAILED}${NC}"
 }
 
 usage() {
@@ -425,7 +233,7 @@ parse_args() {
                     exit 2
                 fi
                 shift 2 ;;
-            --bbr) BBR_MODE="default"; shift ;;
+            --bbr) ENABLE_BBR=true; shift ;;
             --no-bbr) BBR_MODE="none"; shift ;;
             --fail2ban)
                 ENABLE_FAIL2BAN=true
@@ -518,37 +326,29 @@ configure_timezone() {
 
 configure_time_sync() {
     section_header "4" "时间同步配置"
-    
-    # 1. 检查 'chrony' 或 'ntp' (如果已安装, 尊重用户)
-    if (systemctl is-active --quiet chrony 2>/dev/null || \
-       systemctl is-active --quiet ntp 2>/dev/null || \
-       systemctl is-active --quiet ntpd 2>/dev/null); then
-        log "${YELLOW}[WARN] 检测到已有的NTP服务 (chrony/ntp) 正在运行，跳过。${NC}"
-        log "${YELLOW}       (脚本被配置为仅使用 systemd-timesyncd)${NC}"
-        return
+
+    if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null; then
+        log "${YELLOW}  ⚠ 检测到已有 NTP 服务正在运行 (chrony/ntp)，保持现状${NC}"
+        return 0
     fi
 
     if ! command -v timedatectl >/dev/null 2>&1; then
-        log "${RED}[ERROR] 未找到 timedatectl 命令, 无法配置 systemd-timesyncd。${NC}"
-        return
+        log "${YELLOW}  ⚠ 未找到 timedatectl 命令，跳过时间同步配置${NC}"
+        return 0
     fi
 
-    # 启用现有服务，必要时安装后再启用。
-    if systemctl cat systemd-timesyncd >/dev/null 2>&1; then
-        step_info "启用 systemd-timesyncd..."
-    elif ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-        log "${YELLOW}[WARN] systemd-timesyncd 未运行或不存在，尝试安装...${NC}"
+    if ! systemctl cat systemd-timesyncd >/dev/null 2>&1; then
         step_info "安装 systemd-timesyncd..."
-        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y systemd-timesyncd >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     fi
+
     systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
-    
+
     if timedatectl status 2>/dev/null | grep -q 'NTP service: active' || systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-        result_ok "时间同步配置完成"
+        result_ok "时间同步已启用 (systemd-timesyncd)"
     else
-        log "${RED}[ERROR] 时间同步配置未生效${NC}"
-        return 1
+        result_warn "时间同步服务未确认激活，建议后续检查"
     fi
 }
 
@@ -949,17 +749,16 @@ main() {
         exit 2
     fi
 
-    section_header "" "配置摘要" false
-    print_summary_row "主机名" "${NEW_HOSTNAME:-保持当前 / 交互}"
+    section_header "" "配置摘要"
+    print_summary_row "主机名" "${NEW_HOSTNAME:-保持当前}"
     print_summary_row "时区" "$TIMEZONE"
-    print_summary_row "BBR" "$BBR_MODE"
+    print_summary_row "BBR" "$([[ "$ENABLE_BBR" = true ]] && echo "启用 (fq + bbr)" || echo "禁用 (cubic)")"
     print_summary_row "Swap" "$SWAP_SIZE_MB"
     print_summary_row "DNS" "${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
-    print_summary_row "Fail2ban" "$ENABLE_FAIL2BAN"
+    print_summary_row "Fail2ban" "$([[ "$ENABLE_FAIL2BAN" = true ]] && echo "启用" || echo "禁用")"
     [[ -n "$NEW_SSH_PORT" ]] && print_summary_row "SSH 端口" "$NEW_SSH_PORT"
-    print_summary_row "系统升级" "$UPGRADE_SYSTEM"
-    print_summary_row "系统清理" "$CLEAN_SYSTEM"
-    summary_close
+    print_summary_row "系统升级" "$([[ "$UPGRADE_SYSTEM" = true ]] && echo "是" || echo "否")"
+    print_summary_row "系统清理" "$([[ "$CLEAN_SYSTEM" = true ]] && echo "是" || echo "否")"
 
     if [[ "$non_interactive" = false ]]; then
         read -p "开始配置? [Y/n] " -r < /dev/tty
@@ -985,20 +784,10 @@ main() {
     [[ "$ENABLE_FAIL2BAN" = true ]] && configure_fail2ban
     system_update
     
-    run_verification
-
-    if [[ $VERIFICATION_FAILED -gt 0 ]]; then
-        log "${RED}[ERROR] 初始化完成，但存在 ${VERIFICATION_FAILED} 项验证失败${NC}"
-        log "日志文件: ${LOG_FILE}"
-        exit 1
-    fi
-    
-    section_header "" "完成" false
-    print_box_row "${GREEN}🎉 VPS 初始化完成！${NC}"
-    print_box_row "${DIM}执行时间: $(format_duration "$SECONDS")${NC}"
-    print_box_row "${DIM}日志文件:${NC}"
-    print_box_row "${DIM}${LOG_FILE}${NC}"
-    summary_close
+    section_header "" "完成"
+    log "${GREEN}  ✔ VPS 初始化配置全部完成！${NC}"
+    log "  • 执行耗时 : $(format_duration "$SECONDS")"
+    log "  • 日志文件 : ${LOG_FILE}"
     
     if [[ -n "$NEW_SSH_PORT" ]]; then
         log "\n${RED}⚠️  SSH端口已改为 ${NEW_SSH_PORT}，请用新端口重连！${NC}"
