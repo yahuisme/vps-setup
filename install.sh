@@ -471,7 +471,6 @@ configure_swap() {
         fi
     done
     # 先创建新文件（旧 Swap 仍在运行，创建失败不影响现状）
-    log "${BLUE}创建${swap_mb}MB Swap文件...${NC}"
     # 创建阶段失败时也清理临时文件，避免下次运行留下脏状态。
     # fallocate 不可用或失败（如 overlay 文件系统）时回退 dd。
     step_info "创建 Swap 文件（fallocate 优先，失败回退 dd）..."
