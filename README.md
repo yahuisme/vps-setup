@@ -2,7 +2,7 @@
 
 Debian / Ubuntu VPS 初始化脚本。
 
-版本：`v26.09.11`
+版本：`v26.09.15`
 
 支持：Debian 10 – 13、Ubuntu LTS 20.04、22.04、24.04、26.04。
 
@@ -53,9 +53,22 @@ apt-get update -y && apt-get install -y curl && curl -fsSLo install.sh https://r
 - 修改后保留当前 SSH 连接，另开连接验证。
 - `--ssh-password` 会暴露在 shell 历史和进程参数中，建议交互输入。
 - `--swap 0` 禁用全部 Swap；指定容量与现有总量不一致时统一替换为 `/swapfile`。失败恢复旧文件、启动配置和活动状态。
-- BBR、systemd-resolved 和 Fail2ban 应用或验证失败时恢复原配置；恢复失败会明确报告。
+- BBR 按本次实际写入的同名参数接管：`--bbr` 为 `net.core.default_qdisc=fq`、`net.ipv4.tcp_congestion_control=bbr`；`--no-bbr` 仅切换拥塞控制为 cubic，不修改 qdisc（包括已有持久赋值）。
+- 扫描 `/etc/sysctl.conf` 及 `/etc/sysctl.d`、`/run/sysctl.d`、`/usr/local/lib/sysctl.d`、`/usr/lib/sysctl.d`、`/lib/sysctl.d` 的 `*.conf`（含被同名文件遮蔽的配置）。同名参数不比较值，注释其他文件的旧赋值，在 `/etc/sysctl.d/99-bbr.conf` 中替换同名赋值并集中写入；支持点号、斜杠和可选前导 `-`，其他参数、注释及通配符规则不处理（保留原字节及末行无换行状态）。符号链接按实际目标去重，保留链接本身；内容不变的文件不改写，重复执行不累积自身参数的注释。
+- BBR 修改前备份，应用时仅加载本次目标参数并核对运行值；成功修改已有文件时保留 `/etc/sysctl.d/99-bbr.conf.backup.*` 并显示路径（`paths` 逐行对应 `old.0`、`old.1` 等原文件，`runtime` 为原运行值）；无内容变更时不留新备份。失败独立恢复本次已改文件及目标运行参数，恢复不完整时保留并报告备份路径。不是整机 sysctl 回滚；软件包更新、云平台重写或重启后 `/run` 配置重建仍可能覆盖设置，运行期间不要同时编辑 sysctl 配置。
+- systemd-resolved 和 Fail2ban 应用或验证失败时恢复原配置；恢复失败会明确报告。
 - Fail2ban 保护最终有效的全部 SSH 端口；`--no-fail2ban` 跳过本次配置，已有服务保持不变。
 - Fail2ban 默认永久封禁：SSH 在 5 分钟内失败 3 次即封禁，仅豁免 `127.0.0.1/8` 和 `::1`。
 - `/etc/resolv.conf` 由其他 DNS 管理器维护时跳过直接修改。
 - 重启默认否，非交互模式不自动重启。
 - 日志：`/var/log/vps-init-日期时间.log`。
+
+## 本地检查（不运行初始化）
+
+```bash
+bash -n install.sh && bash -n tests/bbr-transaction.sh
+shellcheck -S warning install.sh tests/bbr-transaction.sh
+bash tests/bbr-transaction.sh
+```
+
+测试仅提取 BBR 函数，重定向到临时目录并模拟 sysctl；覆盖同名接管、符号链接、cubic 范围以及生成、写入、应用、验证和恢复故障。不会执行主函数或修改宿主机调优参数。

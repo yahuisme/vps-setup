@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.09.11
+# 版本: v26.09.15
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.09.11"
+SCRIPT_VERSION="v26.09.15"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
@@ -366,48 +366,152 @@ configure_time_sync() {
     fi
 }
 
+# GNU sed preserves unrelated bytes, including a missing final newline.
+# The owned file replaces active keys; other files keep retired lines as comments.
+bbr_filter() {
+    local key expression="" action='s/^/# vps-setup: /'
+    [[ "${3:-}" != replace ]] || action=d
+    while IFS= read -r key; do
+        key=${key//./[.\/]}
+        expression+="\\|^[[:space:]]*-?${key}[[:space:]]*=|${action};"
+    done <<< "$1"
+    sed -E "$expression" "$2"
+}
+
 configure_bbr() {
     section_header "5" "BBR 配置"
-    local config_file="/etc/sysctl.d/99-bbr.conf" backup tmp old_cc old_qdisc target=cubic
+    local config_file="/etc/sysctl.d/99-bbr.conf" target=cubic backup config_target
+    local file resolved dir key value keys="" i tmp="" runtime_started=false retain_backup=false
+    local -a files=() changed=() runtime=()
+    local -A seen=()
     if [[ "$ENABLE_BBR" = true ]]; then
         is_kernel_version_ge "4.9" || { result_warn "内核需要 4.9+，未修改 BBR"; return 1; }
         target=bbr
     fi
-    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
-    old_qdisc=$(sysctl -n net.core.default_qdisc) || return 1
-    backup=$(mktemp -d) || return 1
-    if [[ -e "$config_file" || -L "$config_file" ]]; then
-        cp -a "$config_file" "$backup/config" || { rmdir "$backup"; return 1; }
-    fi
-    printf '%s\n' "net.ipv4.tcp_congestion_control=$old_cc" "net.core.default_qdisc=$old_qdisc" > "$backup/runtime" || { rm -rf "$backup"; return 1; }
-    tmp=$(mktemp "${config_file}.XXXXXX") || { rm -rf "$backup"; return 1; }
-    if ! { if [[ "$target" = bbr ]]; then printf 'net.core.default_qdisc = fq\n'; fi
-        printf 'net.ipv4.tcp_congestion_control = %s\n' "$target"
-    } > "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$config_file"; then
-        rm -f "$tmp"; rm -rf "$backup"; return 1
-    fi
-    if ! sysctl -p "$config_file" >> "$LOG_FILE" 2>&1 ||
-       [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" != "$target" ]] ||
-       { [[ "$target" = bbr ]] && [[ "$(sysctl -n net.core.default_qdisc)" != fq ]]; }; then
-        local restore_failed=false
-        if [[ -e "$backup/config" || -L "$backup/config" ]]; then
-            cp -a --remove-destination "$backup/config" "$config_file" || restore_failed=true
+    backup=$(mktemp -d "${config_file}.backup.XXXXXX") || return 1
+    # Nested helpers share this transaction's local state, including conditional callers.
+    bbr_prepare() {
+        if [[ "$target" = bbr ]]; then
+            printf 'net.core.default_qdisc = fq\n' > "$backup/target" || return 1
         else
-            rm -f "$config_file" || restore_failed=true
+            : > "$backup/target" || return 1
         fi
-        if ! sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" "net.core.default_qdisc=$old_qdisc" >> "$LOG_FILE" 2>&1; then
-            result_warn "内核运行参数恢复失败，请检查日志"
-            restore_failed=true
+        printf 'net.ipv4.tcp_congestion_control = %s\n' "$target" >> "$backup/target" || return 1
+        keys=$(awk -F ' *= *' 'NF == 2 {print $1}' "$backup/target") || return 1
+        [[ -n "$keys" ]] || return 1
+        while IFS= read -r key; do
+            value=$(sysctl -n "$key") || return 1
+            [[ -n "$value" ]] || return 1
+            runtime+=("$key=$value")
+        done <<< "$keys"
+        printf '%s\n' "${runtime[@]}" > "$backup/runtime" || return 1
+        config_target=$(readlink -m -- "$config_file") || return 1
+        # Include shadowed files too, so removing a higher-priority file cannot revive conflicts.
+        for dir in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+            for file in "$dir"/*.conf; do
+                [[ -e "$file" || -L "$file" ]] || continue
+                files+=("$file")
+            done
+        done
+        files+=(/etc/sysctl.conf "$config_file")
+        local -a candidates=("${files[@]}")
+        files=()
+        for file in "${candidates[@]}"; do
+            [[ -e "$file" || -L "$file" || "$file" = "$config_file" ]] || continue
+            resolved=$(readlink -m -- "$file") || return 1
+            [[ ! ${seen[$resolved]+yes} ]] || continue
+            seen[$resolved]=1
+            # /dev/null masks are not configuration files; other special/dangling targets fail closed.
+            [[ "$resolved" != /dev/null ]] || { [[ "$file" != "$config_file" ]] && continue; return 1; }
+            if [[ -e "$resolved" ]]; then
+                [[ -f "$resolved" ]] || return 1
+            elif [[ "$file" != "$config_file" || -L "$file" ]]; then
+                return 1
+            fi
+            i=${#files[@]}
+            : > "$backup/new.$i" || return 1
+            if [[ "$resolved" = "$config_target" ]]; then
+                # Prepend generated keys so an unrelated final line needs no added newline.
+                cat "$backup/target" > "$backup/new.$i" || return 1
+            fi
+            if [[ -f "$resolved" ]]; then
+                cp -a -- "$resolved" "$backup/old.$i" || return 1
+                if [[ "$resolved" = "$config_target" ]]; then
+                    bbr_filter "$keys" "$resolved" replace >> "$backup/new.$i" || return 1
+                else
+                    bbr_filter "$keys" "$resolved" >> "$backup/new.$i" || return 1
+                fi
+                if cmp -s -- "$backup/old.$i" "$backup/new.$i"; then
+                    rm -f -- "$backup/old.$i" "$backup/new.$i" || return 1
+                    continue
+                fi
+                retain_backup=true
+            fi
+            files+=("$resolved")
+            printf '%s\n' "$resolved" >> "$backup/paths" || return 1
+        done
+    }
+    bbr_apply() {
+        for i in "${!files[@]}"; do
+            file=${files[$i]}
+            tmp=$(mktemp "${file}.XXXXXX") || return 1
+            if [[ -f "$backup/old.$i" ]]; then
+                cp -a -- "$backup/old.$i" "$tmp" || return 1
+            else
+                chmod 644 "$tmp" || return 1
+            fi
+            cat "$backup/new.$i" > "$tmp" || return 1
+            # Track before rename: even a failed/partially completed operation must be recovered.
+            changed+=("$i")
+            mv -f -- "$tmp" "$file" || return 1
+            tmp=""
+        done
+        for i in "${!files[@]}"; do
+            cmp -s -- "$backup/new.$i" "${files[$i]}" || return 1
+        done
+        runtime_started=true
+        # Apply only generated assignments, never unrelated settings in another file.
+        sysctl -p "$backup/target" >> "$LOG_FILE" 2>&1 || return 1
+        while IFS='=' read -r key value; do
+            key=${key// /}; value=${value// /}
+            local actual
+            actual=$(sysctl -n "$key") || return 1
+            [[ "$actual" = "$value" ]] || return 1
+        done < "$backup/target"
+    }
+    if ! bbr_prepare || ! bbr_apply; then
+        local restore_failed=false
+        [[ -z "$tmp" ]] || rm -f -- "$tmp" || restore_failed=true
+        for i in "${changed[@]}"; do
+            if [[ -f "$backup/old.$i" ]]; then
+                cp -a --remove-destination -- "$backup/old.$i" "${files[$i]}" || restore_failed=true
+                cmp -s -- "$backup/old.$i" "${files[$i]}" || restore_failed=true
+            else
+                rm -f -- "${files[$i]}" || restore_failed=true
+            fi
+        done
+        if [[ "$runtime_started" = true ]]; then
+            for value in "${runtime[@]}"; do
+                sysctl -w "$value" >> "$LOG_FILE" 2>&1 || restore_failed=true
+                key=${value%%=*}
+                if ! resolved=$(sysctl -n "$key") || [[ "$resolved" != "${value#*=}" ]]; then
+                    restore_failed=true
+                fi
+            done
         fi
         if [[ "$restore_failed" = true ]]; then
-            result_warn "拥塞控制恢复不完整，请检查日志及备份：$backup"
+            result_warn "拥塞控制恢复不完整，请检查日志及备份（paths / old.* / runtime）：$backup"
         else
-            rm -rf "$backup"
-            result_warn "拥塞控制变更失败，已恢复原持久配置"
+            rm -rf -- "$backup"
+            result_warn "拥塞控制变更失败，未提交或已恢复本次配置及运行参数"
         fi
         return 1
     fi
-    rm -rf "$backup"
+    if [[ "$retain_backup" = true ]]; then
+        print_summary_row "原配置备份" "$backup"
+    else
+        rm -rf -- "$backup" || return 1
+    fi
     result_ok "拥塞控制已生效：$target$([[ "$target" = bbr ]] && echo ' / fq')"
     print_summary_row "配置文件" "$config_file"
 }
@@ -868,7 +972,7 @@ main() {
     section_header "" "配置摘要"
     print_summary_row "主机名" "${NEW_HOSTNAME:-保持当前}"
     print_summary_row "时区" "$TIMEZONE"
-    print_summary_row "BBR" "$([[ "$ENABLE_BBR" = true ]] && echo "启用 (fq + bbr)" || echo "禁用 (cubic)")"
+    print_summary_row "BBR" "$([[ "$ENABLE_BBR" = true ]] && echo "启用 (fq + bbr)" || echo "切换为 cubic（保留 qdisc）")"
     print_summary_row "Swap" "$([[ "$SWAP_SIZE_MB" = auto ]] && echo '按内存自动配置' || { [[ "$SWAP_SIZE_MB" = 0 ]] && echo '禁用全部（含分区）' || echo "${SWAP_SIZE_MB}MB"; })"
     print_summary_row "DNS" "IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$(has_ipv6 && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
     print_summary_row "Fail2ban" "$([[ "$ENABLE_FAIL2BAN" = true ]] && echo "SSH 防护：5 分钟内失败 3 次永久封禁" || echo "跳过配置（保持已有服务）")"
