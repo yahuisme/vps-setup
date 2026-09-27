@@ -15,8 +15,9 @@ source_text=${source_text//\/etc\//$root\/etc\/}
 source_text=${source_text//\/run\//$root\/run\/}
 source_text=${source_text//\/usr\//$root\/usr\/}
 source_text=${source_text// \/lib\/sysctl.d/ $root\/lib\/sysctl.d}
-# shellcheck disable=SC1090
-source /dev/stdin <<< "$source_text"
+printf '%s\n' "$source_text" > "$root/isolated-functions.sh"
+# shellcheck disable=SC1091
+source "$root/isolated-functions.sh"
 section_header() { :; }
 result_warn() { printf '%s\n' "$*" >&2; }
 result_ok() { printf '%s\n' "$*"; }

@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.09.15
+# 版本: v26.09.27
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.09.15"
+SCRIPT_VERSION="v26.09.27"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
@@ -105,9 +105,7 @@ check_disk_space() {
 }
 
 is_container() {
-    case "$(systemd-detect-virt --container 2>/dev/null)" in
-        docker|lxc|openvz|containerd|podman) return 0 ;;
-    esac
+    systemd-detect-virt --container >/dev/null 2>&1 && return 0
     [[ -f /.dockerenv ]] || [[ -f /run/.containerenv ]] ||
     grep -q 'container=lxc\|container=docker' /proc/1/environ 2>/dev/null
 }
@@ -195,8 +193,17 @@ valid_ipv6() {
 }
 
 ensure_swap_fstab_entry() {
-    grep -Eq '^[[:space:]]*/swapfile[[:space:]]+' /etc/fstab ||
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    local state
+    state=$(awk -v path=/swapfile '
+        $1 == path { n++; if ($3 != "swap" || NF < 4 || $4 ~ /(^|,)noauto(,|$)/) bad=1 }
+        END { if (bad || n > 1) exit 1; print n+0 }
+    ' /etc/fstab) || { result_warn "fstab 的 /swapfile 条目冲突，请自行整理"; return 1; }
+    [[ "$state" = 0 ]] || return 0
+    # Separate an unterminated last line before appending the boot entry.
+    if [[ -s /etc/fstab && -n "$(tail -c 1 /etc/fstab)" ]]; then
+        printf '\n' >> /etc/fstab || return 1
+    fi
+    printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
 }
 
 valid_ssh_port() {
@@ -341,8 +348,15 @@ configure_timezone() {
 configure_time_sync() {
     section_header "4" "时间同步配置"
 
-    if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null; then
-        log "${YELLOW}  ⚠ 检测到已有 NTP 服务正在运行 (chrony/ntp)，保持现状${NC}"
+    local provider
+    for provider in chrony chronyd ntp ntpd ntpsec openntpd; do
+        if systemctl is-active --quiet "$provider" 2>/dev/null; then
+            result_ok "已有时间同步服务 $provider 正在运行，保持现状"
+            return 0
+        fi
+    done
+    if LC_ALL=C timedatectl status 2>/dev/null | grep -q 'NTP service: active'; then
+        result_ok "已有时间同步服务正在运行，保持现状"
         return 0
     fi
 
@@ -359,8 +373,8 @@ configure_time_sync() {
     systemctl unmask systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
     timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || systemctl enable --now systemd-timesyncd >> "$LOG_FILE" 2>&1 || true
 
-    if timedatectl status 2>/dev/null | grep -q 'NTP service: active' || systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-        result_ok "时间同步已启用 (systemd-timesyncd)"
+    if LC_ALL=C timedatectl status 2>/dev/null | grep -q 'NTP service: active' || systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        result_ok "时间同步服务已启用"
     else
         result_warn "时间同步服务未确认激活，建议后续检查"
     fi
@@ -369,11 +383,14 @@ configure_time_sync() {
 # GNU sed preserves unrelated bytes, including a missing final newline.
 # The owned file replaces active keys; other files keep retired lines as comments.
 bbr_filter() {
-    local key expression="" action='s/^/# vps-setup: /'
+    local key dotted slashed expression="" action='s/^/# vps-setup: /'
     [[ "${3:-}" != replace ]] || action=d
     while IFS= read -r key; do
-        key=${key//./[.\/]}
-        expression+="\\|^[[:space:]]*-?${key}[[:space:]]*=|${action};"
+        # Owned keys contain no literal dots in kernel path components.
+        # procps swaps all separators only when the first separator is a dot.
+        dotted=${key//./\\.}
+        slashed=${key//./\/}
+        expression+="\\|^[[:space:]]*-?(${dotted}\\|${slashed})[[:space:]]*=|${action};"
     done <<< "$1"
     sed -E "$expression" "$2"
 }
@@ -525,13 +542,22 @@ configure_swap() {
     local swap_file="/swapfile" swap_mb="$SWAP_SIZE_MB" current_total_mb=0 size_bytes swap_line
     local snapshot active_swap new_swap="" backup old_moved=false new_installed=false failed=false
     local -a stopped=()
+    # A fixed path is not ownership evidence: never retire unrelated data.
+    if [[ -e "$swap_file" || -L "$swap_file" ]]; then
+        local swap_type
+        if [[ -L "$swap_file" || ! -f "$swap_file" ]] ||
+           ! swap_type=$(blkid -p -s TYPE -o value -- "$swap_file" 2>/dev/null) || [[ "$swap_type" != swap ]]; then
+            result_warn "拒绝修改未识别的 Swap 普通文件：$swap_file"
+            return 1
+        fi
+    fi
     snapshot=$(swapon --show=NAME --noheadings --raw) || return 1
     if [[ "$swap_mb" = auto ]]; then
         local mem_mb
         mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo) || return 1
-        if (( mem_mb < 1024 )); then swap_mb=$mem_mb
-        elif (( mem_mb < 4096 )); then swap_mb=2048
-        else swap_mb=4096; fi
+        if (( mem_mb <= 512 )); then swap_mb=512
+        elif (( mem_mb <= 1024 )); then swap_mb=1024
+        else swap_mb=2048; fi
     fi
     local sizes
     sizes=$(swapon --show=NAME,SIZE --bytes --noheadings --raw) || return 1
@@ -726,20 +752,31 @@ EOF
             result_warn "/etc/resolv.conf 是符号链接，跳过直接修改，请由当前 DNS 管理器配置"
             return 0
         fi
+        local manager
+        for manager in NetworkManager connman resolvconf dhcpcd; do
+            if systemctl is-active --quiet "$manager" 2>/dev/null; then
+                result_warn "检测到 DNS 管理器 $manager，跳过直接修改"
+                return 0
+            fi
+        done
+        if grep -Eiq '^[[:space:]]*[#;].*(generated|managed|do not edit|resolvconf|networkmanager|dhcpcd)' /etc/resolv.conf; then
+            result_warn "resolv.conf 标记为生成/托管文件，跳过直接修改"
+            return 0
+        fi
         cp -a /etc/resolv.conf "/etc/resolv.conf.backup.$(date +%Y%m%d-%H%M%S).$$" 2>>"$LOG_FILE" || {
             log "${RED}✗ 无法备份 /etc/resolv.conf，已停止修改。${NC}"
             return 1
         }
-        local resolv_tmp="/etc/resolv.conf.vps-setup.$$"
-        if ! cat > "$resolv_tmp" << EOF
-nameserver ${PRIMARY_DNS_V4}
-nameserver ${SECONDARY_DNS_V4}
-$( [[ "$ipv6_enabled" == true ]] && printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6" )
-EOF
-        then
+        local resolv_tmp
+        resolv_tmp=$(mktemp /etc/resolv.conf.vps-setup.XXXXXX) || return 1
+        if ! {
+            printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4" &&
+            { [[ "$ipv6_enabled" != true ]] || printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6"; } &&
+            sed -E '/^[[:space:]]*nameserver([[:space:]]|$)/d' /etc/resolv.conf
+        } > "$resolv_tmp"; then
             rm -f "$resolv_tmp"; return 1
         fi
-        if ! mv -f "$resolv_tmp" /etc/resolv.conf; then
+        if ! chmod --reference=/etc/resolv.conf "$resolv_tmp" || ! mv -f "$resolv_tmp" /etc/resolv.conf; then
             rm -f "$resolv_tmp"
             log "${RED}✗ 无法替换 /etc/resolv.conf${NC}"
             return 1
@@ -755,6 +792,22 @@ EOF
         return 1
     fi
     result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([[ "$ipv6_enabled" = true ]] && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
+}
+
+# Input: one numeric address:port per line (sshd -T or ss).
+ssh_remote_listener() {
+    awk -v port="$1" -v strict="${2:-false}" '
+        {
+            endpoint=$1; p=endpoint; sub(/^.*:/, "", p)
+            if (p != port) { if (strict == "true") bad=1; next }
+            address=endpoint; sub(/:[^:]*$/, "", address)
+            gsub(/[\[\]]/, "", address); address=tolower(address)
+            if (address ~ /^127\./ || address == "::1" ||
+                address ~ /^::ffff:127\./ || address ~ /^fe[89ab][0-9a-f]:/) next
+            remote=1
+        }
+        END { exit (bad || !remote) }
+    '
 }
 
 configure_ssh() {
@@ -822,10 +875,12 @@ configure_ssh() {
             rm -f "${ssh_dropin}.tmp.$$"; return 1
         fi
         ssh_changed=true
-        local effective_ports
-        if ! effective_ports=$(sshd -T 2>>"$LOG_FILE" | awk '$1 == "port" {print $2}' | sort -u) ||
-           [[ "$effective_ports" != "$NEW_SSH_PORT" ]]; then
-            result_warn "SSH 有显式多端口、其他 Port 或缺少 Include；拒绝累加端口。请自行整理配置后重试"
+        local effective_ports effective
+        if ! effective=$(sshd -T 2>>"$LOG_FILE") ||
+           ! effective_ports=$(awk '$1 == "port" {print $2}' <<< "$effective" | sort -u) ||
+           [[ "$effective_ports" != "$NEW_SSH_PORT" ]] ||
+           ! awk '$1 == "listenaddress" {print $2}' <<< "$effective" | ssh_remote_listener "$NEW_SSH_PORT" true; then
+            result_warn "SSH Port / ListenAddress 冲突、缺少 Include 或仅限本地绑定；请自行整理配置后重试"
             rollback_ssh
             return 1
         fi
@@ -839,7 +894,7 @@ configure_ssh() {
                 return 1
             fi
             sleep 1
-            if ! ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
+            if ! ss -H -ltn 2>/dev/null | awk '{print $4}' | ssh_remote_listener "$NEW_SSH_PORT"; then
                 log "${RED}✗ SSH 未监听新端口，正在恢复配置。${NC}"
                 rollback_ssh
                 return 1
@@ -867,7 +922,7 @@ configure_fail2ban() {
     while IFS= read -r detected_port; do
         valid_ssh_port "$detected_port" || { result_warn "SSH 有效端口无效"; return 1; }
         ports+=("$detected_port")
-    done < <(awk '$1 == "port" {print $2}' <<< "$effective")
+    done < <(awk '$1 == "listenaddress" {sub(/^.*:/, "", $2); print $2}' <<< "$effective")
     [[ ${#ports[@]} -gt 0 ]] || { result_warn "未发现 SSH 有效端口"; return 1; }
 
     local port_list
@@ -900,15 +955,12 @@ configure_fail2ban() {
         rm -f "$jail_backup"
     }
     if ! cat > "$jail_tmp" << EOF
-[DEFAULT]
+[sshd]
 # 永久封禁：输错 SSH 密码达到 maxretry 后，来源 IP 不会自动解封。
 bantime = -1
 findtime = 300
 maxretry = 3
 backend = systemd
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
 enabled = true
 port = ${port_list}
 EOF
@@ -927,7 +979,37 @@ EOF
         log "${RED}✗ Fail2ban 重启失败，已恢复原配置。${NC}"
         return 1
     fi
-    if systemctl is-active --quiet fail2ban; then
+    verify_sshd_jail() {
+        local actual actions action found=false
+        fail2ban-client status sshd >> "$LOG_FILE" 2>&1 || return 1
+        actual=$(fail2ban-client get sshd maxretry 2>>"$LOG_FILE") || return 1
+        [[ "$actual" = 3 ]] || return 1
+        actual=$(fail2ban-client get sshd findtime 2>>"$LOG_FILE") || return 1
+        [[ "$actual" = 300 ]] || return 1
+        actual=$(fail2ban-client get sshd bantime 2>>"$LOG_FILE") || return 1
+        [[ "$actual" = -1 ]] || return 1
+        # A file backend cannot answer journalmatch; do not accept a silent override.
+        actual=$(fail2ban-client get sshd journalmatch 2>>"$LOG_FILE") || return 1
+        [[ "$actual" = *'_COMM=sshd'* || "$actual" = *'_SYSTEMD_UNIT=ssh.service'* ]] || return 1
+        actions=$(fail2ban-client get sshd actions 2>>"$LOG_FILE") || return 1
+        actions=$(printf '%s\n' "$actions" | sed '/^The jail /d' | tr ',' '\n') || return 1
+        while IFS= read -r action; do
+            action=${action//[[:space:]]/}
+            [[ -n "$action" ]] || continue
+            # Notification actions have no port property; require at least one
+            # port-scoped action and validate every action that exposes ports.
+            if ! actual=$(fail2ban-client get sshd action "$action" port 2>>"$LOG_FILE"); then continue; fi
+            [[ "$actual" = "$port_list" ]] || return 1
+            found=true
+        done <<< "$actions"
+        [[ "$found" = true ]]
+    }
+    local attempt jail_ready=false
+    for attempt in 1 2 3 4 5; do
+        if systemctl is-active --quiet fail2ban && verify_sshd_jail; then jail_ready=true; break; fi
+        if [[ "$attempt" -lt 5 ]]; then sleep 1; fi
+    done
+    if [[ "$jail_ready" = true ]]; then
         rm -f "$jail_backup"
         result_ok "Fail2ban 已启动，保护 SSH 端口：${port_list}；5 分钟内失败 3 次永久封禁"
     else
