@@ -2,20 +2,20 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.09.27
+# 版本: v26.10.01
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.09.27"
+SCRIPT_VERSION="v26.10.01"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
-PRIMARY_DNS_V4="1.1.1.1"
-SECONDARY_DNS_V4="8.8.8.8"
-PRIMARY_DNS_V6="2606:4700:4700::1111"
-SECONDARY_DNS_V6="2001:4860:4860::8888"
+PRIMARY_DNS_V4="8.8.8.8"
+SECONDARY_DNS_V4="1.1.1.1"
+PRIMARY_DNS_V6="2001:4860:4860::8888"
+SECONDARY_DNS_V6="2606:4700:4700::1111"
 NEW_HOSTNAME=""
 ENABLE_BBR=true
 ENABLE_FAIL2BAN=true
@@ -147,7 +147,7 @@ ${YELLOW}▸ 其他${NC}
 
 默认：保留主机名、时区和 SSH 设置；交互模式另行询问主机名和 SSH。
 启用 BBR、Fail2ban；Swap 使用 auto，容量不一致时替换全部现有 Swap。
-DNS 默认 IPv4：1.1.1.1 / 8.8.8.8；IPv6：2606:4700:4700::1111 / 2001:4860:4860::8888。
+DNS 默认 IPv4：8.8.8.8 / 1.1.1.1；IPv6：2001:4860:4860::8888 / 2606:4700:4700::1111。
 DNS 参数须用引号包含两个地址；仅检测到 IPv6 时配置 IPv6 DNS。
 非交互模式仍执行默认初始化项目，不是仅执行显式指定的选项。
 
@@ -690,7 +690,7 @@ configure_dns() {
         if ! cat > "$resolved_tmp" << EOF
 [Resolve]
 DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$( [[ "$ipv6_enabled" == true ]] && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}" )
-FallbackDNS=1.0.0.1 8.8.4.4
+FallbackDNS=8.8.4.4 1.0.0.1
 EOF
         then
             rm -f "$resolved_tmp"; rm -rf "$resolved_backup"; return 1
