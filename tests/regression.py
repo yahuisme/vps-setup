@@ -201,7 +201,7 @@ configure_dns
         path = self.root / 'etc/resolv.conf'
         path.write_bytes(b'# local\nsearch private.internal\nnameserver 10.0.0.53\noptions ndots:2')
         self.run_shell(['configure_dns'], self.dns_defaults() + '\nconfigure_dns\n')
-        self.assertEqual(path.read_bytes(), b'nameserver 8.8.8.8\nnameserver 1.1.1.1\n# local\nsearch private.internal\noptions ndots:2')
+        self.assertEqual(path.read_bytes(), b'nameserver 1.1.1.1\nnameserver 8.8.8.8\n# local\nsearch private.internal\noptions ndots:2')
         self.assertEqual(path.stat().st_mode & 0o777, 0o644)
 
     def dns_defaults(self):
@@ -213,11 +213,11 @@ configure_dns
         path = self.root / 'etc/resolv.conf'
         path.write_text('# local\n')
         self.run_shell(['configure_dns'], self.dns_defaults() + '\nhas_ipv6() { return 0; }\nconfigure_dns\n')
-        self.assertEqual(path.read_text(), 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n'
-                         'nameserver 2001:4860:4860::8888\nnameserver 2606:4700:4700::1111\n# local\n')
+        self.assertEqual(path.read_text(), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'
+                         'nameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888\n# local\n')
         help_text = self.run_shell(['usage'], 'usage\n')
         readme = (REPO / 'README.md').read_text()
-        for addresses in ['8.8.8.8 / 1.1.1.1', '2001:4860:4860::8888 / 2606:4700:4700::1111']:
+        for addresses in ['1.1.1.1 / 8.8.8.8', '2606:4700:4700::1111 / 2001:4860:4860::8888']:
             self.assertIn(addresses, help_text)
             self.assertIn(addresses, readme)
 
@@ -303,7 +303,7 @@ configure_time_sync
         readme = (REPO / 'README.md').read_text()
         for required in ['≤512 MiB', '≤1024 MiB', '2048 MiB', '局部回滚', '不是整轮初始化事务', 'search/options', 'ignoreip', '密码登录开关']:
             self.assertIn(required, readme)
-        self.assertIn('v26.10.01', readme)
+        self.assertIn('v26.10.07', readme)
         self.assertNotIn('其余为 4 GiB', readme)
 
     def test_swap_probe_failure_is_not_identity(self):
@@ -336,9 +336,9 @@ grep -Fxq 'swapon /dev/mock1' "$ROOT/calls"
 resolvectl() { printf 'Global: 8.8.8.8 1.1.1.1\n        2606:4700:4700:0000:0000:0000:0000:1111 2001:4860:4860:0:0:0:0:8888\nLink 2 (eth0): 9.9.9.9\n'; }
 configure_dns
 ''')
-        self.assertIn('2001:4860:4860::8888 / 2606:4700:4700::1111', output)
-        self.assertEqual(path.read_text(), '[Resolve]\nDNS=8.8.8.8 1.1.1.1 '
-                         '2001:4860:4860::8888 2606:4700:4700::1111\nFallbackDNS=8.8.4.4 1.0.0.1\n')
+        self.assertIn('2606:4700:4700::1111 / 2001:4860:4860::8888', output)
+        self.assertEqual(path.read_text(), '[Resolve]\nDNS=1.1.1.1 8.8.8.8 '
+                         '2606:4700:4700::1111 2001:4860:4860::8888\nFallbackDNS=1.0.0.1 8.8.4.4\n')
         path.write_text('original\n')
         self.run_shell(['configure_dns'], prefix + r'''
 resolvectl() { printf 'Global: 9.9.9.9\nLink 2 (eth0): 1.1.1.1 8.8.8.8\n'; }
