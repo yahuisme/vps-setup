@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.10.07
+# 版本: v26.10.09
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.10.07"
+SCRIPT_VERSION="v26.10.09"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
@@ -149,6 +149,8 @@ ${YELLOW}▸ 其他${NC}
 启用 BBR、Fail2ban；Swap 使用 auto，容量不一致时替换全部现有 Swap。
 DNS 默认 IPv4：1.1.1.1 / 8.8.8.8；IPv6：2606:4700:4700::1111 / 2001:4860:4860::8888。
 DNS 参数须用引号包含两个地址；仅检测到 IPv6 时配置 IPv6 DNS。
+所有 VPS 统一静态接管 DNS，锁定 resolv.conf 并停用 systemd-resolved；不重启网络。
+自动 DHCP/VPN DNS 更新将被阻止；手动修改前执行 chattr -i /etc/resolv.conf。
 非交互模式仍执行默认初始化项目，不是仅执行显式指定的选项。
 
 ${GREEN}示例: $0 --bbr --ssh-port 2222${NC}
@@ -168,7 +170,7 @@ valid_ipv4() {
     [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
     IFS=. read -ra octets <<< "$ip"
     for octet in "${octets[@]}"; do
-        # Force base-10 so 08/09 do not trigger Bash's octal parsing.
+        [[ "$octet" = 0 || "$octet" != 0* ]] || return 1
         (( 10#$octet <= 255 )) || return 1
     done
 }
@@ -237,14 +239,14 @@ parse_args() {
                 SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
-                if ! valid_ipv4 "$PRIMARY_DNS_V4" || ! valid_ipv4 "$SECONDARY_DNS_V4"; then
+                if [[ "$2" = *$'\n'* || "$2" = *$'\r'* ]] || ! valid_ipv4 "$PRIMARY_DNS_V4" || ! valid_ipv4 "$SECONDARY_DNS_V4"; then
                     printf '%b\n' "${RED}--ip-dns 需要两个有效 IPv4 地址${NC}" >&2
                     exit 2
                 fi
                 shift 2 ;;
             --ip6-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V6 SECONDARY_DNS_V6 <<< "$2"
-                if ! valid_ipv6 "$PRIMARY_DNS_V6" || ! valid_ipv6 "$SECONDARY_DNS_V6"; then
+                if [[ "$2" = *$'\n'* || "$2" = *$'\r'* ]] || ! valid_ipv6 "$PRIMARY_DNS_V6" || ! valid_ipv6 "$SECONDARY_DNS_V6"; then
                     printf '%b\n' "${RED}--ip6-dns 需要两个有效 IPv6 地址${NC}" >&2
                     exit 2
                 fi
@@ -658,139 +660,166 @@ configure_swap() {
     fi
 }
 
+dns_is_immutable() {
+    local attributes
+    attributes=$(lsattr -d -- "$1" 2>>"$LOG_FILE") || return 2
+    attributes=${attributes%% *}
+    [[ "$attributes" = *i* ]]
+}
+
+dns_resolved_state() {
+    local reply load="" active="" line
+    reply=$(systemctl show --property=LoadState --property=ActiveState systemd-resolved.service 2>>"$LOG_FILE") || return 1
+    while IFS= read -r line; do
+        case "$line" in LoadState=*) load=${line#*=};; ActiveState=*) active=${line#*=};; esac
+    done <<< "$reply"
+    case "$load:$active" in
+        loaded:active|masked:active) printf 'active\n';;
+        loaded:inactive|masked:inactive|not-found:inactive|loaded:failed|masked:failed) printf 'inactive\n';;
+        *) return 1;;
+    esac
+}
+
+dns_verify_file() {
+    local actual
+    [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] || return 1
+    actual=$(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf) || return 1
+    [[ "$actual" = "$expected_dns" ]] && dns_is_immutable /etc/resolv.conf
+}
+
 configure_dns() {
     section_header "7" "DNS 配置"
-    local ipv6_enabled=false
+    local resolv_file="/etc/resolv.conf" unit="/etc/systemd/system/systemd-resolved.service"
+    local runtime_unit="/run/systemd/system/systemd-resolved.service" runtime_mask=false
+    local ipv6_enabled=false old_exists=false old_immutable=false old_active=false
+    local unlocked=false installed=false service_touched=false unit_exists=false attr_status
+    local resolv_tmp backup expected_dns unchanged=false service_state
     has_ipv6 && ipv6_enabled=true
-    if (systemctl is-active --quiet cloud-init 2>/dev/null || [[ -d /etc/cloud ]]); then
-        result_warn "云环境可能覆盖 DNS 配置"
-    fi
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        mkdir -p /etc/systemd/resolved.conf.d || return 1
-        local resolved_file="/etc/systemd/resolved.conf.d/99-custom-dns.conf"
-        local resolved_tmp resolved_backup
-        resolved_backup=$(mktemp -d) || return 1
-        if [[ -e "$resolved_file" || -L "$resolved_file" ]]; then
-            cp -a "$resolved_file" "$resolved_backup/config" || { rmdir "$resolved_backup"; return 1; }
-        fi
-        resolved_tmp=$(mktemp "${resolved_file}.XXXXXX") || { rm -rf "$resolved_backup"; return 1; }
-        restore_resolved() {
-            if [[ -e "$resolved_backup/config" || -L "$resolved_backup/config" ]]; then
-                cp -a --remove-destination "$resolved_backup/config" "$resolved_file" || { result_warn "恢复失败，备份：$resolved_backup"; return 1; }
-            else
-                rm -f "$resolved_file" || return 1
-            fi
-            if ! systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 ||
-               ! systemctl is-active --quiet systemd-resolved || ! resolvectl dns >> "$LOG_FILE" 2>&1; then
-                result_warn "原 DNS 服务恢复失败，请检查日志；保留备份：$resolved_backup"
-                return 1
-            fi
-            rm -rf "$resolved_backup"
-        }
-        if ! cat > "$resolved_tmp" << EOF
-[Resolve]
-DNS=${PRIMARY_DNS_V4} ${SECONDARY_DNS_V4}$( [[ "$ipv6_enabled" == true ]] && echo " ${PRIMARY_DNS_V6} ${SECONDARY_DNS_V6}" )
-FallbackDNS=1.0.0.1 8.8.4.4
-EOF
-        then
-            rm -f "$resolved_tmp"; rm -rf "$resolved_backup"; return 1
-        fi
-        if ! chmod 644 "$resolved_tmp" || ! mv -f "$resolved_tmp" "$resolved_file"; then
-            rm -f "$resolved_tmp"; rm -rf "$resolved_backup"; return 1
-        fi
-        local expected_dns="$PRIMARY_DNS_V4 $SECONDARY_DNS_V4" actual_dns
-        [[ "$ipv6_enabled" != true ]] || expected_dns+=" $PRIMARY_DNS_V6 $SECONDARY_DNS_V6"
-        verify_resolved_dns() {
-            actual_dns=$(LC_ALL=C SYSTEMD_COLORS=0 resolvectl dns 2>>"$LOG_FILE") || return 1
-            # 仅核对 Global（含折行），忽略 Link；地址按集合比较，IPv6 展开后比较。
-            awk -v expected="$expected_dns" '
-                function normalize(ip, halves, left, right, n, m, i, out) {
-                    ip = tolower(ip)
-                    if (ip !~ /^[0-9a-f:.]+$/) return ip
-                    if (index(ip, ":")) {
-                        split(ip, halves, "::")
-                        n = split(halves[1], left, ":")
-                        m = split(halves[2], right, ":")
-                        if (index(ip, "::")) {
-                            for (i = n + 1; i <= 8 - m; i++) left[i] = "0"
-                            for (i = 1; i <= m; i++) left[8 - m + i] = right[i]
-                            n = 8
-                        }
-                        for (i = 1; i <= n; i++) {
-                            sub(/^0+/, "", left[i])
-                            out = out ":" (left[i] == "" ? "0" : left[i])
-                        }
-                        return out
-                    }
-                    n = split(ip, left, ".")
-                    for (i = 1; i <= n; i++) out = out "." (left[i] + 0)
-                    return out
-                }
-                BEGIN { n = split(expected, a); for (i = 1; i <= n; i++) want[normalize(a[i])] = 1 }
-                /^[^[:space:]]/ { global = 0 }
-                /^Global:/ { global = 1; seen = 1; sub(/^Global:[[:space:]]*/, "") }
-                global { for (i = 1; i <= NF; i++) got[normalize($i)] = 1 }
-                END {
-                    if (!seen) exit 1
-                    for (ip in want) if (!(ip in got)) exit 1
-                    for (ip in got) if (!(ip in want)) exit 1
-                }
-            ' <<< "$actual_dns"
-        }
-        if ! systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 ||
-           ! systemctl is-active --quiet systemd-resolved || ! verify_resolved_dns; then
-            restore_resolved
-            result_warn "DNS 重启或验证失败，已尝试恢复原配置"
-            return 1
-        fi
-        rm -rf "$resolved_backup"
-        result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([[ "$ipv6_enabled" = true ]] && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
-        return 0
-    else
-        step_info "配置 resolv.conf..."
-        if [[ -L /etc/resolv.conf ]]; then
-            result_warn "/etc/resolv.conf 是符号链接，跳过直接修改，请由当前 DNS 管理器配置"
-            return 0
-        fi
-        local manager
-        for manager in NetworkManager connman resolvconf dhcpcd; do
-            if systemctl is-active --quiet "$manager" 2>/dev/null; then
-                result_warn "检测到 DNS 管理器 $manager，跳过直接修改"
-                return 0
-            fi
-        done
-        if grep -Eiq '^[[:space:]]*[#;].*(generated|managed|do not edit|resolvconf|networkmanager|dhcpcd)' /etc/resolv.conf; then
-            result_warn "resolv.conf 标记为生成/托管文件，跳过直接修改"
-            return 0
-        fi
-        cp -a /etc/resolv.conf "/etc/resolv.conf.backup.$(date +%Y%m%d-%H%M%S).$$" 2>>"$LOG_FILE" || {
-            log "${RED}✗ 无法备份 /etc/resolv.conf，已停止修改。${NC}"
-            return 1
-        }
-        local resolv_tmp
-        resolv_tmp=$(mktemp /etc/resolv.conf.vps-setup.XXXXXX) || return 1
-        if ! {
-            printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4" &&
-            { [[ "$ipv6_enabled" != true ]] || printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6"; } &&
-            sed -E '/^[[:space:]]*nameserver([[:space:]]|$)/d' /etc/resolv.conf
-        } > "$resolv_tmp"; then
-            rm -f "$resolv_tmp"; return 1
-        fi
-        if ! chmod --reference=/etc/resolv.conf "$resolv_tmp" || ! mv -f "$resolv_tmp" /etc/resolv.conf; then
-            rm -f "$resolv_tmp"
-            log "${RED}✗ 无法替换 /etc/resolv.conf${NC}"
-            return 1
-        fi
-    fi
-    if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        resolvectl dns >/dev/null 2>&1 || {
-            log "${RED}✗ 无法验证 systemd-resolved DNS 状态${NC}"
-            return 1
-        }
-    elif [[ ! -s /etc/resolv.conf ]]; then
-        log "${RED}✗ /etc/resolv.conf 为空，DNS 配置未生效${NC}"
+    expected_dns=$(printf '%s\n' "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4"
+        [[ "$ipv6_enabled" != true ]] || printf '%s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6")
+    step_info "统一接管系统 DNS，禁止自动覆盖..."
+    if [[ -e "$resolv_file" && ! -f "$resolv_file" ]]; then
+        result_warn "DNS 配置路径不是普通文件，未修改：$resolv_file"
         return 1
     fi
+    if ! command -v chattr >/dev/null 2>&1 || ! command -v lsattr >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y e2fsprogs >> "$LOG_FILE" 2>&1 || return 1
+    fi
+    if [[ -f "$resolv_file" && ! -L "$resolv_file" ]]; then
+        if dns_is_immutable "$resolv_file"; then old_immutable=true
+        else
+            attr_status=$?
+            [[ "$attr_status" = 1 ]] || { result_warn "无法读取 DNS 文件属性，未修改"; return 1; }
+        fi
+    fi
+    service_state=$(dns_resolved_state) || { result_warn "无法确认 DNS 服务状态，未修改"; return 1; }
+    [[ "$service_state" != active ]] || old_active=true
+    if [[ -L "$runtime_unit" && "$(readlink -- "$runtime_unit")" = /dev/null ]]; then runtime_mask=true; fi
+    resolv_tmp=$(mktemp "${resolv_file}.vps-setup.XXXXXX") || return 1
+    if ! {
+        printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V4" "$SECONDARY_DNS_V4" &&
+        { [[ "$ipv6_enabled" != true ]] || printf 'nameserver %s\nnameserver %s\n' "$PRIMARY_DNS_V6" "$SECONDARY_DNS_V6"; } &&
+        { [[ ! -f "$resolv_file" ]] || sed -E '/^[[:space:]]*nameserver([[:space:]]|$)/d' "$resolv_file"; }
+    } > "$resolv_tmp" || ! chmod 644 "$resolv_tmp"; then
+        rm -f "$resolv_tmp"; return 1
+    fi
+    if [[ "$old_immutable" = true ]] && cmp -s "$resolv_tmp" "$resolv_file"; then unchanged=true; fi
+    # Keep the original link object and service mask, not the generated link target.
+    backup=$(mktemp -d "${resolv_file}.backup.XXXXXX") || { rm -f "$resolv_tmp"; return 1; }
+    dns_snapshot() {
+        if [[ -e "$resolv_file" || -L "$resolv_file" ]]; then
+            old_exists=true
+            cp -a -- "$resolv_file" "$backup/resolv.conf" || return 1
+        fi
+        if [[ -e "$unit" || -L "$unit" ]]; then
+            unit_exists=true
+            cp -a -- "$unit" "$backup/resolved-unit" || return 1
+        fi
+        printf 'immutable=%s\nresolved_active=%s\n' "$old_immutable" "$old_active" > "$backup/state" || return 1
+    }
+    if ! dns_snapshot; then rm -f "$resolv_tmp"; rm -rf "$backup"; return 1; fi
+    restore_dns() {
+        local failed=false
+        if [[ "$installed" = true ]]; then
+            if ! chattr -i -- "$resolv_file" >> "$LOG_FILE" 2>&1; then failed=true; fi
+            if [[ "$old_exists" = true ]]; then
+                cp -a --remove-destination -- "$backup/resolv.conf" "$resolv_file" || failed=true
+            else
+                rm -f -- "$resolv_file" || failed=true
+            fi
+        fi
+        if [[ "$old_immutable" = true && "$unlocked" = true ]]; then
+            chattr +i -- "$resolv_file" >> "$LOG_FILE" 2>&1 || failed=true
+        fi
+        if [[ "$service_touched" = true ]]; then
+            if [[ "$unit_exists" = true ]]; then
+                cp -a --remove-destination -- "$backup/resolved-unit" "$unit" || failed=true
+            else
+                rm -f -- "$unit" || failed=true
+            fi
+            systemctl daemon-reload >> "$LOG_FILE" 2>&1 || failed=true
+            if [[ "$old_active" = true ]]; then
+                local restore_mask=false
+                if [[ -L "$unit" && "$(readlink -- "$unit")" = /dev/null ]]; then
+                    restore_mask=true
+                    rm -f -- "$unit" || failed=true
+                    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || failed=true
+                fi
+                if [[ "$runtime_mask" = true ]]; then
+                    rm -f -- "$runtime_unit" || failed=true
+                    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || failed=true
+                fi
+                systemctl start systemd-resolved.service >> "$LOG_FILE" 2>&1 || failed=true
+                if [[ "$runtime_mask" = true ]]; then
+                    ln -s /dev/null "$runtime_unit" || failed=true
+                    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || failed=true
+                fi
+                if [[ "$restore_mask" = true ]]; then
+                    cp -a --remove-destination -- "$backup/resolved-unit" "$unit" || failed=true
+                    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || failed=true
+                fi
+                service_state=$(dns_resolved_state) || failed=true
+                [[ "$service_state" = active ]] || failed=true
+            fi
+        fi
+        rm -f "$resolv_tmp" || failed=true
+        if [[ "$failed" = true ]]; then
+            result_warn "DNS 恢复不完整，请检查备份：$backup"
+        else
+            rm -rf "$backup"
+            result_warn "DNS 接管失败，已恢复原配置"
+        fi
+        return 1
+    }
+    dns_apply() {
+        if [[ "$unchanged" != true ]]; then
+            if [[ "$old_immutable" = true ]]; then
+                chattr -i -- "$resolv_file" >> "$LOG_FILE" 2>&1 || return 1
+                unlocked=true
+            fi
+            mv -fT -- "$resolv_tmp" "$resolv_file" || return 1
+            installed=true
+            chattr +i -- "$resolv_file" >> "$LOG_FILE" 2>&1 || return 1
+        fi
+        # Mask even an inactive/absent resolved so a later boot cannot revive old DNS.
+        if [[ ! -L "$unit" || "$(readlink -- "$unit")" != /dev/null || "$old_active" = true ]]; then
+            service_touched=true
+            rm -f -- "$unit" || return 1
+            systemctl mask --now systemd-resolved.service >> "$LOG_FILE" 2>&1 || return 1
+        fi
+        [[ -L "$unit" && "$(readlink -- "$unit")" = /dev/null ]] || return 1
+        service_state=$(dns_resolved_state) || return 1
+        [[ "$service_state" = inactive ]] || return 1
+        dns_verify_file
+    }
+    if ! dns_apply; then restore_dns; return 1; fi
+    rm -f "$resolv_tmp" || return 1
+    if [[ "$installed" = true || "$service_touched" = true ]]; then
+        print_summary_row "原 DNS 备份" "$backup"
+    else
+        rm -rf "$backup" || return 1
+    fi
+    print_summary_row "DNS 管理" "静态接管，已禁止自动覆盖"
     result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([[ "$ipv6_enabled" = true ]] && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
 }
 
@@ -1057,6 +1086,7 @@ main() {
     print_summary_row "BBR" "$([[ "$ENABLE_BBR" = true ]] && echo "启用 (fq + bbr)" || echo "切换为 cubic（保留 qdisc）")"
     print_summary_row "Swap" "$([[ "$SWAP_SIZE_MB" = auto ]] && echo '按内存自动配置' || { [[ "$SWAP_SIZE_MB" = 0 ]] && echo '禁用全部（含分区）' || echo "${SWAP_SIZE_MB}MB"; })"
     print_summary_row "DNS" "IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$(has_ipv6 && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
+    print_summary_row "DNS 管理" "统一静态接管，停用 resolved 并禁止自动覆盖"
     print_summary_row "Fail2ban" "$([[ "$ENABLE_FAIL2BAN" = true ]] && echo "SSH 防护：5 分钟内失败 3 次永久封禁" || echo "跳过配置（保持已有服务）")"
     [[ -n "$NEW_SSH_PORT" ]] && print_summary_row "SSH 端口" "$NEW_SSH_PORT"
     print_summary_row "系统升级" "$([[ "$UPGRADE_SYSTEM" = true ]] && echo "是" || echo "否")"
