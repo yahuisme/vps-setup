@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.10.09
+# 版本: v26.10.28
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.10.09"
+SCRIPT_VERSION="v26.10.28"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
@@ -123,7 +123,7 @@ usage() {
 ${BOLD}用法: $0 [选项]${NC}
 
 ${YELLOW}▸ 核心${NC}
-  --hostname <name>        设置主机名（字母、数字、连字符；首尾为字母或数字）
+  --hostname <name>        设置主机名（1-63 字符，字母、数字、连字符；首尾为字母或数字）
   --timezone <tz>          设置时区（如 Asia/Hong_Kong；默认当前时区）
   --swap <size_mb>         设置 Swap 大小（auto / MB；0 禁用全部）
   --ip-dns <'主 备'>        设置 IPv4 DNS
@@ -137,7 +137,7 @@ ${YELLOW}▸ 安全${NC}
   --fail2ban               启用 Fail2ban，保护 SSH
   --no-fail2ban            跳过 Fail2ban 配置（不停止已有服务）
   --ssh-port <port>        设置 SSH 端口（1-65535，无前导零）
-  --ssh-password <pass>    设置 root 密码
+  --ssh-password <pass>    设置 root 密码（单行，建议交互输入）
   --upgrade                执行系统 full-upgrade
   --cleanup                执行 autoremove 和 apt clean
 
@@ -219,7 +219,7 @@ parse_args() {
             -h|--help) [[ $# -eq 1 ]] || usage 2; usage 0 ;;
             --hostname)
                 require_value "$@"
-                [[ "$2" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || {
+                [[ "$2" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || {
                     printf '%b\n' "${RED}无效主机名: $2${NC}" >&2
                     exit 2
                 }
@@ -228,14 +228,19 @@ parse_args() {
                 ;;
             --timezone)
                 require_value "$@"
-                if command -v timedatectl >/dev/null 2>&1 && ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$2"; then
+                if [[ "$2" = *$'\n'* || "$2" = *$'\r'* ]] ||
+                   { command -v timedatectl >/dev/null 2>&1 && ! timedatectl list-timezones 2>/dev/null | grep -Fx -- "$2" >/dev/null; }; then
                     printf '%b\n' "${RED}无效时区: $2${NC}" >&2
                     exit 2
                 fi
                 TIMEZONE="$2"; shift 2 ;;
             --swap)
                 require_value "$@"
-                [[ "$2" = "auto" || "$2" =~ ^(0|[1-9][0-9]*)$ ]] || { printf '%b\n' "${RED}--swap 必须是 auto、0 或正整数 MB${NC}" >&2; exit 2; }
+                # Bound MiB before arithmetic; the resulting byte size must fit signed 64-bit.
+                if [[ "$2" != auto ]] && { [[ ! "$2" =~ ^(0|[1-9][0-9]*)$ || ${#2} -gt 13 ]] || (( $2 > 8796093022207 )); }; then
+                    printf '%b\n' "${RED}--swap 必须是 auto 或 0-8796093022207 MB 的整数${NC}" >&2
+                    exit 2
+                fi
                 SWAP_SIZE_MB="$2"; shift 2 ;;
             --ip-dns)
                 require_value "$@"; read -r PRIMARY_DNS_V4 SECONDARY_DNS_V4 <<< "$2"
@@ -261,7 +266,10 @@ parse_args() {
                 require_value "$@"
                 valid_ssh_port "$2" || { printf '%b\n' "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
                 NEW_SSH_PORT="$2"; shift 2 ;;
-            --ssh-password) require_value "$@"; NEW_SSH_PASSWORD="$2"; shift 2 ;;
+            --ssh-password)
+                require_value "$@"
+                [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || { result_warn "root 密码必须为单行（不含换行或回车）"; exit 2; }
+                NEW_SSH_PASSWORD="$2"; shift 2 ;;
             --upgrade) UPGRADE_SYSTEM=true; shift ;;
             --cleanup) CLEAN_SYSTEM=true; shift ;;
             --non-interactive) non_interactive=true; shift ;;
@@ -311,7 +319,7 @@ configure_hostname() {
     log "  当前主机名：${current_hostname}${NC}"
     local final_hostname="$current_hostname"
     if [[ -n "$NEW_HOSTNAME" ]]; then
-        if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+        if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
             hostnamectl set-hostname "$NEW_HOSTNAME" >> "$LOG_FILE" 2>&1
             final_hostname="$NEW_HOSTNAME"
         fi
@@ -319,12 +327,12 @@ configure_hostname() {
         read -p "修改主机名? [y/N] " -r < /dev/tty
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             read -r -p "新主机名（留空保持当前）: " new_name < /dev/tty
-            if [[ -n "$new_name" && "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+            if [[ -n "$new_name" && "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
                 hostnamectl set-hostname "$new_name" >> "$LOG_FILE" 2>&1
                 final_hostname="$new_name"
                 NEW_HOSTNAME="$new_name"
             elif [[ -n "$new_name" ]]; then
-                result_warn "主机名仅限字母、数字和连字符，首尾须为字母或数字；保持当前：${current_hostname}"
+                result_warn "主机名须为 1-63 字符，仅限字母、数字和连字符，首尾须为字母或数字；保持当前：${current_hostname}"
             fi
         fi
     fi
@@ -852,21 +860,35 @@ configure_ssh() {
         read -r -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty
         echo
     fi
+    if [[ "$NEW_SSH_PASSWORD" = *$'\n'* || "$NEW_SSH_PASSWORD" = *$'\r'* ]]; then
+        result_warn "root 密码必须为单行（不含换行或回车），未修改 SSH 或密码"
+        return 1
+    fi
     if [[ -n "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = true ]]; then
         log "${RED}⚠ 使用 --ssh-password 参数会将密码记录在shell历史中，存在安全风险！${NC}"
     fi
 
+    if [[ -n "$NEW_SSH_PORT" ]]; then
+        local socket_unit
+        for socket_unit in ssh.socket sshd.socket; do
+            if systemctl is-active --quiet "$socket_unit"; then
+                result_warn "检测到活动的 $socket_unit；端口由 socket 管理，未修改 SSH，请先自行配置 socket 监听端口"
+                return 1
+            fi
+        done
+    fi
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
         step_info "安装 openssh-server..."
         DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y openssh-server >> "$LOG_FILE" 2>&1 || return 1
     fi
 
-    local ssh_changed=false ssh_backup="" ssh_dropin="/etc/ssh/sshd_config.d/99-vps-setup.conf"
+    local ssh_changed=false ssh_backup="" ssh_unit="" ssh_dropin="/etc/ssh/sshd_config.d/99-vps-setup.conf"
     restart_ssh_service() {
         local unit
         for unit in ssh.service sshd.service; do
             if systemctl cat "$unit" >/dev/null 2>&1; then
-                if systemctl restart "$unit" >> "$LOG_FILE" 2>&1; then
+                if systemctl restart "$unit" >> "$LOG_FILE" 2>&1 && systemctl is-active --quiet "$unit"; then
+                    ssh_unit="$unit"
                     return 0
                 fi
             fi
@@ -923,7 +945,8 @@ configure_ssh() {
                 return 1
             fi
             sleep 1
-            if ! ss -H -ltn 2>/dev/null | awk '{print $4}' | ssh_remote_listener "$NEW_SSH_PORT"; then
+            if ! systemctl is-active --quiet "$ssh_unit" ||
+               ! ss -H -ltn 2>/dev/null | awk '{print $4}' | ssh_remote_listener "$NEW_SSH_PORT"; then
                 log "${RED}✗ SSH 未监听新端口，正在恢复配置。${NC}"
                 rollback_ssh
                 return 1
@@ -938,7 +961,7 @@ configure_ssh() {
     fi
 
     if [[ -n "$NEW_SSH_PASSWORD" ]]; then
-        echo "root:${NEW_SSH_PASSWORD}" | chpasswd >> "$LOG_FILE" 2>&1 || return 1
+        printf 'root:%s\n' "$NEW_SSH_PASSWORD" | chpasswd >> "$LOG_FILE" 2>&1 || return 1
         result_ok "root 密码已设置"
     fi
 }

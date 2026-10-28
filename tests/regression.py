@@ -68,16 +68,18 @@ class Regression(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_shell(self, names, body):
+    def run_shell(self, names, body, interactive_input=None):
         if 'configure_dns' in names:
             names = [n for n in names if n != 'configure_dns'] + [n for n in FUNCTIONS if n.startswith('dns_')] + ['configure_dns']
         code = '\n'.join(n + '() {\n' + FUNCTIONS[n] for n in names)
         code = re.sub(r'(?<![A-Za-z0-9_$}])/(etc|run|usr|lib|proc)/', lambda m: str(self.root) + '/' + m[1] + '/', code)
         code = re.sub(r'(?<![A-Za-z0-9_$}])/swapfile', str(self.root) + '/swapfile', code)
         code = code.replace('/.dockerenv', str(self.root / '.dockerenv'))
+        if interactive_input is not None:
+            code = code.replace(' < /dev/tty', '')
         fixture = self.root / 'fixture.sh'
         fixture.write_text(COMMON + f"ROOT='{self.root}'\nLOG_FILE='{self.root}/log'\n" + code + '\n' + body)
-        out = subprocess.run(['bash', str(fixture)], capture_output=True, text=True,
+        out = subprocess.run(['bash', str(fixture)], capture_output=True, text=True, input=interactive_input,
                              env={**os.environ, 'TMPDIR': str(self.root / 'tmp')})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr + ((self.root / 'log').read_text() if (self.root / 'log').exists() else ''))
         return out.stdout
@@ -193,7 +195,7 @@ configure_fail2ban
 non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
 sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
 dpkg() { return 0; }
-systemctl() { return 0; }
+systemctl() { [[ "${@: -1}" != *.socket ]]; }
 ss() { if [[ -f "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf" ]]; then
     sshd -T | awk '$1 == "listenaddress" {print "LISTEN 0 128 " $2 " *:*"}'
 fi; }
@@ -201,6 +203,179 @@ fi; }
                 self.assertEqual(dropin.exists(), accepted)
                 out = subprocess.check_output(['/usr/sbin/sshd', '-T', '-f', str(config)], text=True)
                 self.assertIn('passwordauthentication no', out)
+
+    def test_password_is_single_line_before_any_change(self):
+        names = ['valid_ssh_port', 'configure_ssh']
+        for value in ["$'secret\\nother:injected'", "$'secret\\rnext'"]:
+            with self.subTest(value=value):
+                output = self.run_shell(names, f'''non_interactive=true NEW_SSH_PORT='' NEW_SSH_PASSWORD={value}
+printf '# fixture\\n' > "$ROOT/etc/ssh/sshd_config"
+dpkg() {{ return 0; }}
+sshd() {{ return 0; }}
+chpasswd() {{ command cat > "$ROOT/password-input"; }}
+if configure_ssh; then exit 9; fi
+[[ ! -f "$ROOT/password-input" ]]
+''')
+                self.assertNotIn('OK', output)
+                self.assertEqual((self.root / 'calls').read_text(), '')
+        self.run_shell(names, r'''non_interactive=true NEW_SSH_PORT='' NEW_SSH_PASSWORD='colon:back\\slash'
+dpkg() { return 0; }
+chpasswd() { command cat > "$ROOT/password-input"; }
+printf '# fixture\n' > "$ROOT/etc/ssh/sshd_config"
+sshd() { return 0; }
+configure_ssh
+''')
+        self.assertEqual((self.root / 'password-input').read_bytes(), b'root:colon:back\\\\slash\n')
+
+    def test_password_cli_rejects_multiline_without_disclosing_secret(self):
+        for value in ["$'secret\\nother:injected'", "$'secret\\rnext'"]:
+            with self.subTest(value=value):
+                out = self.run_shell(['require_value', 'parse_args'],
+                                     f'if (parse_args --ssh-password {value}); then exit 9; else [[ $? = 2 ]]; fi\n')
+                self.assertNotIn('secret', out)
+                self.assertNotIn('injected', out)
+
+    def test_swap_size_rejects_arithmetic_overflow(self):
+        parsers = ['require_value', 'valid_ipv4', 'valid_ipv6', 'valid_ssh_port', 'parse_args']
+        for value in ['9223372036854775808', '18446744073709551616', '8796093022208', '9' * 100]:
+            with self.subTest(value=value):
+                self.run_shell(parsers, f'if (parse_args --swap {value}); then exit 9; else [[ $? = 2 ]]; fi\n')
+        self.run_shell(parsers, 'parse_args --swap 8796093022207\n[[ "$SWAP_SIZE_MB" = 8796093022207 ]]\n')
+
+    def test_hostname_length_is_validated_before_mutation(self):
+        parsers = ['require_value', 'parse_args']
+        self.run_shell(parsers, 'parse_args --hostname ' + 'a' * 63 + '\n')
+        for value in ['a' * 64, 'a' * 65, '-invalid', 'invalid-']:
+            with self.subTest(value=value):
+                self.run_shell(parsers, f'if (parse_args --hostname {value}); then exit 9; else [[ $? = 2 ]]; fi\n')
+
+    def test_interactive_hostname_and_password_validation(self):
+        output = self.run_shell(['configure_hostname'], r'''
+non_interactive=false NEW_HOSTNAME=''
+hostname() { printf 'current\n'; }
+hostnamectl() { printf 'MUTATION\n' >> "$ROOT/calls"; }
+configure_hostname
+''', interactive_input='y\n' + 'a' * 64 + '\n')
+        self.assertIn('1-63', output)
+        self.assertEqual((self.root / 'calls').read_text(), '')
+        output = self.run_shell(['valid_ssh_port', 'configure_ssh'], r'''
+non_interactive=false NEW_SSH_PORT='' NEW_SSH_PASSWORD=''
+if configure_ssh; then exit 9; fi
+''', interactive_input='\nsecret\rnext\n')
+        self.assertNotIn('secret', output)
+        self.assertEqual((self.root / 'calls').read_text(), '')
+
+    def test_timezone_validation_consumes_full_list(self):
+        # A producer larger than the pipe buffer deterministically exposes grep -q SIGPIPE.
+        self.run_shell(['require_value', 'parse_args'], r'''
+timedatectl() {
+    [[ "$1" = list-timezones ]] || return 99
+    printf 'UTC\n'
+    for ((i=0; i<10000; i++)); do printf 'Example/Zone%s\n' "$i"; done
+}
+parse_args --timezone UTC
+[[ "$TIMEZONE" = UTC ]]
+if (parse_args --timezone invalid); then exit 9; else [[ $? = 2 ]]; fi
+if (parse_args --timezone $'UTC\ninvalid'); then exit 9; else [[ $? = 2 ]]; fi
+''')
+
+    def test_ssh_socket_activation_is_left_untouched(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        dropin = self.root / 'etc/ssh/sshd_config.d/99-vps-setup.conf'
+        config.write_text(f'Include {dropin.parent}/*.conf\n')
+        dropin.write_text('Port 22\n# administrator\n')
+        for socket in ['ssh.socket', 'sshd.socket']:
+            with self.subTest(socket=socket):
+                output = self.run_shell(['valid_ssh_port', 'ssh_remote_listener', 'configure_ssh'], f'ACTIVE_SOCKET={socket}\n' + r'''
+non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
+sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+dpkg() { return 0; }
+systemctl() {
+    if [[ "$1" = is-active ]]; then [[ "${@: -1}" = "$ACTIVE_SOCKET" ]]; return; fi
+    printf 'MUTATION %s\n' "$*" >> "$ROOT/calls"
+}
+ss() { if [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = 'Port 2222' ]]; then printf 'LISTEN 0 128 0.0.0.0:2222 *:*\n'; fi; }
+if configure_ssh; then exit 9; fi
+''')
+                self.assertEqual(dropin.read_text(), 'Port 22\n# administrator\n')
+                self.assertEqual((self.root / 'calls').read_text(), '')
+                self.assertNotIn('OK SSH', output)
+
+    def test_ssh_failed_restart_restores_config_and_keeps_failed_recovery_backup(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        dropin = self.root / 'etc/ssh/sshd_config.d/99-vps-setup.conf'
+        config.write_text(f'Include {dropin.parent}/*.conf\n')
+        original = 'Port 22\n# administrator\n'
+        for recovery in ['true', 'false']:
+            with self.subTest(recovery=recovery):
+                dropin.write_text(original)
+                output = self.run_shell(['valid_ssh_port', 'ssh_remote_listener', 'configure_ssh'], f'RECOVERY={recovery}\n' + r'''
+non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
+sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+dpkg() { return 0; }
+systemctl() {
+    case "$1" in
+        is-active) [[ "${@: -1}" != *.socket ]];;
+        cat) return 0;;
+        restart) printf 'restart\n' >> "$ROOT/restarts"
+            [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = *administrator* && "$RECOVERY" = true ]];;
+        *) return 99;;
+    esac
+}
+ss() { :; }
+if configure_ssh; then exit 9; fi
+''')
+                self.assertEqual(dropin.read_text(), original)
+                self.assertNotIn('OK SSH', output)
+                backups = list(dropin.parent.glob('*.backup.*'))
+                self.assertEqual(len(backups), 0 if recovery == 'true' else 1)
+                if backups: self.assertEqual(backups[0].read_text(), original)
+
+    def test_fail2ban_failed_restart_restores_owned_config(self):
+        body = self.setup_fail2ban()
+        owned = self.root / 'etc/fail2ban/jail.d/99-vps-setup.local'
+        owned.write_text('# administrator\n')
+        body += r'''
+systemctl() {
+    if [[ "$1" = restart ]]; then
+        printf 'restart\n' >> "$ROOT/restarts"
+        grep -q administrator "$ROOT/etc/fail2ban/jail.d/99-vps-setup.local"
+    else return 0; fi
+}
+if configure_fail2ban; then exit 9; fi
+'''
+        output = self.run_shell(['valid_ssh_port', 'configure_fail2ban'], body)
+        self.assertEqual(owned.read_text(), '# administrator\n')
+        self.assertEqual((self.root / 'restarts').read_text().splitlines(), ['restart', 'restart'])
+        self.assertNotIn('OK Fail2ban', output)
+
+    def test_ssh_restart_success_requires_active_service(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        dropin = self.root / 'etc/ssh/sshd_config.d/99-vps-setup.conf'
+        config.write_text(f'Include {dropin.parent}/*.conf\n')
+        dropin.write_text('Port 22\n# administrator\n')
+        for failure_phase in ['immediate', 'after-wait']:
+            with self.subTest(failure_phase=failure_phase):
+                output = self.run_shell(['valid_ssh_port', 'ssh_remote_listener', 'configure_ssh'], f'FAILURE_PHASE={failure_phase}\n' + r'''
+non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
+sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+dpkg() { return 0; }
+sleep() { touch "$ROOT/after-wait"; }
+systemctl() {
+    case "$1" in
+        cat|restart) return 0;;
+        is-active)
+            [[ "${@: -1}" != *.socket ]] || return 1
+            [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = *administrator* ||
+               ( "$FAILURE_PHASE" = after-wait && ! -f "$ROOT/after-wait" ) ]];;
+        *) return 99;;
+    esac
+}
+ss() { if [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = 'Port 2222' ]]; then printf 'LISTEN 0 128 0.0.0.0:2222 *:*\n'; fi; }
+if configure_ssh; then exit 9; fi
+''')
+                self.assertEqual(dropin.read_text(), 'Port 22\n# administrator\n')
+                self.assertNotIn('OK SSH', output)
 
     def test_dns_takes_over_managers(self):
         for manager, header in [('NetworkManager', ''), ('connman', ''), ('resolvconf', ''), ('dhcpcd', ''),
@@ -326,9 +501,12 @@ configure_time_sync
 
     def test_readme_scope_and_defaults(self):
         readme = (REPO / 'README.md').read_text()
-        for required in ['≤512 MiB', '≤1024 MiB', '2048 MiB', '局部回滚', '不是整轮初始化事务', 'search/options', 'ignoreip', '密码登录开关']:
+        for required in ['≤512 MiB', '≤1024 MiB', '2048 MiB', '局部回滚', '不会撤销整轮已完成步骤', 'search/options', 'ignoreip', '密码登录开关']:
             self.assertIn(required, readme)
-        self.assertIn('v26.10.09', readme)
+        version_match = re.search(r'^SCRIPT_VERSION="([^"]+)"$', SOURCE, re.M)
+        self.assertIsNotNone(version_match)
+        assert version_match is not None
+        self.assertIn('# 版本: ' + version_match[1], SOURCE)
         self.assertNotIn('其余为 4 GiB', readme)
 
     def test_swap_probe_failure_is_not_identity(self):
@@ -536,7 +714,7 @@ configure_dns
 non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
 sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
 dpkg() { return 0; }
-systemctl() { return 0; }
+systemctl() { [[ "${@: -1}" != *.socket ]]; }
 ''' + f'''ss() {{ if [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = 'Port 2222' ]]; then printf 'LISTEN 0 128 {endpoint} *:*\\n'; fi; }}
 if configure_ssh; then exit 9; fi
 ''')
