@@ -109,6 +109,19 @@ fail2ban-client() {
         out = subprocess.check_output(['/usr/bin/fail2ban-client', '-c', str(self.root / 'etc/fail2ban'), '-d'], text=True)
         return [ast.literal_eval(line) for line in out.splitlines()]
 
+    def test_fail2ban_rejects_nonmatching_journal_conjunction(self):
+        body = self.setup_fail2ban()
+        owned = self.root / 'etc/fail2ban/jail.d/99-vps-setup.local'
+        for match in ('_COMM=sshd _SYSTEMD_UNIT=not-ssh.service', '_COMM=sshd-other'):
+            with self.subTest(match=match):
+                owned.write_text('# original\n')
+                (self.root / 'etc/fail2ban/jail.d/zz-existing.local').write_text(
+                    '[sshd]\njournalmatch = ' + match + '\n')
+                output = self.run_shell(['valid_ssh_port', 'configure_fail2ban'],
+                                        body + '\nif configure_fail2ban; then exit 9; fi\n')
+                self.assertNotIn('OK Fail2ban', output)
+                self.assertEqual(owned.read_text(), '# original\n')
+
     def test_fail2ban_other_jail_unchanged(self):
         body = self.setup_fail2ban()
         before = [x for x in self.dump_fail2ban() if len(x) > 1 and x[1] == 'nginx-http-auth']
@@ -227,6 +240,13 @@ configure_ssh
 ''')
         self.assertEqual((self.root / 'password-input').read_bytes(), b'root:colon:back\\\\slash\n')
 
+    def test_password_cli_preserves_leading_hyphen(self):
+        self.run_shell(['require_value', 'parse_args'], r'''
+parse_args --ssh-password '-single-line:with\\slash'
+[[ "$NEW_SSH_PASSWORD" = '-single-line:with\\slash' ]]
+if (parse_args --ssh-password); then exit 9; else [[ $? = 2 ]]; fi
+''')
+
     def test_password_cli_rejects_multiline_without_disclosing_secret(self):
         for value in ["$'secret\\nother:injected'", "$'secret\\rnext'"]:
             with self.subTest(value=value):
@@ -235,12 +255,55 @@ configure_ssh
                 self.assertNotIn('secret', out)
                 self.assertNotIn('injected', out)
 
+    def test_fstab_repair_failure_preserves_original_bytes(self):
+        for failure in ('shortwrite', 'rename'):
+            with self.subTest(failure=failure):
+                self.run_shell(['ensure_swap_fstab_entry'], 'FAILURE=' + failure + r'''
+printf '#%01018d' 0 > "$ROOT/etc/fstab"
+chmod 640 "$ROOT/etc/fstab"
+cp -p "$ROOT/etc/fstab" "$ROOT/expected"
+if [[ "$FAILURE" = shortwrite ]]; then
+    trap '' XFSZ
+    ulimit -f 1
+else
+    mv() { return 1; }
+fi
+if ensure_swap_fstab_entry; then exit 9; fi
+cmp "$ROOT/etc/fstab" "$ROOT/expected"
+[[ $(stat -c %a "$ROOT/etc/fstab") = 640 ]]
+[[ -z $(compgen -G "$ROOT/etc/fstab.vps-setup.*") ]]
+''')
+
     def test_swap_size_rejects_arithmetic_overflow(self):
         parsers = ['require_value', 'valid_ipv4', 'valid_ipv6', 'valid_ssh_port', 'parse_args']
         for value in ['9223372036854775808', '18446744073709551616', '8796093022208', '9' * 100]:
             with self.subTest(value=value):
                 self.run_shell(parsers, f'if (parse_args --swap {value}); then exit 9; else [[ $? = 2 ]]; fi\n')
         self.run_shell(parsers, 'parse_args --swap 8796093022207\n[[ "$SWAP_SIZE_MB" = 8796093022207 ]]\n')
+
+    def test_hostname_matches_exact_address_and_preserves_aliases(self):
+        hosts = self.root / 'etc/hosts'
+        hosts.write_text('127.0.0.1 localhost\n127.0.1.10 keep-alias\n'
+                         ' 127.0.1.1 old-host old-host.internal service-alias # keep note\n')
+        self.run_shell(['configure_hostname'], r'''
+non_interactive=true NEW_HOSTNAME=new-host
+hostname() { printf 'old-host\n'; }
+hostnamectl() { return 0; }
+configure_hostname
+''')
+        self.assertIn('127.0.1.10 keep-alias\n', hosts.read_text())
+        self.assertIn('new-host old-host.internal service-alias # keep note\n', hosts.read_text())
+
+    def test_hostname_adds_missing_exact_address(self):
+        hosts = self.root / 'etc/hosts'
+        hosts.write_text('127.0.1.10 keep-alias\n')
+        self.run_shell(['configure_hostname'], r'''
+non_interactive=true NEW_HOSTNAME=new-host
+hostname() { printf 'old-host\n'; }
+hostnamectl() { return 0; }
+configure_hostname
+''')
+        self.assertEqual(hosts.read_text(), '127.0.1.10 keep-alias\n127.0.1.1\tnew-host\n')
 
     def test_hostname_length_is_validated_before_mutation(self):
         parsers = ['require_value', 'parse_args']
@@ -521,11 +584,23 @@ if configure_swap; then exit 9; fi
         self.run_shell(SWAP, r'''SWAP_SIZE_MB=0
 printf '/dev/mock1 none swap sw 0 0\n/dev/mock2 none swap sw 0 0\n' > "$ROOT/etc/fstab"
 cp "$ROOT/etc/fstab" "$ROOT/original"
-swapon() { case "$*" in --show=NAME\ --*) printf '/dev/mock1\n/dev/mock2\n';; --show=NAME,SIZE*) printf '/dev/mock1 1048576\n/dev/mock2 1048576\n';; *) printf 'swapon %s\n' "$*" >> "$ROOT/calls";; esac; }
-swapoff() { [[ "$1" != /dev/mock2 ]]; }
+printf '/dev/mock1\n/dev/mock2\n' > "$ROOT/active-list"
+swapon() {
+    case "$*" in
+        --show=NAME,PRIO*) awk '{print $0, ($0 == "/dev/mock1" ? 10 : 100)}' "$ROOT/active-list";;
+        --show=NAME\ --*) cat "$ROOT/active-list";;
+        --show=NAME,SIZE*) printf '/dev/mock1 1048576\n/dev/mock2 1048576\n';;
+        *) printf 'swapon %s\n' "$*" >> "$ROOT/calls"; printf '%s\n' "${@: -1}" >> "$ROOT/active-list";;
+    esac
+}
+swapoff() {
+    [[ "$1" != /dev/mock2 ]] || return 1
+    grep -Fxv "$1" "$ROOT/active-list" > "$ROOT/active-list.new" || :
+    mv "$ROOT/active-list.new" "$ROOT/active-list"
+}
 if configure_swap; then exit 9; fi
 cmp "$ROOT/original" "$ROOT/etc/fstab"
-grep -Fxq 'swapon /dev/mock1' "$ROOT/calls"
+grep -Fxq 'swapon --priority 10 /dev/mock1' "$ROOT/calls"
 ''')
         parsers = ['require_value', 'usage', 'valid_ipv4', 'valid_ipv6', 'valid_ssh_port', 'parse_args']
         for args in ['--unknown', '--swap', '--ssh-port 022', "--ip-dns '1.1.1.1 999.1.1.1'", "--ip6-dns ':1:2:3:4:5:6:7:8 2001::1'", "--ip-dns $'1.1.1.1 8.8.8.8\\ngarbage'", "--ip-dns '010.1.1.1 8.8.8.8'"]:
@@ -730,6 +805,7 @@ blkid() { printf 'swap\n'; }
 swapon() {
     case "$*" in
         --show=NAME,SIZE*) :;;
+        --show=NAME,PRIO*) [[ ! -f "$ROOT/active" ]] || printf '%s -2\n' "$ROOT/swapfile";;
         --show=NAME*) [[ ! -f "$ROOT/active" ]] || printf '%s\n' "$ROOT/swapfile";;
         *) touch "$ROOT/active";;
     esac

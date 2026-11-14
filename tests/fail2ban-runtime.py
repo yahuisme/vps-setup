@@ -31,7 +31,7 @@ elif args[:2] == ['get', 'sshd']:
         lookup = 'addjournalmatch' if key == 'journalmatch' else key
         for x in commands:
             if x[:3] == ['set', 'sshd', lookup]:
-                print(' '.join(map(str, x[3:])))
+                print(('Current match filter:\n' if key == 'journalmatch' else '') + ' '.join(map(str, x[3:])))
                 break
         else: sys.exit(1)
 else:

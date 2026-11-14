@@ -32,5 +32,5 @@ bash install.sh --non-interactive --hostname my-vps --timezone Asia/Hong_Kong --
 
 - 修改 SSH 端口前先放行防火墙和安全组，保留原连接并另开连接验证；活动的 SSH socket 由管理员配置端口，脚本会拒绝改动。密码须为单行，建议交互输入。
 - DNS 接管会阻止 DHCP/VPN 自动更新，可能影响云内网域名解析。原配置保存在 `/etc/resolv.conf.backup.*`；手动修改前执行 `chattr -i /etc/resolv.conf`。不支持文件锁定时会失败；系统解析库通常最多使用前三个 nameserver。
-- BBR、Swap、DNS、SSH 和 Fail2ban 失败时尝试局部回滚，不会撤销整轮已完成步骤；恢复不完整时按提示保留备份处理。请勿并发运行。
+- BBR、Swap、DNS、SSH 和 Fail2ban 失败时尝试局部回滚，不会撤销整轮已完成步骤；Swap/DNS 捕获 INT/TERM 后也尝试恢复，不保证强杀或断电恢复。恢复不完整时按提示保留备份处理。请勿并发运行。
 - 日志：`/var/log/vps-init-日期时间.log`。

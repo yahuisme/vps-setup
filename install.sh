@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.10.28
+# 版本: v26.11.14
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.10.28"
+SCRIPT_VERSION="v26.11.14"
 TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
@@ -201,11 +201,18 @@ ensure_swap_fstab_entry() {
         END { if (bad || n > 1) exit 1; print n+0 }
     ' /etc/fstab) || { result_warn "fstab 的 /swapfile 条目冲突，请自行整理"; return 1; }
     [[ "$state" = 0 ]] || return 0
-    # Separate an unterminated last line before appending the boot entry.
-    if [[ -s /etc/fstab && -n "$(tail -c 1 /etc/fstab)" ]]; then
-        printf '\n' >> /etc/fstab || return 1
+    # Stage the append so short writes leave the live fstab byte-identical.
+    local staged last_byte
+    staged=$(mktemp /etc/fstab.vps-setup.XXXXXX) || return 1
+    if ! cp -p -- /etc/fstab "$staged"; then rm -f -- "$staged"; return 1; fi
+    last_byte=$(tail -c 1 -- "$staged") || { rm -f -- "$staged"; return 1; }
+    if ! { { [[ -z "$last_byte" ]] || printf '\n'; } &&
+           printf '/swapfile none swap sw 0 0\n'; } >> "$staged" ||
+       ! awk -v path=/swapfile '$1 == path && $2 == "none" && $3 == "swap" && $4 == "sw" && NF == 6 {n++} END {exit (n != 1)}' "$staged" ||
+       ! mv -f -- "$staged" /etc/fstab; then
+        rm -f -- "$staged"
+        return 1
     fi
-    printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
 }
 
 valid_ssh_port() {
@@ -267,7 +274,7 @@ parse_args() {
                 valid_ssh_port "$2" || { printf '%b\n' "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
                 NEW_SSH_PORT="$2"; shift 2 ;;
             --ssh-password)
-                require_value "$@"
+                [[ $# -ge 2 && -n "$2" ]] || { result_warn "选项 --ssh-password 需要一个参数"; exit 2; }
                 [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || { result_warn "root 密码必须为单行（不含换行或回车）"; exit 2; }
                 NEW_SSH_PASSWORD="$2"; shift 2 ;;
             --upgrade) UPGRADE_SYSTEM=true; shift ;;
@@ -337,8 +344,8 @@ configure_hostname() {
         fi
     fi
     if [[ "$final_hostname" != "$current_hostname" ]]; then
-        if grep -q "^127\.0\.1\.1" /etc/hosts; then
-            sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${final_hostname}/" /etc/hosts
+        if grep -qE '^[[:space:]]*127\.0\.1\.1([[:space:]]|$)' /etc/hosts; then
+            sed -i -E "s/^([[:space:]]*127\.0\.1\.1)[[:space:]]+[^[:space:]#]+/\\1\\t${final_hostname}/" /etc/hosts
         else
             printf '%b\n' "127.0.1.1\t${final_hostname}" >> /etc/hosts
         fi
@@ -550,8 +557,10 @@ remove_fstab_swap_entries() {
 configure_swap() {
     section_header "6" "Swap 配置"
     local swap_file="/swapfile" swap_mb="$SWAP_SIZE_MB" current_total_mb=0 size_bytes swap_line
-    local snapshot active_swap new_swap="" backup old_moved=false new_installed=false failed=false
+    local snapshot active_swap new_swap="" backup old_moved=false new_installed=false
     local -a stopped=()
+    local priority options entry_source entry_type entry_options option active_state fstab_entries find_rc=0
+    local -A priorities=() swap_options=()
     # A fixed path is not ownership evidence: never retire unrelated data.
     if [[ -e "$swap_file" || -L "$swap_file" ]]; then
         local swap_type
@@ -591,6 +600,26 @@ configure_swap() {
         fi
     fi
     [[ ! -L "$swap_file" ]] || { result_warn "拒绝替换符号链接 $swap_file"; return 1; }
+    active_state=$(swapon --show=NAME,PRIO --noheadings --raw) || return 1
+    fstab_entries=$(findmnt --fstab --tab-file /etc/fstab --evaluate --noheadings --raw --output SOURCE,FSTYPE,OPTIONS) || find_rc=$?
+    [[ "$find_rc" -le 1 && ( "$find_rc" -eq 0 || -z "$fstab_entries" ) ]] || return 1
+    while read -r active_swap priority; do
+        [[ -n "$active_swap" ]] || continue
+        [[ "$priority" =~ ^-?[0-9]+$ ]] || return 1
+        priorities["$active_swap"]=$priority
+        options=""
+        while read -r entry_source entry_type entry_options; do
+            [[ "$entry_source" = "$active_swap" && "$entry_type" = swap ]] || continue
+            local -a entry_parts=()
+            IFS=, read -r -a entry_parts <<< "$entry_options"
+            for option in "${entry_parts[@]}"; do
+                case "$option" in discard|discard=once|discard=pages) options+="${options:+,}$option";; esac
+            done
+        done <<< "$fstab_entries"
+        swap_options["$active_swap"]=$options
+    done <<< "$active_state"
+    # Linux cannot assign negative priorities: stop lowest first, restore in reverse.
+    active_state=$(LC_ALL=C sort -k2,2n <<< "$active_state") || return 1
     if [[ "$swap_mb" != 0 ]]; then
         check_disk_space $((swap_mb + 100)) || return 1
         new_swap=$(mktemp "${swap_file}.new.XXXXXX") || return 1
@@ -624,11 +653,25 @@ configure_swap() {
             if ! mv -f "$backup/swapfile" "$swap_file"; then swap_file_blocked=true; restore_failed=true; fi
         fi
         cp -a "$backup/fstab" /etc/fstab || restore_failed=true
-        for item in "${stopped[@]}"; do
+        local stopped_index actual_priority
+        for ((stopped_index=${#stopped[@]}-1; stopped_index>=0; stopped_index--)); do
+            item=${stopped[stopped_index]}
             # 冲突路径不能冒充旧 Swap；fstab 和其他旧 Swap 仍独立恢复。
             [[ "$item" != "$swap_file" || "$swap_file_blocked" = false ]] || continue
-            swapon "$item" >> "$LOG_FILE" 2>&1 || restore_failed=true
+            local -a restore_args=()
+            priority=${priorities[$item]}
+            [[ "$priority" -lt 0 ]] || restore_args+=(--priority "$priority")
+            [[ -z "${swap_options[$item]}" ]] || restore_args+=(--options "${swap_options[$item]}")
+            swapon "${restore_args[@]}" "$item" >> "$LOG_FILE" 2>&1 || restore_failed=true
         done
+        if ! remaining=$(swapon --show=NAME,PRIO --noheadings --raw); then
+            restore_failed=true
+        else
+            for item in "${stopped[@]}"; do
+                actual_priority=$(awk -v name="$item" '$1 == name {print $2}' <<< "$remaining")
+                [[ "$actual_priority" = "${priorities[$item]}" ]] || restore_failed=true
+            done
+        fi
         [[ -z "$new_swap" ]] || rm -f "$new_swap"
         if [[ "$restore_failed" = true ]]; then
             result_warn "Swap 恢复不完整，请检查日志及备份：$backup"
@@ -638,28 +681,66 @@ configure_swap() {
         fi
         return 1
     }
-    while IFS= read -r active_swap; do
-        [[ -n "$active_swap" ]] || continue
-        if ! swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then failed=true; break; fi
-        stopped+=("$active_swap")
-    done <<< "$snapshot"
-    if [[ "$failed" = true ]]; then rollback_swap; return 1; fi
-    if [[ -e "$swap_file" ]]; then
-        if ! mv "$swap_file" "$backup/swapfile"; then rollback_swap; return 1; fi
-        old_moved=true
+    local signal_rc=0 saved_int saved_term
+    saved_int=$(trap -p INT); saved_term=$(trap -p TERM)
+    # A trap only records cancellation: finish recording the command's real outcome
+    # before recovery, otherwise mv/swapoff can outlive or undo the rollback.
+    trap 'signal_rc=130' INT
+    trap 'signal_rc=143' TERM
+    swap_restore_traps() {
+        trap - INT TERM
+        [[ -z "$saved_int" ]] || eval "$saved_int"
+        [[ -z "$saved_term" ]] || eval "$saved_term"
+        return 0
+    }
+    swap_apply() {
+        local remaining final_swap
+        while read -r active_swap priority; do
+            [[ -n "$active_swap" ]] || continue
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            if swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
+                stopped+=("$active_swap")
+            else
+                # An interrupted command can fail after completing its mutation.
+                if remaining=$(swapon --show=NAME --noheadings --raw) &&
+                   ! grep -Fxq "$active_swap" <<< "$remaining"; then stopped+=("$active_swap"); fi
+                return 1
+            fi
+            [[ "$signal_rc" -eq 0 ]] || return 1
+        done <<< "$active_state"
+        if [[ -e "$swap_file" ]]; then
+            if mv "$swap_file" "$backup/swapfile"; then old_moved=true
+            else
+                [[ ! -e "$backup/swapfile" ]] || old_moved=true
+                return 1
+            fi
+            [[ "$signal_rc" -eq 0 ]] || return 1
+        fi
+        remove_fstab_swap_entries || return 1
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        if [[ "$swap_mb" != 0 ]]; then
+            if mv "$new_swap" "$swap_file"; then new_installed=true
+            else
+                [[ ! -e "$swap_file" ]] || new_installed=true
+                return 1
+            fi
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            swapon "$swap_file" >> "$LOG_FILE" 2>&1 || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            ensure_swap_fstab_entry || return 1
+        fi
+        final_swap=$(swapon --show=NAME --noheadings --raw) || return 1
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        if [[ "$swap_mb" = 0 ]]; then [[ -z "$final_swap" ]]
+        else [[ "$final_swap" = "$swap_file" ]]; fi
+    }
+    if ! swap_apply || [[ "$signal_rc" -ne 0 ]]; then
+        rollback_swap || :
+        swap_restore_traps
+        [[ "$signal_rc" -eq 0 ]] || return "$signal_rc"
+        return 1
     fi
-    if ! remove_fstab_swap_entries; then rollback_swap; return 1; fi
-    if [[ "$swap_mb" != 0 ]]; then
-        if ! mv "$new_swap" "$swap_file"; then rollback_swap; return 1; fi
-        new_installed=true
-        if ! swapon "$swap_file" >> "$LOG_FILE" 2>&1 || ! ensure_swap_fstab_entry; then rollback_swap; return 1; fi
-    fi
-    local final_swap
-    if ! final_swap=$(swapon --show=NAME --noheadings --raw) ||
-       { [[ "$swap_mb" = 0 ]] && [[ -n "$final_swap" ]]; } ||
-       { [[ "$swap_mb" != 0 ]] && [[ "$final_swap" != "$swap_file" ]]; }; then
-        rollback_swap; return 1
-    fi
+    swap_restore_traps
     rm -rf "$backup" || return 1
     if [[ "$swap_mb" = 0 ]]; then
         result_ok "全部 Swap 已禁用，Swap 启动条目及 /swapfile 已移除"
@@ -802,25 +883,51 @@ configure_dns() {
     dns_apply() {
         if [[ "$unchanged" != true ]]; then
             if [[ "$old_immutable" = true ]]; then
-                chattr -i -- "$resolv_file" >> "$LOG_FILE" 2>&1 || return 1
                 unlocked=true
+                chattr -i -- "$resolv_file" >> "$LOG_FILE" 2>&1 || return 1
+                [[ "$signal_rc" -eq 0 ]] || return 1
             fi
-            mv -fT -- "$resolv_tmp" "$resolv_file" || return 1
-            installed=true
+            if mv -fT -- "$resolv_tmp" "$resolv_file"; then installed=true
+            else
+                [[ -e "$resolv_tmp" ]] || installed=true
+                return 1
+            fi
+            [[ "$signal_rc" -eq 0 ]] || return 1
             chattr +i -- "$resolv_file" >> "$LOG_FILE" 2>&1 || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
         fi
         # Mask even an inactive/absent resolved so a later boot cannot revive old DNS.
         if [[ ! -L "$unit" || "$(readlink -- "$unit")" != /dev/null || "$old_active" = true ]]; then
             service_touched=true
             rm -f -- "$unit" || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
             systemctl mask --now systemd-resolved.service >> "$LOG_FILE" 2>&1 || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
         fi
         [[ -L "$unit" && "$(readlink -- "$unit")" = /dev/null ]] || return 1
         service_state=$(dns_resolved_state) || return 1
         [[ "$service_state" = inactive ]] || return 1
-        dns_verify_file
+        dns_verify_file || return 1
+        [[ "$signal_rc" -eq 0 ]]
     }
-    if ! dns_apply; then restore_dns; return 1; fi
+    local signal_rc=0 saved_int saved_term
+    saved_int=$(trap -p INT); saved_term=$(trap -p TERM)
+    # Defer local recovery until the in-flight command and its state flags agree.
+    trap 'signal_rc=130' INT
+    trap 'signal_rc=143' TERM
+    dns_restore_traps() {
+        trap - INT TERM
+        [[ -z "$saved_int" ]] || eval "$saved_int"
+        [[ -z "$saved_term" ]] || eval "$saved_term"
+        return 0
+    }
+    if ! dns_apply || [[ "$signal_rc" -ne 0 ]]; then
+        restore_dns || :
+        dns_restore_traps
+        [[ "$signal_rc" -eq 0 ]] || return "$signal_rc"
+        return 1
+    fi
+    dns_restore_traps
     rm -f "$resolv_tmp" || return 1
     if [[ "$installed" = true || "$service_touched" = true ]]; then
         print_summary_row "原 DNS 备份" "$backup"
@@ -1042,7 +1149,19 @@ EOF
         [[ "$actual" = -1 ]] || return 1
         # A file backend cannot answer journalmatch; do not accept a silent override.
         actual=$(fail2ban-client get sshd journalmatch 2>>"$LOG_FILE") || return 1
-        [[ "$actual" = *'_COMM=sshd'* || "$actual" = *'_SYSTEMD_UNIT=ssh.service'* ]] || return 1
+        # Require an unqualified SSH branch, not a substring inside a
+        # contradictory AND clause or a different process name.
+        awk '
+            function finish() { if (count && ssh && !extra) good=1; count=ssh=extra=0 }
+            /^Current match filter:/ { next }
+            { for (i=1; i<=NF; i++) {
+                if ($i == "+") { finish(); continue }
+                count++
+                if ($i ~ /^(_COMM=sshd|_COMM=sshd-session|_SYSTEMD_UNIT=ssh[.]service|_SYSTEMD_UNIT=sshd[.]service)$/) ssh=1
+                else extra=1
+            } }
+            END { finish(); exit !good }
+        ' <<< "$actual" || return 1
         actions=$(fail2ban-client get sshd actions 2>>"$LOG_FILE") || return 1
         actions=$(printf '%s\n' "$actions" | sed '/^The jail /d' | tr ',' '\n') || return 1
         while IFS= read -r action; do
