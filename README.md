@@ -1,6 +1,6 @@
 # vps-setup
 
-版本：v26.11.19
+版本：`v26.11.19`
 
 一键初始化 Debian / Ubuntu VPS：安装基础工具，配置时间同步、BBR、Swap、DNS 和 SSH 防护。
 
