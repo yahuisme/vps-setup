@@ -2,14 +2,14 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.11.14
+# 版本: v26.11.19
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.11.14"
-TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
+SCRIPT_VERSION="v26.11.19"
+TIMEZONE=""
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates)
 PRIMARY_DNS_V4="1.1.1.1"
@@ -49,14 +49,9 @@ format_duration() {
 }
 
 section_header() {
-    local number="$1" title="$2" text
-    if [[ -n "$title" ]]; then
-        text="${number:+${number}. }${title}"
-    else
-        text="${number}"
-    fi
+    local number="$1" title="$2"
     log ""
-    log "${BOLD}${text}${NC}"
+    log "${BOLD}${number:+${number}. }${title}${NC}"
 }
 
 print_summary_row() {
@@ -117,9 +112,9 @@ is_kernel_version_ge() {
 }
 
 usage() {
-    local exit_code="${1:-0}" out=/dev/stdout
-    [[ "$exit_code" -eq 0 ]] || out=/dev/stderr
-    cat > "$out" << EOF
+    local exit_code="${1:-0}" out=1
+    [[ "$exit_code" -eq 0 ]] || out=2
+    cat >&"$out" << EOF
 ${BOLD}用法: $0 [选项]${NC}
 
 ${YELLOW}▸ 核心${NC}
@@ -167,6 +162,7 @@ require_value() {
 
 valid_ipv4() {
     local ip="$1" octet
+    local -a octets
     [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
     IFS=. read -ra octets <<< "$ip"
     for octet in "${octets[@]}"; do
@@ -194,22 +190,32 @@ valid_ipv6() {
     fi
 }
 
+append_line_break() {
+    local last_byte
+    last_byte=$(tail -c 1 -- "$1") || return 1
+    [[ -z "$last_byte" ]] || printf '\n' >> "$1"
+}
+
+append_swap_fstab_entry() {
+    append_line_break "$1" && printf '/swapfile none swap sw 0 0\n' >> "$1" || return 1
+    awk -v path=/swapfile '$1 == path {
+        n++; if ($2 != "none" || $3 != "swap" || $4 != "sw" || $5 != 0 || $6 != 0 || NF != 6) bad=1
+    } END {exit (bad || n != 1)}' "$1"
+}
+
 ensure_swap_fstab_entry() {
-    local state
+    local state fstab_real
+    fstab_real=$(realpath -e -- /etc/fstab) && [[ -f "$fstab_real" ]] || return 1
     state=$(awk -v path=/swapfile '
         $1 == path { n++; if ($3 != "swap" || NF < 4 || $4 ~ /(^|,)noauto(,|$)/) bad=1 }
         END { if (bad || n > 1) exit 1; print n+0 }
-    ' /etc/fstab) || { result_warn "fstab 的 /swapfile 条目冲突，请自行整理"; return 1; }
+    ' "$fstab_real") || { result_warn "fstab 的 /swapfile 条目冲突，请自行整理"; return 1; }
     [[ "$state" = 0 ]] || return 0
     # Stage the append so short writes leave the live fstab byte-identical.
-    local staged last_byte
-    staged=$(mktemp /etc/fstab.vps-setup.XXXXXX) || return 1
-    if ! cp -p -- /etc/fstab "$staged"; then rm -f -- "$staged"; return 1; fi
-    last_byte=$(tail -c 1 -- "$staged") || { rm -f -- "$staged"; return 1; }
-    if ! { { [[ -z "$last_byte" ]] || printf '\n'; } &&
-           printf '/swapfile none swap sw 0 0\n'; } >> "$staged" ||
-       ! awk -v path=/swapfile '$1 == path && $2 == "none" && $3 == "swap" && $4 == "sw" && NF == 6 {n++} END {exit (n != 1)}' "$staged" ||
-       ! mv -f -- "$staged" /etc/fstab; then
+    local staged
+    staged=$(mktemp "${fstab_real}.vps-setup.XXXXXX") || return 1
+    if ! cp -p -- "$fstab_real" "$staged" || ! append_swap_fstab_entry "$staged" ||
+       ! mv -fT -- "$staged" "$fstab_real"; then
         rm -f -- "$staged"
         return 1
     fi
@@ -296,10 +302,11 @@ pre_flight_checks() {
     # shellcheck source=/dev/null
     source /etc/os-release
     local supported=false
-    [[ "$ID" = "debian" && "$VERSION_ID" =~ ^(10|11|12|13)$ ]] && supported=true
-    [[ "$ID" = "ubuntu" && "$VERSION_ID" =~ ^(20\.04|22\.04|24\.04|26\.04)$ ]] && supported=true
+    local os_name="${PRETTY_NAME:-${ID:-未知}}"
+    [[ "${ID:-}" = debian && "${VERSION_ID:-}" =~ ^(10|11|12|13)$ ]] && supported=true
+    [[ "${ID:-}" = ubuntu && "${VERSION_ID:-}" =~ ^(20\.04|22\.04|24\.04|26\.04)$ ]] && supported=true
     if [[ "$supported" = "false" ]]; then
-        log "${YELLOW}⚠ 系统: ${PRETTY_NAME} (建议使用Debian 10-13或Ubuntu 20.04-26.04)${NC}"
+        log "${YELLOW}⚠ 系统: ${os_name} (建议使用Debian 10-13或Ubuntu 20.04-26.04)${NC}"
         if [[ "$non_interactive" = true ]]; then
             log "${RED}✗ 非交互模式不支持当前系统，已中止${NC}"
             exit 1
@@ -307,7 +314,7 @@ pre_flight_checks() {
         read -p "继续? [y/N] " -r < /dev/tty
         [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 0
     fi
-    result_ok "系统: ${PRETTY_NAME}"
+    result_ok "系统: ${os_name}"
 }
 
 install_packages() {
@@ -345,8 +352,12 @@ configure_hostname() {
     fi
     if [[ "$final_hostname" != "$current_hostname" ]]; then
         if grep -qE '^[[:space:]]*127\.0\.1\.1([[:space:]]|$)' /etc/hosts; then
-            sed -i -E "s/^([[:space:]]*127\.0\.1\.1)[[:space:]]+[^[:space:]#]+/\\1\\t${final_hostname}/" /etc/hosts
+            sed -i -E "/^[[:space:]]*127\.0\.1\.1([[:space:]]|$)/ {
+                s/^([[:space:]]*127\.0\.1\.1)[[:space:]]+[^[:space:]#]+/\\1\\t${final_hostname}/; t
+                s/^([[:space:]]*127\.0\.1\.1)/\\1\\t${final_hostname}/
+            }" /etc/hosts
         else
+            append_line_break /etc/hosts || return 1
             printf '%b\n' "127.0.1.1\t${final_hostname}" >> /etc/hosts
         fi
         result_ok "主机名设为: ${final_hostname}"
@@ -357,8 +368,12 @@ configure_hostname() {
 
 configure_timezone() {
     section_header "3" "时区配置"
+    if [[ -z "$TIMEZONE" ]]; then
+        step_info "时区保持当前"
+        return 0
+    fi
     step_info "设置时区：${TIMEZONE}"
-    timedatectl set-timezone "$TIMEZONE" >> "$LOG_FILE" 2>&1
+    timedatectl set-timezone "$TIMEZONE" >> "$LOG_FILE" 2>&1 || return 1
     result_ok "时区已设置：${TIMEZONE}"
 }
 
@@ -440,6 +455,8 @@ configure_bbr() {
         done <<< "$keys"
         printf '%s\n' "${runtime[@]}" > "$backup/runtime" || return 1
         config_target=$(readlink -m -- "$config_file") || return 1
+        # Reject an invalid owned symlink even if an earlier alias resolves to it too.
+        [[ ! -L "$config_file" || -f "$config_target" ]] || return 1
         # Include shadowed files too, so removing a higher-priority file cannot revive conflicts.
         for dir in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
             for file in "$dir"/*.conf; do
@@ -456,7 +473,7 @@ configure_bbr() {
             [[ ! ${seen[$resolved]+yes} ]] || continue
             seen[$resolved]=1
             # /dev/null masks are not configuration files; other special/dangling targets fail closed.
-            [[ "$resolved" != /dev/null ]] || { [[ "$file" != "$config_file" ]] && continue; return 1; }
+            [[ "$resolved" != /dev/null ]] || continue
             if [[ -e "$resolved" ]]; then
                 [[ -f "$resolved" ]] || return 1
             elif [[ "$file" != "$config_file" || -L "$file" ]]; then
@@ -469,16 +486,16 @@ configure_bbr() {
                 cat "$backup/target" > "$backup/new.$i" || return 1
             fi
             if [[ -f "$resolved" ]]; then
-                cp -a -- "$resolved" "$backup/old.$i" || return 1
                 if [[ "$resolved" = "$config_target" ]]; then
                     bbr_filter "$keys" "$resolved" replace >> "$backup/new.$i" || return 1
                 else
                     bbr_filter "$keys" "$resolved" >> "$backup/new.$i" || return 1
                 fi
-                if cmp -s -- "$backup/old.$i" "$backup/new.$i"; then
-                    rm -f -- "$backup/old.$i" "$backup/new.$i" || return 1
+                if cmp -s -- "$resolved" "$backup/new.$i"; then
+                    rm -f -- "$backup/new.$i" || return 1
                     continue
                 fi
+                cp -a -- "$resolved" "$backup/old.$i" || return 1
                 retain_backup=true
             fi
             files+=("$resolved")
@@ -497,7 +514,7 @@ configure_bbr() {
             cat "$backup/new.$i" > "$tmp" || return 1
             # Track before rename: even a failed/partially completed operation must be recovered.
             changed+=("$i")
-            mv -f -- "$tmp" "$file" || return 1
+            mv -fT -- "$tmp" "$file" || return 1
             tmp=""
         done
         for i in "${!files[@]}"; do
@@ -551,16 +568,16 @@ configure_bbr() {
 }
 
 remove_fstab_swap_entries() {
-    sed -i -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]\|$)|d' /etc/fstab
+    sed -E '\|^[[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]\|$)|d' "$1"
 }
 
 configure_swap() {
     section_header "6" "Swap 配置"
     local swap_file="/swapfile" swap_mb="$SWAP_SIZE_MB" current_total_mb=0 size_bytes swap_line
-    local snapshot active_swap new_swap="" backup old_moved=false new_installed=false
-    local -a stopped=()
+    local active_swap new_swap="" backup old_moved=false new_installed=false
+    local managed_active=false fstab_real fstab_staged
     local priority options entry_source entry_type entry_options option active_state fstab_entries find_rc=0
-    local -A priorities=() swap_options=()
+    local -A swap_options=()
     # A fixed path is not ownership evidence: never retire unrelated data.
     if [[ -e "$swap_file" || -L "$swap_file" ]]; then
         local swap_type
@@ -570,7 +587,7 @@ configure_swap() {
             return 1
         fi
     fi
-    snapshot=$(swapon --show=NAME --noheadings --raw) || return 1
+
     if [[ "$swap_mb" = auto ]]; then
         local mem_mb
         mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo) || return 1
@@ -585,9 +602,10 @@ configure_swap() {
         size_bytes=${swap_line##* }
         [[ "$size_bytes" =~ ^[0-9]+$ ]] || return 1
         current_total_mb=$((current_total_mb + (size_bytes + 524288) / 1048576))
+        if [[ "${swap_line% *}" = "$swap_file" ]]; then managed_active=true; fi
     done <<< "$sizes"
     if [[ "$swap_mb" != 0 && "$current_total_mb" -eq "$swap_mb" ]]; then
-        if grep -Fxq "$swap_file" <<< "$snapshot"; then ensure_swap_fstab_entry || return 1; fi
+        if [[ "$managed_active" = true ]]; then ensure_swap_fstab_entry || return 1; fi
         result_ok "现有 Swap 与目标一致（${swap_mb}MB），保留"
         return 0
     fi
@@ -599,14 +617,14 @@ configure_swap() {
             result_warn "容量不一致，将停用全部现有 Swap（含分区），统一替换为 /swapfile"
         fi
     fi
-    [[ ! -L "$swap_file" ]] || { result_warn "拒绝替换符号链接 $swap_file"; return 1; }
+
+    fstab_real=$(realpath -e -- /etc/fstab) && [[ -f "$fstab_real" ]] || return 1
     active_state=$(swapon --show=NAME,PRIO --noheadings --raw) || return 1
-    fstab_entries=$(findmnt --fstab --tab-file /etc/fstab --evaluate --noheadings --raw --output SOURCE,FSTYPE,OPTIONS) || find_rc=$?
+    fstab_entries=$(findmnt --fstab --tab-file "$fstab_real" --evaluate --noheadings --raw --output SOURCE,FSTYPE,OPTIONS) || find_rc=$?
     [[ "$find_rc" -le 1 && ( "$find_rc" -eq 0 || -z "$fstab_entries" ) ]] || return 1
     while read -r active_swap priority; do
         [[ -n "$active_swap" ]] || continue
         [[ "$priority" =~ ^-?[0-9]+$ ]] || return 1
-        priorities["$active_swap"]=$priority
         options=""
         while read -r entry_source entry_type entry_options; do
             [[ "$entry_source" = "$active_swap" && "$entry_type" = swap ]] || continue
@@ -631,12 +649,19 @@ configure_swap() {
     fi
     # 同一文件系统保存旧文件，提交前不删除；只清理本次创建的路径。
     backup=$(mktemp -d "${swap_file}.backup.XXXXXX") || { [[ -z "$new_swap" ]] || rm -f "$new_swap"; return 1; }
-    if ! cp -a /etc/fstab "$backup/fstab"; then
-        [[ -z "$new_swap" ]] || rm -f "$new_swap"
-        rmdir "$backup"; return 1
+    fstab_staged=$(mktemp "${fstab_real}.vps-setup.XXXXXX") || {
+        [[ -z "$new_swap" ]] || rm -f -- "$new_swap"
+        rmdir -- "$backup"; return 1
+    }
+    if ! cp -p -- "$fstab_real" "$backup/fstab" || ! cp -p -- "$backup/fstab" "$fstab_staged" ||
+       ! remove_fstab_swap_entries "$backup/fstab" > "$fstab_staged" ||
+       { [[ "$swap_mb" != 0 ]] && ! append_swap_fstab_entry "$fstab_staged"; }; then
+        [[ -z "$new_swap" ]] || rm -f -- "$new_swap"
+        rm -rf -- "$backup" "$fstab_staged"; return 1
     fi
     rollback_swap() {
-        local restore_failed=false swap_file_blocked=false item remaining
+        local restore_failed=false swap_file_blocked=false item remaining reverse_snapshot path attempt
+        local -A active_names=()
         if [[ "$new_installed" = true ]]; then
             if ! swapoff "$swap_file" >> "$LOG_FILE" 2>&1; then
                 if ! remaining=$(swapon --show=NAME --noheadings --raw) || grep -Fxq "$swap_file" <<< "$remaining"; then
@@ -652,27 +677,37 @@ configure_swap() {
         if [[ "$old_moved" = true && "$swap_file_blocked" = false ]]; then
             if ! mv -f "$backup/swapfile" "$swap_file"; then swap_file_blocked=true; restore_failed=true; fi
         fi
-        cp -a "$backup/fstab" /etc/fstab || restore_failed=true
-        local stopped_index actual_priority
-        for ((stopped_index=${#stopped[@]}-1; stopped_index>=0; stopped_index--)); do
-            item=${stopped[stopped_index]}
-            # 冲突路径不能冒充旧 Swap；fstab 和其他旧 Swap 仍独立恢复。
-            [[ "$item" != "$swap_file" || "$swap_file_blocked" = false ]] || continue
-            local -a restore_args=()
-            priority=${priorities[$item]}
-            [[ "$priority" -lt 0 ]] || restore_args+=(--priority "$priority")
-            [[ -z "${swap_options[$item]}" ]] || restore_args+=(--options "${swap_options[$item]}")
-            swapon "${restore_args[@]}" "$item" >> "$LOG_FILE" 2>&1 || restore_failed=true
+        if [[ ! -e "$fstab_staged" ]] &&
+           ! { cp -p -- "$backup/fstab" "$fstab_staged" && mv -fT -- "$fstab_staged" "$fstab_real"; }; then
+            restore_failed=true
+        fi
+        # A failed swapoff may have completed. Retry readback, not activation.
+        for ((attempt=0; attempt<3; attempt++)); do
+            remaining=$(swapon --show=NAME,PRIO --noheadings --raw) && break
         done
-        if ! remaining=$(swapon --show=NAME,PRIO --noheadings --raw); then
+        if (( attempt == 3 )) || ! reverse_snapshot=$(tac <<< "$active_state"); then
             restore_failed=true
         else
-            for item in "${stopped[@]}"; do
-                actual_priority=$(awk -v name="$item" '$1 == name {print $2}' <<< "$remaining")
-                [[ "$actual_priority" = "${priorities[$item]}" ]] || restore_failed=true
-            done
+            while read -r item _; do
+                [[ -z "$item" ]] || active_names["$item"]=1
+            done <<< "$remaining"
+            while read -r item priority; do
+                [[ -n "$item" && -z "${active_names[$item]:-}" ]] || continue
+                printf -v path '%b' "$item"
+                # 冲突路径不能冒充旧 Swap；fstab 和其他旧 Swap 仍独立恢复。
+                [[ "$path" != "$swap_file" || "$swap_file_blocked" = false ]] || continue
+                local -a restore_args=()
+                [[ "$priority" -lt 0 ]] || restore_args+=(--priority "$priority")
+                [[ -z "${swap_options[$item]}" ]] || restore_args+=(--options "${swap_options[$item]}")
+                swapon "${restore_args[@]}" "$path" >> "$LOG_FILE" 2>&1 || restore_failed=true
+            done <<< "$reverse_snapshot"
+            if ! remaining=$(swapon --show=NAME,PRIO --noheadings --raw | LC_ALL=C sort -k2,2n) ||
+               [[ "$remaining" != "$active_state" ]]; then
+                restore_failed=true
+            fi
         fi
-        [[ -z "$new_swap" ]] || rm -f "$new_swap"
+        [[ -z "$new_swap" ]] || rm -f -- "$new_swap" || restore_failed=true
+        rm -f -- "$fstab_staged" || restore_failed=true
         if [[ "$restore_failed" = true ]]; then
             result_warn "Swap 恢复不完整，请检查日志及备份：$backup"
         else
@@ -694,18 +729,13 @@ configure_swap() {
         return 0
     }
     swap_apply() {
-        local remaining final_swap
+        local final_swap path
         while read -r active_swap priority; do
             [[ -n "$active_swap" ]] || continue
             [[ "$signal_rc" -eq 0 ]] || return 1
-            if swapoff "$active_swap" >> "$LOG_FILE" 2>&1; then
-                stopped+=("$active_swap")
-            else
-                # An interrupted command can fail after completing its mutation.
-                if remaining=$(swapon --show=NAME --noheadings --raw) &&
-                   ! grep -Fxq "$active_swap" <<< "$remaining"; then stopped+=("$active_swap"); fi
-                return 1
-            fi
+            # Keep raw names for comparisons; decode util-linux escapes only for argv.
+            printf -v path '%b' "$active_swap"
+            swapoff "$path" >> "$LOG_FILE" 2>&1 || return 1
             [[ "$signal_rc" -eq 0 ]] || return 1
         done <<< "$active_state"
         if [[ -e "$swap_file" ]]; then
@@ -716,8 +746,6 @@ configure_swap() {
             fi
             [[ "$signal_rc" -eq 0 ]] || return 1
         fi
-        remove_fstab_swap_entries || return 1
-        [[ "$signal_rc" -eq 0 ]] || return 1
         if [[ "$swap_mb" != 0 ]]; then
             if mv "$new_swap" "$swap_file"; then new_installed=true
             else
@@ -727,12 +755,18 @@ configure_swap() {
             [[ "$signal_rc" -eq 0 ]] || return 1
             swapon "$swap_file" >> "$LOG_FILE" 2>&1 || return 1
             [[ "$signal_rc" -eq 0 ]] || return 1
-            ensure_swap_fstab_entry || return 1
         fi
         final_swap=$(swapon --show=NAME --noheadings --raw) || return 1
         [[ "$signal_rc" -eq 0 ]] || return 1
-        if [[ "$swap_mb" = 0 ]]; then [[ -z "$final_swap" ]]
-        else [[ "$final_swap" = "$swap_file" ]]; fi
+        if [[ "$swap_mb" = 0 ]]; then [[ -z "$final_swap" ]] || return 1
+        else [[ "$final_swap" = "$swap_file" ]] || return 1; fi
+        # Detect edits made while Swap was changing; comparison and rename are not a CAS.
+        if [[ "$(realpath -e -- /etc/fstab)" != "$fstab_real" ]] || ! cmp -s -- "$backup/fstab" "$fstab_real"; then
+            result_warn "fstab 已被其他操作修改或无法读取，保留其内容并恢复活动 Swap"
+            return 1
+        fi
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        mv -fT -- "$fstab_staged" "$fstab_real"
     }
     if ! swap_apply || [[ "$signal_rc" -ne 0 ]]; then
         rollback_swap || :
@@ -763,8 +797,8 @@ dns_resolved_state() {
         case "$line" in LoadState=*) load=${line#*=};; ActiveState=*) active=${line#*=};; esac
     done <<< "$reply"
     case "$load:$active" in
-        loaded:active|masked:active) printf 'active\n';;
-        loaded:inactive|masked:inactive|not-found:inactive|loaded:failed|masked:failed) printf 'inactive\n';;
+        loaded:active|masked:active) printf '%s:active\n' "$load";;
+        loaded:inactive|masked:inactive|not-found:inactive|loaded:failed|masked:failed) printf '%s:inactive\n' "$load";;
         *) return 1;;
     esac
 }
@@ -802,7 +836,7 @@ configure_dns() {
         fi
     fi
     service_state=$(dns_resolved_state) || { result_warn "无法确认 DNS 服务状态，未修改"; return 1; }
-    [[ "$service_state" != active ]] || old_active=true
+    [[ "$service_state" != *:active ]] || old_active=true
     if [[ -L "$runtime_unit" && "$(readlink -- "$runtime_unit")" = /dev/null ]]; then runtime_mask=true; fi
     resolv_tmp=$(mktemp "${resolv_file}.vps-setup.XXXXXX") || return 1
     if ! {
@@ -813,6 +847,12 @@ configure_dns() {
         rm -f "$resolv_tmp"; return 1
     fi
     if [[ "$old_immutable" = true ]] && cmp -s "$resolv_tmp" "$resolv_file"; then unchanged=true; fi
+    if [[ "$unchanged" = true && "$service_state" = masked:inactive && -L "$unit" && "$(readlink -- "$unit")" = /dev/null ]]; then
+        # The successful state query and byte comparison already verified the current state.
+        rm -f -- "$resolv_tmp" || return 1
+        dns_report "$ipv6_enabled"
+        return 0
+    fi
     # Keep the original link object and service mask, not the generated link target.
     backup=$(mktemp -d "${resolv_file}.backup.XXXXXX") || { rm -f "$resolv_tmp"; return 1; }
     dns_snapshot() {
@@ -868,7 +908,7 @@ configure_dns() {
                     systemctl daemon-reload >> "$LOG_FILE" 2>&1 || failed=true
                 fi
                 service_state=$(dns_resolved_state) || failed=true
-                [[ "$service_state" = active ]] || failed=true
+                [[ "$service_state" = *:active ]] || failed=true
             fi
         fi
         rm -f "$resolv_tmp" || failed=true
@@ -897,16 +937,23 @@ configure_dns() {
             [[ "$signal_rc" -eq 0 ]] || return 1
         fi
         # Mask even an inactive/absent resolved so a later boot cannot revive old DNS.
-        if [[ ! -L "$unit" || "$(readlink -- "$unit")" != /dev/null || "$old_active" = true ]]; then
+        if [[ ! -L "$unit" || "$(readlink -- "$unit")" != /dev/null ]]; then
             service_touched=true
             rm -f -- "$unit" || return 1
             [[ "$signal_rc" -eq 0 ]] || return 1
             systemctl mask --now systemd-resolved.service >> "$LOG_FILE" 2>&1 || return 1
             [[ "$signal_rc" -eq 0 ]] || return 1
+        elif [[ "$service_state" != masked:inactive ]]; then
+            service_touched=true
+            systemctl daemon-reload >> "$LOG_FILE" 2>&1 || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            if [[ "$old_active" = true ]]; then
+                systemctl stop systemd-resolved.service >> "$LOG_FILE" 2>&1 || return 1
+            fi
         fi
         [[ -L "$unit" && "$(readlink -- "$unit")" = /dev/null ]] || return 1
         service_state=$(dns_resolved_state) || return 1
-        [[ "$service_state" = inactive ]] || return 1
+        [[ "$service_state" = masked:inactive ]] || return 1
         dns_verify_file || return 1
         [[ "$signal_rc" -eq 0 ]]
     }
@@ -934,24 +981,60 @@ configure_dns() {
     else
         rm -rf "$backup" || return 1
     fi
-    print_summary_row "DNS 管理" "静态接管，已禁止自动覆盖"
-    result_ok "DNS 配置完成：IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$([[ "$ipv6_enabled" = true ]] && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
+    dns_report "$ipv6_enabled"
 }
 
-# Input: one numeric address:port per line (sshd -T or ss).
-ssh_remote_listener() {
-    awk -v port="$1" -v strict="${2:-false}" '
-        {
-            endpoint=$1; p=endpoint; sub(/^.*:/, "", p)
-            if (p != port) { if (strict == "true") bad=1; next }
-            address=endpoint; sub(/:[^:]*$/, "", address)
+dns_report() {
+    print_summary_row "DNS 管理" "静态接管，已禁止自动覆盖"
+    local summary="IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}"
+    [[ "$1" != true ]] || summary+="，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}"
+    result_ok "DNS 配置完成：$summary"
+}
+
+# Output: one numeric, remotely usable endpoint per line.
+ssh_remote_endpoints() {
+    awk '
+        NF {
+            address=$1; sub(/:[^:]*$/, "", address)
             gsub(/[\[\]]/, "", address); address=tolower(address)
             if (address ~ /^127\./ || address == "::1" ||
                 address ~ /^::ffff:127\./ || address ~ /^fe[89ab][0-9a-f]:/) next
-            remote=1
+            print $1
         }
-        END { exit (bad || !remote) }
     '
+}
+
+# Join socket inodes against the selected process's descriptors, not ss process names.
+ssh_socket_rows() {
+    local pid=$1 fd target inodes=' ' rows
+    shift
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        for fd in /proc/"$pid"/fd/*; do
+            target=$(readlink -- "$fd" 2>/dev/null) || continue
+            if [[ "$target" =~ ^socket:\[([0-9]+)\]$ ]]; then inodes+="${BASH_REMATCH[1]} "; fi
+        done
+    fi
+    rows=$(ss -H -O -ltne "$@" 2>>"$LOG_FILE") || return 1
+    awk -v inodes="$inodes" '$1 == "LISTEN" {
+        owned=0
+        for (i=6; i<=NF; i++) if ($i ~ /^ino:[0-9]+$/) {
+            owned=(index(inodes, " " substr($i, 5) " ") != 0); break
+        }
+        print $4, owned
+    }' <<< "$rows"
+}
+
+ssh_bindings_present() {
+    local expected=$1 actual=$2 endpoint port
+    while IFS= read -r endpoint; do
+        [[ -n "$endpoint" ]] || continue
+        if grep -Fx -- "$endpoint" <<< "$actual" >/dev/null; then continue; fi
+        port=${endpoint##*:}
+        case "$endpoint" in
+            "0.0.0.0:$port"|"[::]:$port") grep -Fx -- "*:$port" <<< "$actual" >/dev/null || return 1;;
+            *) return 1;;
+        esac
+    done <<< "$expected"
 }
 
 configure_ssh() {
@@ -984,12 +1067,12 @@ configure_ssh() {
             fi
         done
     fi
-    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! dpkg -l openssh-server >/dev/null 2>&1; then
+    if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]] && ! command -v sshd >/dev/null 2>&1; then
         step_info "安装 openssh-server..."
         DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y openssh-server >> "$LOG_FILE" 2>&1 || return 1
     fi
 
-    local ssh_changed=false ssh_backup="" ssh_unit="" ssh_dropin="/etc/ssh/sshd_config.d/99-vps-setup.conf"
+    local ssh_backup="" ssh_unit="" ssh_dropin="/etc/ssh/sshd_config.d/99-vps-setup.conf"
     restart_ssh_service() {
         local unit
         for unit in ssh.service sshd.service; do
@@ -1008,7 +1091,9 @@ configure_ssh() {
         else
             rm -f "$ssh_dropin" || return 1
         fi
-        restart_ssh_service || { result_warn "原 SSH 服务恢复失败，请检查日志"; return 1; }
+        if [[ "${1:-}" = restart ]]; then
+            restart_ssh_service || { result_warn "原 SSH 服务恢复失败，请检查日志；备份：$ssh_backup"; return 1; }
+        fi
         rm -f "$ssh_backup"
     }
     if [[ -n "$NEW_SSH_PORT" || -n "$NEW_SSH_PASSWORD" ]]; then
@@ -1018,53 +1103,86 @@ configure_ssh() {
         fi
     fi
     if [[ -n "$NEW_SSH_PORT" ]]; then
-        local current_ssh_port
+        local listeners ssh_tmp effective_ports effective ssh_pid unit expected actual
         result_warn "请先在防火墙和安全组放行 TCP ${NEW_SSH_PORT}，保留当前 SSH 连接"
-        current_ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {printf "%s ", $2}') || return 1
-        if [[ " $current_ssh_port " != *" ${NEW_SSH_PORT} "* ]] && ss -H -ltn 2>/dev/null | awk -v port=":${NEW_SSH_PORT}" '$4 ~ port "$" {found=1} END {exit !found}'; then
+        ssh_pid=0
+        for unit in ssh.service sshd.service; do
+            if ! systemctl is-active --quiet "$unit"; then continue; fi
+            ssh_pid=$(systemctl show --property=MainPID --value "$unit" 2>>"$LOG_FILE") || return 1
+            break
+        done
+        listeners=$(ssh_socket_rows "$ssh_pid" "sport = :${NEW_SSH_PORT}") || return 1
+        if [[ "$listeners" = *' 0' || "$listeners" = *$' 0\n'* ]]; then
             log "${RED}✗ SSH端口 ${NEW_SSH_PORT} 已被其他服务占用，未修改 SSH 配置。${NC}"
             return 1
         fi
         ssh_backup="${ssh_dropin}.backup.$(date +%Y%m%d-%H%M%S).$$"
         if [[ -e "$ssh_dropin" || -L "$ssh_dropin" ]]; then cp -a "$ssh_dropin" "$ssh_backup" || return 1; fi
         mkdir -p "${ssh_dropin%/*}" || return 1
-        if ! printf 'Port %s\n' "$NEW_SSH_PORT" > "${ssh_dropin}.tmp.$$" ||
-           ! mv -f "${ssh_dropin}.tmp.$$" "$ssh_dropin"; then
-            rm -f "${ssh_dropin}.tmp.$$"; return 1
-        fi
-        ssh_changed=true
-        local effective_ports effective
-        if ! effective=$(sshd -T 2>>"$LOG_FILE") ||
-           ! effective_ports=$(awk '$1 == "port" {print $2}' <<< "$effective" | sort -u) ||
-           [[ "$effective_ports" != "$NEW_SSH_PORT" ]] ||
-           ! awk '$1 == "listenaddress" {print $2}' <<< "$effective" | ssh_remote_listener "$NEW_SSH_PORT" true; then
-            result_warn "SSH Port / ListenAddress 冲突、缺少 Include 或仅限本地绑定；请自行整理配置后重试"
-            rollback_ssh
-            return 1
-        fi
-    fi
-    
-    if [[ "$ssh_changed" = true ]]; then
-        if sshd -t 2>>"$LOG_FILE"; then
+        ssh_tmp=$(mktemp "${ssh_dropin}.tmp.XXXXXX") || return 1
+        apply_ssh_port() {
+            printf 'Port %s\n' "$NEW_SSH_PORT" > "$ssh_tmp" || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            mv -fT -- "$ssh_tmp" "$ssh_dropin" || return 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            if ! effective=$(sshd -T 2>>"$LOG_FILE") ||
+               ! effective_ports=$(awk '$1 == "port" {print $2}' <<< "$effective" | sort -u) ||
+               [[ "$effective_ports" != "$NEW_SSH_PORT" ]] ||
+               ! expected=$(awk -v port="$NEW_SSH_PORT" '$1 == "listenaddress" {
+                   if ($2 !~ (":" port "$")) bad=1; else print $2
+               } END {exit bad}' <<< "$effective"); then
+                result_warn "SSH Port / ListenAddress 冲突、缺少 Include 或仅限本地绑定；请自行整理配置后重试"
+                return 1
+            fi
+            # sshd -T lists IPv6 addresses even if the kernel has IPv6 disabled.
+            if ! IFS= read -r _ 2>/dev/null < /proc/net/if_inet6; then
+                expected=$(awk '$0 !~ /^\[/' <<< "$expected") || return 1
+            fi
+            if [[ -z "$(ssh_remote_endpoints <<< "$expected")" ]] || ! sshd -t 2>>"$LOG_FILE"; then
+                result_warn "SSH 配置错误或仅限本地绑定，正在恢复原配置"
+                return 1
+            fi
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            restart_needed=restart
             if ! restart_ssh_service; then
-                log "${RED}✗ SSH 服务重启失败，正在恢复配置。${NC}"
-                rollback_ssh
+                result_warn "SSH 服务重启失败，正在恢复配置"
                 return 1
             fi
+            [[ "$signal_rc" -eq 0 ]] || return 1
             sleep 1
+            [[ "$signal_rc" -eq 0 ]] || return 1
             if ! systemctl is-active --quiet "$ssh_unit" ||
-               ! ss -H -ltn 2>/dev/null | awk '{print $4}' | ssh_remote_listener "$NEW_SSH_PORT"; then
-                log "${RED}✗ SSH 未监听新端口，正在恢复配置。${NC}"
-                rollback_ssh
+               ! ssh_pid=$(systemctl show --property=MainPID --value "$ssh_unit" 2>>"$LOG_FILE") ||
+               [[ ! "$ssh_pid" =~ ^[1-9][0-9]*$ ]] ||
+               ! listeners=$(ssh_socket_rows "$ssh_pid" "sport = :${NEW_SSH_PORT}") ||
+               [[ "$listeners" = *' 0' || "$listeners" = *$' 0\n'* ]] ||
+               ! actual=$(awk -v port="$NEW_SSH_PORT" '$1 ~ (":" port "$") && $2 == 1 {print $1}' <<< "$listeners") ||
+               [[ -z "$(ssh_remote_endpoints <<< "$actual")" ]] || ! ssh_bindings_present "$expected" "$actual"; then
+                result_warn "SSH 未监听新端口，正在恢复配置"
                 return 1
             fi
-            result_ok "SSH 已监听端口：${NEW_SSH_PORT}；请保留当前连接并测试新连接"
-            rm -f "$ssh_backup"
-        else
-            log "${RED}✗ SSH配置错误，已恢复备份${NC}"
-            rollback_ssh
-            return 1
+        }
+        local signal_rc=0 saved_int saved_term restart_needed='' failed=false
+        saved_int=$(trap -p INT); saved_term=$(trap -p TERM)
+        # Keep the rollback in the foreground after any in-flight command returns.
+        trap 'signal_rc=130' INT
+        trap 'signal_rc=143' TERM
+        if ! apply_ssh_port || [[ "$signal_rc" -ne 0 ]]; then
+            failed=true
+            # The rename can have completed even when the command returned nonzero.
+            if [[ ! -e "$ssh_tmp" ]]; then
+                rollback_ssh "$restart_needed" || :
+            else
+                rm -f -- "$ssh_tmp" "$ssh_backup" || :
+            fi
         fi
+        trap - INT TERM
+        [[ -z "$saved_int" ]] || eval "$saved_int"
+        [[ -z "$saved_term" ]] || eval "$saved_term"
+        [[ "$signal_rc" -eq 0 ]] || return "$signal_rc"
+        [[ "$failed" = false ]] || return 1
+        rm -f -- "$ssh_backup" || return 1
+        result_ok "SSH 已监听端口：${NEW_SSH_PORT}；请保留当前连接并测试新连接"
     fi
 
     if [[ -n "$NEW_SSH_PASSWORD" ]]; then
@@ -1073,47 +1191,106 @@ configure_ssh() {
     fi
 }
 
+ssh_listening_ports() {
+    local unit state pid rows actual expected endpoint port endpoints=''
+    for unit in ssh.service sshd.service ssh.socket sshd.socket; do
+        state=$(systemctl show --property=ActiveState --value "$unit" 2>>"$LOG_FILE") || return 1
+        case "$state" in
+            inactive|failed) continue;;
+            active) ;;
+            *) return 1;;
+        esac
+        if [[ "$unit" = *.socket ]]; then
+            # Systemd owns sockets before sshd starts. Confirm the active TCP
+            # bindings listed by the manager against PID 1's actual sockets.
+            expected=$(systemctl show --property=Listen --value "$unit" 2>>"$LOG_FILE" |
+                awk '{for (i=2; i<=NF; i++) if ($i == "(Stream)" && $(i-1) ~ /:[0-9]+$/) print $(i-1)}') || return 1
+            [[ -n "$expected" ]] || return 1
+            pid=1
+        else
+            expected=''
+            pid=$(systemctl show --property=MainPID --value "$unit" 2>>"$LOG_FILE") || return 1
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+        fi
+        rows=$(ssh_socket_rows "$pid") || return 1
+        actual=$(awk '$2 == 1 {print $1}' <<< "$rows") || return 1
+        if [[ -n "$expected" ]]; then
+            ssh_bindings_present "$expected" "$actual" || return 1
+            actual=$expected
+        fi
+        endpoints+="$actual"$'\n'
+    done
+    endpoints=$(ssh_remote_endpoints <<< "$endpoints") || return 1
+    [[ -n "$endpoints" ]] || return 1
+    while IFS= read -r endpoint; do
+        port=${endpoint##*:}
+        valid_ssh_port "$port" || return 1
+        printf '%s\n' "$port"
+    done <<< "$endpoints" | sort -un | paste -sd, -
+}
+
+fail2ban_service_state() {
+    systemctl show --property=LoadState --property=ActiveState --property=UnitFileState fail2ban.service 2>>"$LOG_FILE" |
+        awk -F= '
+            $1 == "LoadState" {load=$2}
+            $1 == "ActiveState" {active=$2}
+            $1 == "UnitFileState" {boot=$2}
+            END {
+                if (load == "not-found" && active == "inactive" && boot == "") print "inactive:absent"
+                else if (load == "loaded" && active ~ /^(active|inactive|failed)$/ && boot ~ /^(enabled|enabled-runtime|disabled)$/)
+                    print (active == "active" ? "active" : "inactive") ":" boot
+                else exit 1
+            }'
+}
+
 configure_fail2ban() {
     section_header "9" "Fail2ban 配置"
-    
-    local ports=() detected_port effective
-    effective=$(sshd -T 2>>"$LOG_FILE") || { result_warn "无法读取 SSH 有效端口，未修改 Fail2ban"; return 1; }
-    while IFS= read -r detected_port; do
-        valid_ssh_port "$detected_port" || { result_warn "SSH 有效端口无效"; return 1; }
-        ports+=("$detected_port")
-    done < <(awk '$1 == "listenaddress" {sub(/^.*:/, "", $2); print $2}' <<< "$effective")
-    [[ ${#ports[@]} -gt 0 ]] || { result_warn "未发现 SSH 有效端口"; return 1; }
-
-    local port_list
-    port_list=$(printf "%s\n" "${ports[@]}" | sort -un | tr '\n' ',' | sed 's/,$//')
-    
-    step_info "安装 Fail2ban..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y fail2ban >> "$LOG_FILE" 2>&1; then
-        log "${RED}✗ Fail2ban 安装失败，请查看日志：${LOG_FILE}${NC}"
-        return 1
-    fi
-    
-    local jail_file="/etc/fail2ban/jail.d/99-vps-setup.local"
-    local jail_tmp="${jail_file}.vps-setup.$$"
-    local jail_backup
+    local port_list original_state jail_file="/etc/fail2ban/jail.d/99-vps-setup.local" jail_tmp='' jail_backup
+    port_list=$(ssh_listening_ports) || { result_warn "无法确认 SSH 实际监听端口，未修改 Fail2ban"; return 1; }
+    original_state=$(fail2ban_service_state) || { result_warn "无法确认 Fail2ban 原服务状态，未修改"; return 1; }
     jail_backup="${jail_file}.backup.$(date +%Y%m%d-%H%M%S).$$"
-    mkdir -p "${jail_file%/*}" || return 1
     if [[ -e "$jail_file" || -L "$jail_file" ]]; then cp -a "$jail_file" "$jail_backup" || return 1; fi
     restore_fail2ban_jail() {
+        local failed=false current wanted=${original_state%:*} boot=${original_state#*:}
         if [[ -e "$jail_backup" || -L "$jail_backup" ]]; then
-            cp -a --remove-destination "$jail_backup" "$jail_file" || { result_warn "Fail2ban 恢复失败，备份：$jail_backup"; return 1; }
+            cp -a --remove-destination -- "$jail_backup" "$jail_file" || failed=true
         else
-            rm -f "$jail_file" || return 1
+            rm -f -- "$jail_file" || failed=true
         fi
-        if [[ "${1:-}" = restart ]]; then
-            if ! systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || ! systemctl is-active --quiet fail2ban; then
-                result_warn "原 Fail2ban 服务恢复失败，请检查日志；保留备份：$jail_backup"
-                return 1
-            fi
+        if [[ "$wanted" = active ]]; then
+            if [[ "$failed" = false && "$service_touched" = true ]]; then systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || failed=true; fi
+        else
+            current=$(fail2ban_service_state) || current=''
+            if [[ "$current" != inactive:* ]]; then systemctl stop fail2ban >> "$LOG_FILE" 2>&1 || failed=true; fi
         fi
-        rm -f "$jail_backup"
+        current=$(fail2ban_service_state) || current=''
+        if [[ "$boot" = absent && "$current" != *:absent ]]; then boot=disabled; fi
+        if [[ "${current#*:}" != "$boot" ]]; then
+            case "$boot" in
+                enabled) systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || failed=true;;
+                disabled|enabled-runtime)
+                    systemctl disable fail2ban >> "$LOG_FILE" 2>&1 || failed=true
+                    if [[ "$boot" = enabled-runtime ]]; then systemctl enable --runtime fail2ban >> "$LOG_FILE" 2>&1 || failed=true; fi;;
+            esac
+        fi
+        current=$(fail2ban_service_state) || failed=true
+        [[ "$current" = "$wanted:$boot" ]] || failed=true
+        if [[ "$failed" = true ]]; then
+            result_warn "Fail2ban 恢复不完整，请检查日志及原 jail 备份：$jail_backup"
+            return 1
+        fi
+        rm -f -- "$jail_backup"
     }
-    if ! cat > "$jail_tmp" << EOF
+    apply_fail2ban() {
+        if [[ "$original_state" = *:absent ]] || ! command -v fail2ban-client >/dev/null 2>&1; then
+            step_info "安装 Fail2ban..."
+            service_touched=true
+            DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y fail2ban >> "$LOG_FILE" 2>&1 || return 1
+        fi
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        mkdir -p "${jail_file%/*}" || return 1
+        jail_tmp=$(mktemp "${jail_file}.vps-setup.XXXXXX") || return 1
+        cat > "$jail_tmp" << EOF || return 1
 [sshd]
 # 永久封禁：输错 SSH 密码达到 maxretry 后，来源 IP 不会自动解封。
 bantime = -1
@@ -1123,21 +1300,31 @@ backend = systemd
 enabled = true
 port = ${port_list}
 EOF
-    then
-        rm -f "$jail_tmp"; return 1
-    fi
-    if ! mv -f "$jail_tmp" "$jail_file"; then rm -f "$jail_tmp"; return 1; fi
-    if ! fail2ban-client -t >> "$LOG_FILE" 2>&1; then
-        log "${RED}✗ Fail2ban 配置校验失败${NC}"
-        restore_fail2ban_jail
+
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        mv -fT -- "$jail_tmp" "$jail_file" || return 1
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        fail2ban-client -t >> "$LOG_FILE" 2>&1 || return 1
+        [[ "$signal_rc" -eq 0 ]] || return 1
+        service_touched=true
+        systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || return 1
+        local attempt current
+        for attempt in 1 2 3 4 5; do
+            [[ "$signal_rc" -eq 0 ]] || return 1
+            if systemctl is-active --quiet fail2ban && verify_sshd_jail; then
+                current=$(fail2ban_service_state) || return 1
+                [[ "$signal_rc" -eq 0 ]] || return 1
+                if [[ "$current" != active:enabled ]]; then
+                    systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || return 1
+                    current=$(fail2ban_service_state) || return 1
+                fi
+                [[ "$current" = active:enabled ]] || return 1
+                return 0
+            fi
+            if [[ "$attempt" -lt 5 ]]; then sleep 1; fi
+        done
         return 1
-    fi
-    
-    if ! systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || ! systemctl restart fail2ban >> "$LOG_FILE" 2>&1; then
-        restore_fail2ban_jail restart || return 1
-        log "${RED}✗ Fail2ban 重启失败，已恢复原配置。${NC}"
-        return 1
-    fi
+    }
     verify_sshd_jail() {
         local actual actions action found=false
         fail2ban-client status sshd >> "$LOG_FILE" 2>&1 || return 1
@@ -1175,19 +1362,23 @@ EOF
         done <<< "$actions"
         [[ "$found" = true ]]
     }
-    local attempt jail_ready=false
-    for attempt in 1 2 3 4 5; do
-        if systemctl is-active --quiet fail2ban && verify_sshd_jail; then jail_ready=true; break; fi
-        if [[ "$attempt" -lt 5 ]]; then sleep 1; fi
-    done
-    if [[ "$jail_ready" = true ]]; then
-        rm -f "$jail_backup"
-        result_ok "Fail2ban 已启动，保护 SSH 端口：${port_list}；5 分钟内失败 3 次永久封禁"
-    else
-        restore_fail2ban_jail restart || return 1
-        log "${RED}✗ Fail2ban 启动失败，已恢复原配置${NC}"
-        return 1
+    local service_touched=false signal_rc=0 saved_int saved_term failed=false
+    saved_int=$(trap -p INT); saved_term=$(trap -p TERM)
+    # apt can start and enable Fail2ban before its jail has been written.
+    trap 'signal_rc=130' INT
+    trap 'signal_rc=143' TERM
+    if ! apply_fail2ban || [[ "$signal_rc" -ne 0 ]]; then
+        failed=true
+        if [[ -n "$jail_tmp" ]]; then rm -f -- "$jail_tmp" || result_warn "无法清理 Fail2ban 临时文件：$jail_tmp"; fi
+        if restore_fail2ban_jail; then result_warn "Fail2ban 安装、校验或启用失败，已恢复原 jail 和服务状态"; fi
     fi
+    trap - INT TERM
+    [[ -z "$saved_int" ]] || eval "$saved_int"
+    [[ -z "$saved_term" ]] || eval "$saved_term"
+    [[ "$signal_rc" -eq 0 ]] || return "$signal_rc"
+    [[ "$failed" = false ]] || return 1
+    rm -f -- "$jail_backup" || return 1
+    result_ok "Fail2ban 已启动，保护 SSH 端口：${port_list}；5 分钟内失败 3 次永久封禁"
 }
 
 system_update() {
@@ -1213,20 +1404,23 @@ system_update() {
 # ==============================================================================
 main() {
     trap 'handle_error ${LINENO}' ERR
-    [[ $EUID -ne 0 ]] && { printf '%b\n' "${RED}需要root权限${NC}"; exit 1; }
-    
     parse_args "$@"
+    [[ $EUID -ne 0 ]] && { printf '%b\n' "${RED}需要root权限${NC}"; exit 1; }
 
-    if [[ "$non_interactive" = false && ! -t 0 && ! -t 1 ]]; then
+    if [[ "$non_interactive" = false ]] && ! ( : < /dev/tty ) 2>/dev/null; then
         log "${RED}✗ 当前没有可用终端，请使用 --non-interactive${NC}"
         exit 2
     fi
 
     section_header "" "配置摘要"
     print_summary_row "主机名" "${NEW_HOSTNAME:-保持当前}"
-    print_summary_row "时区" "$TIMEZONE"
+    print_summary_row "时区" "${TIMEZONE:-保持当前}"
     print_summary_row "BBR" "$([[ "$ENABLE_BBR" = true ]] && echo "启用 (fq + bbr)" || echo "切换为 cubic（保留 qdisc）")"
-    print_summary_row "Swap" "$([[ "$SWAP_SIZE_MB" = auto ]] && echo '按内存自动配置' || { [[ "$SWAP_SIZE_MB" = 0 ]] && echo '禁用全部（含分区）' || echo "${SWAP_SIZE_MB}MB"; })"
+    case "$SWAP_SIZE_MB" in
+        auto) print_summary_row "Swap" "按内存自动配置" ;;
+        0) print_summary_row "Swap" "禁用全部（含分区）" ;;
+        *) print_summary_row "Swap" "${SWAP_SIZE_MB}MB" ;;
+    esac
     print_summary_row "DNS" "IPv4 ${PRIMARY_DNS_V4} / ${SECONDARY_DNS_V4}$(has_ipv6 && echo "，IPv6 ${PRIMARY_DNS_V6} / ${SECONDARY_DNS_V6}")"
     print_summary_row "DNS 管理" "统一静态接管，停用 resolved 并禁止自动覆盖"
     print_summary_row "Fail2ban" "$([[ "$ENABLE_FAIL2BAN" = true ]] && echo "SSH 防护：5 分钟内失败 3 次永久封禁" || echo "跳过配置（保持已有服务）")"

@@ -18,7 +18,7 @@ curl -fsSLo install.sh https://raw.githubusercontent.com/yahuisme/vps-setup/main
 - **BBR**：启用 `fq + bbr`；`--no-bbr` 改用 cubic，保留 qdisc。
 - **Swap**：内存 ≤512 MiB 配 512 MiB，≤1024 MiB 配 1024 MiB，其余配 2048 MiB。现有总量一致则保留，否则停用全部现有 Swap 并替换为 `/swapfile`；`--swap 0` 禁用全部 Swap。
 - **DNS**：IPv4 使用 `1.1.1.1 / 8.8.8.8`；检测到 IPv6 时增加 `2606:4700:4700::1111 / 2001:4860:4860::8888`。替换并锁定 `/etc/resolv.conf`，保留 search/options，停用 systemd-resolved。
-- **Fail2ban**：仅保护 SSH，5 分钟内失败 3 次永久封禁；不改其他 jail 或 ignoreip。`--no-fail2ban` 跳过配置，不停止已有服务。
+- **Fail2ban**：按实际 SSH 监听端口配置（含 systemd socket），5 分钟内失败 3 次永久封禁；不改其他 jail 或 ignoreip。无法确认端口时不修改。`--no-fail2ban` 跳过配置，不停止已有服务。
 
 自定义示例，需先完成上方下载；非交互模式仍执行全部默认项目：
 

@@ -23,11 +23,18 @@ result_ok() { printf 'OK %s\n' "$*"; }
 result_warn() { printf 'WARN %s\n' "$*"; }
 print_summary_row() { printf '%s:%s\n' "$@"; }
 log() { printf '%s\n' "$*"; }
+resolved_load() {
+    if [[ "$(readlink "$ROOT/etc/systemd/system/systemd-resolved.service")" = /dev/null ]]; then
+        printf masked
+    else
+        printf loaded
+    fi
+}
 APT_LOCK_WAIT=()
 apt-get() { printf 'apt %s\n' "$*" >> "$ROOT/calls"; }
 systemctl() {
     printf 'systemctl %s\n' "$*" >> "$ROOT/calls"
-    if [[ "$1" = show ]]; then printf 'LoadState=loaded\nActiveState=inactive\n'; return 0; fi
+    if [[ "$1" = show ]]; then printf 'LoadState=%s\nActiveState=inactive\n' "$(resolved_load)"; return 0; fi
     if [[ "$1" = mask ]]; then
         mkdir -p "$ROOT/etc/systemd/system"
         ln -sf /dev/null "$ROOT/etc/systemd/system/systemd-resolved.service"
@@ -51,7 +58,8 @@ sleep() { :; }
 lsattr() { if [[ -f "$ROOT/dns-immutable" ]]; then printf '%s %s\n' '----i---------' "${@: -1}"; else printf '%s %s\n' '--------------' "${@: -1}"; fi; }
 chattr() { case "$1" in +i) printf yes > "$ROOT/dns-immutable";; -i) rm -f "$ROOT/dns-immutable";; *) return 99;; esac; }
 '''
-SWAP = ['ensure_swap_fstab_entry', 'remove_fstab_swap_entries', 'configure_swap']
+FSTAB = ['append_line_break', 'append_swap_fstab_entry', 'ensure_swap_fstab_entry']
+SWAP = [*FSTAB, 'remove_fstab_swap_entries', 'configure_swap']
 
 class Regression(unittest.TestCase):
     def setUp(self):
@@ -61,6 +69,12 @@ class Regression(unittest.TestCase):
             (self.root / d).mkdir(parents=True)
         (self.root / 'etc/fstab').write_text('# preserve\n')
         (self.root / 'calls').touch()
+        (self.root / 'proc/net').mkdir()
+        (self.root / 'proc/net/if_inet6').write_text('mock-ipv6\n')
+        for pid, inode in [(123, 100), (1, 101)]:
+            fd = self.root / f'proc/{pid}/fd'
+            fd.mkdir(parents=True)
+            (fd / '3').symlink_to(f'socket:[{inode}]')
         stub = self.root / 'run/systemd/resolve/stub-resolv.conf'
         stub.parent.mkdir(parents=True)
         stub.write_text('nameserver 127.0.0.53\n')
@@ -69,6 +83,10 @@ class Regression(unittest.TestCase):
         self.temp.cleanup()
 
     def run_shell(self, names, body, interactive_input=None):
+        if 'configure_ssh' in names or 'configure_fail2ban' in names:
+            names = [n for n in names if not n.startswith('ssh_')] + [n for n in FUNCTIONS if n.startswith('ssh_')]
+        if 'configure_fail2ban' in names and 'fail2ban_service_state' in FUNCTIONS:
+            names += ['fail2ban_service_state']
         if 'configure_dns' in names:
             names = [n for n in names if n != 'configure_dns'] + [n for n in FUNCTIONS if n.startswith('dns_')] + ['configure_dns']
         code = '\n'.join(n + '() {\n' + FUNCTIONS[n] for n in names)
@@ -96,7 +114,31 @@ class Regression(unittest.TestCase):
             f'logpath = {self.root}/nginx.log\n')
         return r'''
 sshd() { printf 'port 22\nport 2222\nlistenaddress 0.0.0.0:22\nlistenaddress [::]:2222\n'; }
-systemctl() { printf 'systemctl %s\n' "$*" >> "$ROOT/calls"; return 0; }
+ss() { printf '%s\n' 'LISTEN 0 128 0.0.0.0:22 *:* ino:100' 'LISTEN 0 128 [::]:2222 *:* ino:100'; }
+F2B_LOAD=loaded F2B_ACTIVE=active F2B_BOOT=enabled SSH_MODE=service
+mock_systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$ROOT/calls"
+    case "${@: -1}" in
+        ssh.service|sshd.service|ssh.socket|sshd.socket)
+            case "$*:$SSH_MODE" in
+                *ActiveState*' ssh.service:service'|*ActiveState*' ssh.socket:socket') printf 'active\n';;
+                *ActiveState*) printf 'inactive\n';;
+                *MainPID*) printf '123\n';;
+                *Listen*) printf '[::]:2200 (Stream) /run/unused (Stream)\n';;
+                *) return 99;;
+            esac;;
+        *) case "$1" in
+            show) printf 'LoadState=%s\nActiveState=%s\nUnitFileState=%s\n' "$F2B_LOAD" "$F2B_ACTIVE" "$F2B_BOOT";;
+            is-active) [[ "$F2B_ACTIVE" = active ]];;
+            restart) F2B_ACTIVE=active;;
+            stop) F2B_ACTIVE=inactive;;
+            enable) F2B_BOOT=enabled;;
+            disable) F2B_BOOT=disabled;;
+            *) return 99;;
+        esac;;
+    esac
+}
+systemctl() { mock_systemctl "$@"; }
 fail2ban-client() {
     case "$1" in
         -t|-d) /usr/bin/fail2ban-client -c "$ROOT/etc/fail2ban" "$@" ;;
@@ -181,15 +223,34 @@ fail2ban-client() {
             '         iptables-multiport[name=two, actname=two, port="%(port)s"]\n')
         self.run_shell(['valid_ssh_port', 'configure_fail2ban'], body + '\nconfigure_fail2ban\n')
 
-    def test_fail2ban_uses_listenaddress_ports(self):
+    def test_fail2ban_uses_live_socket_ports(self):
         body = self.setup_fail2ban()
         config = self.root / 'etc/ssh/sshd_config'
-        config.write_text('Port 2222\nListenAddress 0.0.0.0:22\nListenAddress [::]:2200\n')
+        config.write_text('Port 22\n')
         self.run_shell(['valid_ssh_port', 'configure_fail2ban'], body + r'''
 sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+SSH_MODE=socket
+ss() { printf '%s\n' 'LISTEN 0 128 *:2200 *:* ino:101' 'LISTEN 0 128 0.0.0.0:22 *:* ino:555'; }
 configure_fail2ban
 ''')
-        self.assertIn('port = 22,2200\n', (self.root / 'etc/fail2ban/jail.d/99-vps-setup.local').read_text())
+        self.assertIn('port = 2200\n', (self.root / 'etc/fail2ban/jail.d/99-vps-setup.local').read_text())
+
+    def test_fail2ban_does_not_change_unverified_service(self):
+        body = self.setup_fail2ban()
+        for mode in ['socket-missing', 'unknown-state']:
+            with self.subTest(mode=mode):
+                (self.root / 'calls').write_text('')
+                output = self.run_shell(['valid_ssh_port', 'configure_fail2ban'], body + f'\nFAIL={mode}\n' + r'''
+if [[ "$FAIL" = socket-missing ]]; then
+    SSH_MODE=socket
+else
+    F2B_BOOT=unknown
+fi
+if configure_fail2ban; then exit 9; fi
+''')
+                self.assertIn('未修改', output)
+                self.assertNotIn('OK Fail2ban', output)
+                self.assertNotRegex((self.root / 'calls').read_text(), r'(?m)^(apt |systemctl (enable|disable|start|stop|restart) )')
 
     def test_ssh_effective_bindings(self):
         config = self.root / 'etc/ssh/sshd_config'
@@ -208,9 +269,9 @@ configure_fail2ban
 non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
 sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
 dpkg() { return 0; }
-systemctl() { [[ "${@: -1}" != *.socket ]]; }
+systemctl() { if [[ "$1" = show ]]; then printf '123\n'; else [[ "${@: -1}" != *.socket ]]; fi; }
 ss() { if [[ -f "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf" ]]; then
-    sshd -T | awk '$1 == "listenaddress" {print "LISTEN 0 128 " $2 " *:*"}'
+    sshd -T | awk '$1 == "listenaddress" {print "LISTEN 0 128 " $2 " *:* ino:100"}'
 fi; }
 ''' + ('configure_ssh\n' if accepted else 'if configure_ssh; then exit 9; fi\n'))
                 self.assertEqual(dropin.exists(), accepted)
@@ -258,7 +319,7 @@ if (parse_args --ssh-password); then exit 9; else [[ $? = 2 ]]; fi
     def test_fstab_repair_failure_preserves_original_bytes(self):
         for failure in ('shortwrite', 'rename'):
             with self.subTest(failure=failure):
-                self.run_shell(['ensure_swap_fstab_entry'], 'FAILURE=' + failure + r'''
+                self.run_shell(FSTAB, 'FAILURE=' + failure + r'''
 printf '#%01018d' 0 > "$ROOT/etc/fstab"
 chmod 640 "$ROOT/etc/fstab"
 cp -p "$ROOT/etc/fstab" "$ROOT/expected"
@@ -297,13 +358,29 @@ configure_hostname
     def test_hostname_adds_missing_exact_address(self):
         hosts = self.root / 'etc/hosts'
         hosts.write_text('127.0.1.10 keep-alias\n')
-        self.run_shell(['configure_hostname'], r'''
+        self.run_shell(['append_line_break', 'configure_hostname'], r'''
 non_interactive=true NEW_HOSTNAME=new-host
 hostname() { printf 'old-host\n'; }
 hostnamectl() { return 0; }
 configure_hostname
 ''')
         self.assertEqual(hosts.read_text(), '127.0.1.10 keep-alias\n127.0.1.1\tnew-host\n')
+
+    def test_hostname_handles_address_without_name_and_unterminated_hosts(self):
+        hosts = self.root / 'etc/hosts'
+        for original, expected in [
+            ('127.0.1.1 # keep', '127.0.1.1\tnew-host # keep'),
+            ('127.0.0.1 localhost', '127.0.0.1 localhost\n127.0.1.1\tnew-host\n'),
+        ]:
+            with self.subTest(original=original):
+                hosts.write_text(original)
+                self.run_shell(['append_line_break', 'configure_hostname'], r'''
+non_interactive=true NEW_HOSTNAME=new-host
+hostname() { printf 'old-host\n'; }
+hostnamectl() { return 0; }
+configure_hostname
+''')
+                self.assertEqual(hosts.read_text(), expected)
 
     def test_hostname_length_is_validated_before_mutation(self):
         parsers = ['require_value', 'parse_args']
@@ -340,6 +417,17 @@ parse_args --timezone UTC
 [[ "$TIMEZONE" = UTC ]]
 if (parse_args --timezone invalid); then exit 9; else [[ $? = 2 ]]; fi
 if (parse_args --timezone $'UTC\ninvalid'); then exit 9; else [[ $? = 2 ]]; fi
+''')
+
+    def test_timezone_only_mutates_on_explicit_request(self):
+        self.run_shell(['configure_timezone'], r'''
+timedatectl() { printf '%s\n' "$*" >> "$ROOT/calls"; }
+TIMEZONE=''
+configure_timezone
+[[ ! -s "$ROOT/calls" ]]
+TIMEZONE=Asia/Hong_Kong
+configure_timezone
+[[ $(< "$ROOT/calls") = 'set-timezone Asia/Hong_Kong' ]]
 ''')
 
     def test_ssh_socket_activation_is_left_untouched(self):
@@ -380,6 +468,7 @@ systemctl() {
     case "$1" in
         is-active) [[ "${@: -1}" != *.socket ]];;
         cat) return 0;;
+        show) printf '123\n';;
         restart) printf 'restart\n' >> "$ROOT/restarts"
             [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = *administrator* && "$RECOVERY" = true ]];;
         *) return 99;;
@@ -403,13 +492,32 @@ systemctl() {
     if [[ "$1" = restart ]]; then
         printf 'restart\n' >> "$ROOT/restarts"
         grep -q administrator "$ROOT/etc/fail2ban/jail.d/99-vps-setup.local"
-    else return 0; fi
+    else mock_systemctl "$@"; fi
 }
 if configure_fail2ban; then exit 9; fi
 '''
         output = self.run_shell(['valid_ssh_port', 'configure_fail2ban'], body)
         self.assertEqual(owned.read_text(), '# administrator\n')
         self.assertEqual((self.root / 'restarts').read_text().splitlines(), ['restart', 'restart'])
+        self.assertNotIn('OK Fail2ban', output)
+
+    def test_fail2ban_rejected_jail_is_not_enabled_or_left_running(self):
+        body = self.setup_fail2ban() + r'''
+F2B_LOAD=not-found F2B_ACTIVE=inactive F2B_BOOT=''
+apt-get() {
+    printf 'apt %s\n' "$*" >> "$ROOT/calls"
+    F2B_LOAD=loaded F2B_ACTIVE=active F2B_BOOT=enabled
+}
+if configure_fail2ban; then exit 9; fi
+[[ "$F2B_ACTIVE:$F2B_BOOT" = inactive:disabled ]]
+'''
+        (self.root / 'etc/fail2ban/jail.d/zz-existing.local').write_text('[sshd]\nenabled = false\n')
+        output = self.run_shell(['valid_ssh_port', 'configure_fail2ban'], body)
+        calls = (self.root / 'calls').read_text().splitlines()
+        self.assertIn('systemctl restart fail2ban', calls)
+        self.assertIn('systemctl stop fail2ban', calls)
+        self.assertIn('systemctl disable fail2ban', calls)
+        self.assertNotIn('systemctl enable fail2ban', calls)
         self.assertNotIn('OK Fail2ban', output)
 
     def test_ssh_restart_success_requires_active_service(self):
@@ -448,7 +556,7 @@ if configure_ssh; then exit 9; fi
                 (self.root / 'etc/resolv.conf').write_text(original)
                 output = self.run_shell(['configure_dns'], self.dns_defaults() + f'''
 systemctl() {{
-    if [[ "$1" = show ]]; then printf 'LoadState=loaded\nActiveState=inactive\n';
+    if [[ "$1" = show ]]; then printf 'LoadState=%s\nActiveState=inactive\n' "$(resolved_load)";
     elif [[ "$1" = mask ]]; then mkdir -p "$ROOT/etc/systemd/system"; ln -sf /dev/null "$ROOT/etc/systemd/system/systemd-resolved.service";
     else [[ "$*" = 'is-active --quiet {manager}' ]]; fi
 }}
@@ -626,7 +734,7 @@ grep -Fxq 'swapon --priority 10 /dev/mock1' "$ROOT/calls"
 ACTIVE=true
 systemctl() {
     case "$1" in
-        show) printf 'LoadState=loaded\nActiveState=%s\n' "$([[ "$ACTIVE" = true ]] && printf active || printf inactive)";;
+        show) printf 'LoadState=%s\nActiveState=%s\n' "$(resolved_load)" "$([[ "$ACTIVE" = true ]] && printf active || printf inactive)";;
         is-active) [[ "$ACTIVE" = true ]];;
         mask) ln -sf /dev/null "$ROOT/etc/systemd/system/systemd-resolved.service"; ACTIVE=false; [[ "$FAULT" != mask ]] || return 1; [[ "$FAULT" != active ]] || ACTIVE=true;;
         start) ACTIVE=true;;
@@ -683,10 +791,11 @@ if configure_dns; then exit 9; fi
 ACTIVE=true
 systemctl() {
     case "$1" in
-        show) printf 'LoadState=loaded\nActiveState=%s\n' "$([[ "$ACTIVE" = true ]] && printf active || printf inactive)";;
+        show) printf 'LoadState=%s\nActiveState=%s\n' "$(resolved_load)" "$([[ "$ACTIVE" = true ]] && printf active || printf inactive)";;
         mask) [[ ! -e "$ROOT/etc/systemd/system/systemd-resolved.service" && ! -L "$ROOT/etc/systemd/system/systemd-resolved.service" ]] || return 1
             ln -s /dev/null "$ROOT/etc/systemd/system/systemd-resolved.service"; ACTIVE=false;;
         start) [[ "$(readlink "$ROOT/etc/systemd/system/systemd-resolved.service" || true)" != /dev/null && "$(readlink "$ROOT/run/systemd/system/systemd-resolved.service" || true)" != /dev/null ]] || return 1; ACTIVE=true;;
+        stop) ACTIVE=false;;
         daemon-reload) :;;
         *) return 99;;
     esac
@@ -745,7 +854,11 @@ if configure_dns; then exit 9; fi
 
     def test_dns_repeat_and_custom_dual_stack(self):
         path = self.root / 'etc/resolv.conf'
-        self.run_shell(['configure_dns'], self.dns_defaults() + '\nconfigure_dns\nconfigure_dns\n')
+        self.run_shell(['configure_dns'], self.dns_defaults() + r'''
+configure_dns
+mktemp() { [[ "$*" != *.backup.* ]] || return 99; command mktemp "$@"; }
+configure_dns
+''')
         self.assertEqual(len(list(path.parent.glob('resolv.conf.backup.*'))), 1)
         output = self.run_shell(['configure_dns'], self.dns_defaults() + r'''
 PRIMARY_DNS_V4=9.9.9.9 SECONDARY_DNS_V4=149.112.112.112
@@ -756,6 +869,26 @@ configure_dns
         self.assertEqual(path.read_text(), 'nameserver 9.9.9.9\nnameserver 149.112.112.112\nnameserver 2620:fe::fe\nnameserver 2620:fe::9\n')
         self.assertIn('2620:fe::fe / 2620:fe::9', output)
 
+    def test_dns_reloads_mask_already_on_disk(self):
+        unit = self.root / 'etc/systemd/system/systemd-resolved.service'
+        unit.parent.mkdir(parents=True)
+        unit.symlink_to('/dev/null')
+        (self.root / 'etc/resolv.conf').write_text('nameserver 1.1.1.1\nnameserver 8.8.8.8\n')
+        (self.root / 'dns-immutable').touch()
+        output = self.run_shell(['configure_dns'], self.dns_defaults() + r'''
+LOAD=loaded
+systemctl() {
+    case "$1" in
+        show) printf 'LoadState=%s\nActiveState=inactive\n' "$LOAD";;
+        daemon-reload) LOAD=masked; touch "$ROOT/reloaded";;
+        *) return 99;;
+    esac
+}
+configure_dns
+''')
+        self.assertTrue((self.root / 'reloaded').exists())
+        self.assertIn('OK DNS', output)
+
     def test_dns_resolved_is_replaced_and_masked(self):
         path = self.root / 'etc/resolv.conf'
         path.symlink_to(self.root / 'run/systemd/resolve/stub-resolv.conf')
@@ -764,7 +897,7 @@ ACTIVE=true
 systemctl() {
     printf '%s\n' "$*" >> "$ROOT/calls"
     case "$1" in
-        show) printf 'LoadState=loaded\nActiveState=%s\n' "$([[ "$ACTIVE" = true ]] && printf active || printf inactive)";;
+        show) printf 'LoadState=%s\nActiveState=%s\n' "$(resolved_load)" "$([[ "$ACTIVE" = true ]] && printf active || printf inactive)";;
         is-active) [[ "$ACTIVE" = true ]];;
         mask) ACTIVE=false; mkdir -p "$ROOT/etc/systemd/system"; ln -sf /dev/null "$ROOT/etc/systemd/system/systemd-resolved.service";;
         daemon-reload|start) return 0;;
@@ -789,11 +922,76 @@ configure_dns
 non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
 sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
 dpkg() { return 0; }
-systemctl() { [[ "${@: -1}" != *.socket ]]; }
-''' + f'''ss() {{ if [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = 'Port 2222' ]]; then printf 'LISTEN 0 128 {endpoint} *:*\\n'; fi; }}
+systemctl() { if [[ "$1" = show ]]; then printf '123\n'; else [[ "${@: -1}" != *.socket ]]; fi; }
+''' + f'''ss() {{ if [[ $(< "$ROOT/etc/ssh/sshd_config.d/99-vps-setup.conf") = 'Port 2222' ]]; then printf 'LISTEN 0 128 {endpoint} *:* ino:100 users:(("sshd",pid=123,fd=3))\\n'; fi; }}
 if configure_ssh; then exit 9; fi
 ''')
                 self.assertEqual(dropin.read_text(), 'Port 22\n# old\n')
+
+    def test_ssh_config_conflict_does_not_restart_running_service(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        dropin = self.root / 'etc/ssh/sshd_config.d/99-vps-setup.conf'
+        config.write_text(f'Include {dropin.parent}/*.conf\nPort 22\n')
+        output = self.run_shell(['valid_ssh_port', 'ssh_remote_listener', 'configure_ssh'], r'''
+non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
+sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+dpkg() { return 0; }
+ss() { :; }
+systemctl() { printf '%s\n' "$*" >> "$ROOT/calls"; [[ "${@: -1}" != *.socket ]]; }
+if configure_ssh; then exit 9; fi
+''')
+        self.assertIn('Port / ListenAddress 冲突', output)
+        self.assertFalse(dropin.exists())
+        self.assertNotIn('restart', (self.root / 'calls').read_text())
+
+    def test_ssh_readback_excludes_other_processes(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        dropin = self.root / 'etc/ssh/sshd_config.d/99-vps-setup.conf'
+        config.write_text(f'Include {dropin.parent}/*.conf\n')
+        output = self.run_shell(['valid_ssh_port', 'ssh_remote_listener', 'configure_ssh'], r'''
+non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
+sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+dpkg() { return 0; }
+systemctl() {
+    case "$1" in
+        show) printf '123\n';;
+        restart) touch "$ROOT/restarted";;
+        *) [[ "${@: -1}" != *.socket ]];;
+    esac
+}
+ss() {
+    [[ ! -e "$ROOT/restarted" ]] || printf '%s\n' \
+        'LISTEN 0 128 [::]:2222 *:* ino:100 users:(("sshd",pid=123,fd=3))' \
+        'LISTEN 0 128 0.0.0.0:2222 *:* ino:555 users:(("other,pid=123,",pid=1234,fd=3))'
+}
+if configure_ssh; then exit 9; fi
+''')
+        self.assertIn('未监听新端口', output)
+        self.assertTrue((self.root / 'restarted').exists())
+        self.assertFalse(dropin.exists())
+
+    def test_ssh_same_port_still_checks_existing_ownership(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        dropin = self.root / 'etc/ssh/sshd_config.d/99-vps-setup.conf'
+        config.write_text(f'Include {dropin.parent}/*.conf\n')
+        dropin.write_text('Port 2222\n# old\n')
+        output = self.run_shell(['valid_ssh_port', 'configure_ssh'], r'''
+non_interactive=true NEW_SSH_PORT=2222 NEW_SSH_PASSWORD=''
+sshd() { /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"; }
+systemctl() {
+    case "$1" in
+        show) printf '123\n';;
+        restart) touch "$ROOT/restarted";;
+        *) [[ "${@: -1}" != *.socket ]];;
+    esac
+}
+ss() { printf '%s\n' 'LISTEN 0 128 0.0.0.0:2222 *:* ino:555' \
+    'LISTEN 0 128 [::]:2222 *:* ino:100 users:(("sshd",pid=123,fd=3))'; }
+if configure_ssh; then exit 9; fi
+''')
+        self.assertIn('已被其他服务占用', output)
+        self.assertFalse((self.root / 'restarted').exists())
+        self.assertEqual(dropin.read_text(), 'Port 2222\n# old\n')
 
     def test_swap_recognized_disable_and_replace(self):
         for size in [0, 512]:

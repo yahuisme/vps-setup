@@ -89,7 +89,7 @@ printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n# ow
 cmp "$root/expected-owned" "$root/etc/sysctl.d/99-bbr.conf"
 configure_bbr > "$root/output"
 cmp "$root/expected-owned" "$root/etc/sysctl.d/99-bbr.conf"
-! grep -q '原配置备份' "$root/output"
+grep -q '原配置备份' "$root/output" && exit 1
 [[ -d "$retained" ]]
 printf 'PASS: exact-key takeover, byte preservation, retained backups and stable repeat\n'
 # Reuse real sysctl mock, injecting failures after partial application.
@@ -170,7 +170,7 @@ configure_bbr > "$root/output"
 cmp -s "$root/owned" "$root/etc/sysctl.d/99-bbr.conf" && { printf 'FAIL: missing cubic assignment\n'; exit 1; }
 grep -Fxq 'net.core.default_qdisc=fq_codel' "$root/etc/sysctl.d/99-bbr.conf"
 [[ $(<"$root/qdisc") = pfifo_fast && $(<"$root/cc") = cubic ]]
-! grep -q 'net.core.default_qdisc' "$root/calls"
+grep -q 'net.core.default_qdisc' "$root/calls" && exit 1
 [[ $(<"$root/lib/sysctl.d/20-unrelated.conf") = untouched-no-newline ]]
 printf 'PASS: cubic only owns congestion control; unrelated no-op\n'
 fixture
@@ -197,6 +197,15 @@ done
 printf 'PASS: all procps dirs, equal values, mask and unrelated wildcard\n'
 fixture
 rm "$root/etc/sysctl.d/99-bbr.conf"
+ln -s /dev/null "$root/etc/sysctl.d/01-mask.conf"
+ln -s /dev/null "$root/etc/sysctl.d/99-bbr.conf"
+if configure_bbr > "$root/output" 2>&1; then printf 'FAIL: masked owned file accepted via alias\n' >&2; exit 1; fi
+cmp "$root/original" "$root/etc/sysctl.conf"
+[[ $(<"$root/cc") = reno ]]
+[[ -L "$root/etc/sysctl.d/99-bbr.conf" ]]
+printf 'PASS: masked owned file is rejected even with an earlier alias\n'
+fixture
+rm "$root/etc/sysctl.d/99-bbr.conf"
 fault=apply
 if configure_bbr > "$root/output" 2>&1; then exit 1; fi
 [[ ! -e "$root/etc/sysctl.d/99-bbr.conf" ]]
@@ -208,5 +217,5 @@ is_kernel_version_ge() { return 1; }
 if configure_bbr > "$root/output" 2>&1; then exit 1; fi
 cmp "$root/original" "$root/etc/sysctl.conf"
 [[ ! -s "$root/calls" ]]
-! grep -q '已生效' "$root/output"
+if grep -q '已生效' "$root/output"; then exit 1; fi
 printf 'PASS: unsupported kernel does not claim success\n'
