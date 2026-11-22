@@ -98,6 +98,44 @@ class Transactions(unittest.TestCase):
         (self.root/'status').write_text(str(out.returncode)+'\n')
         return out
 
+    def test_swap_replacement_failures_restore_only_original_active_entries(self):
+        for failure in ('activate', 'verify', 'fstab-rename'):
+            with self.subTest(failure=failure):
+                swap = self.root / 'swapfile'
+                swap.write_text('old-swap')
+                original = f'{swap} none swap sw,discard=once 0 0\n/dev/inactive none swap sw,noauto 0 0\n# preserve'
+                (self.root / 'etc/fstab').write_text(original)
+                self.state = {'active': [[str(swap), -2, 'discard=once'], ['/dev/priority', 10, 'discard=pages']],
+                              'fstab': f'{swap} swap sw,discard=once\n/dev/priority swap sw,pri=10,discard=pages\n/dev/inactive swap sw,noauto\n'}
+                out = self.run_case(reg.SWAP, f'FAILURE={failure}\n' + r'''
+SWAP_SIZE_MB=512
+mkswap() { printf 'new-swap' > "$1"; }
+swapon() {
+    if [[ "$1" != --show=* ]]; then
+        python3 "$ROOT/mock.py" swapon "$@" || return 1
+        if [[ $(< "$ROOT/swapfile") = new-swap ]]; then
+            touch "$ROOT/new-activated"
+            [[ "$FAILURE" != activate ]] || return 1
+        fi
+    elif [[ "$FAILURE" = verify && "$1" = --show=NAME && -e "$ROOT/new-activated" ]]; then
+        rm -f "$ROOT/new-activated"
+        printf '/dev/foreign\n'
+    else python3 "$ROOT/mock.py" swapon "$@"; fi
+}
+mv() {
+    if [[ "$FAILURE" = fstab-rename && "${@: -1}" = "$ROOT/etc/fstab" ]]; then return 1; fi
+    command mv "$@"
+}
+if configure_swap; then exit 9; fi
+''')
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn('已恢复旧配置和活动 Swap', out.stdout)
+                self.assertEqual(swap.read_text(), 'old-swap')
+                self.assertEqual((self.root / 'etc/fstab').read_text(), original)
+                self.assertEqual(sorted(json.loads((self.root / 'state.json').read_text())['active']), sorted(self.state['active']))
+                self.assertFalse(list(self.root.glob('swapfile.backup.*')))
+                (self.root / 'new-activated').unlink(missing_ok=True)
+
     def test_swap_rollback_preserves_priority_and_discard(self):
         self.state = {'active': [['/dev/low', 10, 'discard=pages'], ['/dev/auto-a', -2, 'discard=once'],
                                  ['/dev/auto-b', -3, ''], ['/dev/blocker', 100, 'discard']],
@@ -336,6 +374,81 @@ configure_fail2ban
         self.assertFalse((self.root/'enabled').exists())
         self.assertFalse((self.root/'checked').exists())
         self.assertEqual(out.returncode, 130, out.stdout+out.stderr)
+
+    def test_bbr_signals_recover_completed_mutations_and_restore_traps(self):
+        names = ['bbr_filter', 'configure_bbr']
+        for signal in ('INT', 'TERM'):
+            for phase in ('rename', 'runtime'):
+                for command_fails in (False, True):
+                    with self.subTest(signal=signal, phase=phase, command_fails=command_fails):
+                        (self.root / 'signalled').unlink(missing_ok=True)
+                        (self.root / 'original-handler').unlink(missing_ok=True)
+                        caller = ('set +e\nconfigure_bbr\nrc=$?' if command_fails else
+                                  'if configure_bbr; then rc=0; else rc=$?; fi')
+                        out = self.run_case(names, f'SIGNAL={signal} PHASE={phase} COMMAND_FAILS={str(command_fails).lower()}\n' + r'''
+ENABLE_BBR=true
+mkdir -p "$ROOT/etc/sysctl.d"
+printf 'net.ipv4.tcp_congestion_control=reno\n# keep' > "$ROOT/etc/sysctl.conf"
+printf 'net.core.default_qdisc=fq_codel\n' > "$ROOT/etc/sysctl.d/99-bbr.conf"
+cp -p "$ROOT/etc/sysctl.conf" "$ROOT/original"
+cp -p "$ROOT/etc/sysctl.d/99-bbr.conf" "$ROOT/original-owned"
+printf 'reno\n' > "$ROOT/cc"
+printf 'pfifo_fast\n' > "$ROOT/qdisc"
+is_kernel_version_ge() { return 0; }
+signal_once() {
+    if [[ ! -e "$ROOT/signalled" ]]; then
+        touch "$ROOT/signalled"
+        kill -s "$SIGNAL" "$BASHPID"
+        [[ "$COMMAND_FAILS" != true ]] || return 1
+    fi
+}
+sysctl() {
+    local key value
+    printf 'sysctl %s\n' "$*" >> "$ROOT/calls"
+    case "$1" in
+        -n) case "$2" in
+            net.ipv4.tcp_congestion_control) cat "$ROOT/cc";;
+            net.core.default_qdisc) cat "$ROOT/qdisc";;
+            *) return 99;;
+        esac;;
+        -p) while IFS='=' read -r key value; do
+            key=${key// /}; value=${value// /}
+            case "$key" in
+                net.ipv4.tcp_congestion_control) printf '%s\n' "$value" > "$ROOT/cc";;
+                net.core.default_qdisc) printf '%s\n' "$value" > "$ROOT/qdisc";;
+                *) return 99;;
+            esac
+        done < "$2"
+        [[ "$PHASE" != runtime ]] || signal_once;;
+        -w) case "$2" in
+            net.ipv4.tcp_congestion_control=*) printf '%s\n' "${2#*=}" > "$ROOT/cc";;
+            net.core.default_qdisc=*) printf '%s\n' "${2#*=}" > "$ROOT/qdisc";;
+            *) return 99;;
+        esac;;
+        *) return 99;;
+    esac
+}
+mv() {
+    command mv "$@" || return 1
+    [[ "$PHASE" != rename ]] || signal_once
+}
+trap 'printf old-int >> "$ROOT/original-handler"' INT
+trap 'printf old-term >> "$ROOT/original-handler"' TERM
+trap -p INT TERM > "$ROOT/traps-before"
+CALLER
+set -e
+trap -p INT TERM > "$ROOT/traps-after"
+cmp "$ROOT/original" "$ROOT/etc/sysctl.conf"
+cmp "$ROOT/original-owned" "$ROOT/etc/sysctl.d/99-bbr.conf"
+[[ $(< "$ROOT/cc") = reno && $(< "$ROOT/qdisc") = pfifo_fast ]]
+[[ ! -e "$ROOT/original-handler" ]]
+exit "$rc"
+'''.replace('CALLER', caller))
+                        self.assertEqual(out.returncode, 130 if signal == 'INT' else 143, out.stdout + out.stderr)
+                        self.assertTrue((self.root / 'signalled').exists())
+                        self.assertEqual((self.root / 'traps-before').read_text(), (self.root / 'traps-after').read_text())
+                        self.assertNotIn('OK 拥塞控制已生效', out.stdout)
+                        (self.root / 'signalled').unlink()
 
     def dns_signal_case(self, signal):
         resolv = self.root/'etc/resolv.conf'

@@ -9,13 +9,17 @@ mkdir -p "$TMPDIR"
 mkdir -p "$root/etc/sysctl.d" "$root/run/sysctl.d" "$root/usr/local/lib/sysctl.d" "$root/usr/lib/sysctl.d" "$root/lib/sysctl.d"
 # shellcheck disable=SC2218 # Deliberately use system awk before defining the fault injector.
 command awk '/^(bbr_[a-z_]+|configure_bbr)\(\) \{/ { copy=1 } copy { print } copy && /^}/ { copy=0 }' "$repo/install.sh" > "$root/functions"
-# Substitution is confined to the extracted functions and literal system paths.
-source_text=$(<"$root/functions")
-source_text=${source_text//\/etc\//$root\/etc\/}
-source_text=${source_text//\/run\//$root\/run\/}
-source_text=${source_text//\/usr\//$root\/usr\/}
-source_text=${source_text// \/lib\/sysctl.d/ $root\/lib\/sysctl.d}
-printf '%s\n' "$source_text" > "$root/isolated-functions.sh"
+# Match absolute path tokens, never path-like fragments in variable suffixes.
+python3 - "$root" <<'PY'
+from pathlib import Path
+import re
+import sys
+root = Path(sys.argv[1])
+code = (root / 'functions').read_text()
+code = re.sub(r'(?<![A-Za-z0-9_$}])/(etc|run|usr|lib)/',
+              lambda m: str(root) + '/' + m[1] + '/', code)
+(root / 'isolated-functions.sh').write_text(code)
+PY
 # shellcheck disable=SC1091
 source "$root/isolated-functions.sh"
 section_header() { :; }

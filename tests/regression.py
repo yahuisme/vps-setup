@@ -65,7 +65,7 @@ class Regression(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='vps-regression-')
         self.root = Path(self.temp.name)
-        for d in ['etc/ssh/sshd_config.d', 'etc/systemd/resolved.conf.d', 'etc/sysctl.d', 'proc', 'run', 'tmp']:
+        for d in ['etc/ssh/sshd_config.d', 'etc/systemd/resolved.conf.d', 'etc/sysctl.d', 'var/log', 'proc', 'run', 'tmp']:
             (self.root / d).mkdir(parents=True)
         (self.root / 'etc/fstab').write_text('# preserve\n')
         (self.root / 'calls').touch()
@@ -82,7 +82,7 @@ class Regression(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_shell(self, names, body, interactive_input=None):
+    def run_shell(self, names, body, interactive_input=None, expected_returncode=0):
         if 'configure_ssh' in names or 'configure_fail2ban' in names:
             names = [n for n in names if not n.startswith('ssh_')] + [n for n in FUNCTIONS if n.startswith('ssh_')]
         if 'configure_fail2ban' in names and 'fail2ban_service_state' in FUNCTIONS:
@@ -90,7 +90,7 @@ class Regression(unittest.TestCase):
         if 'configure_dns' in names:
             names = [n for n in names if n != 'configure_dns'] + [n for n in FUNCTIONS if n.startswith('dns_')] + ['configure_dns']
         code = '\n'.join(n + '() {\n' + FUNCTIONS[n] for n in names)
-        code = re.sub(r'(?<![A-Za-z0-9_$}])/(etc|run|usr|lib|proc)/', lambda m: str(self.root) + '/' + m[1] + '/', code)
+        code = re.sub(r'(?<![A-Za-z0-9_$}])/(etc|run|usr|lib|proc|var)/', lambda m: str(self.root) + '/' + m[1] + '/', code)
         code = re.sub(r'(?<![A-Za-z0-9_$}])/swapfile', str(self.root) + '/swapfile', code)
         code = code.replace('/.dockerenv', str(self.root / '.dockerenv'))
         if interactive_input is not None:
@@ -99,7 +99,7 @@ class Regression(unittest.TestCase):
         fixture.write_text(COMMON + f"ROOT='{self.root}'\nLOG_FILE='{self.root}/log'\n" + code + '\n' + body)
         out = subprocess.run(['bash', str(fixture)], capture_output=True, text=True, input=interactive_input,
                              env={**os.environ, 'TMPDIR': str(self.root / 'tmp')})
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr + ((self.root / 'log').read_text() if (self.root / 'log').exists() else ''))
+        self.assertEqual(out.returncode, expected_returncode, out.stdout + out.stderr + ((self.root / 'log').read_text() if (self.root / 'log').exists() else ''))
         return out.stdout
 
     def setup_fail2ban(self):
@@ -580,6 +580,94 @@ configure_dns
         self.assertEqual(len(defaults), 4)
         return '\n'.join(defaults) + '\nhas_ipv6() { return 1; }\n'
 
+    def test_ipv6_detection_consumes_complete_ip_output(self):
+        for branch in ('route', 'addr'):
+            with self.subTest(branch=branch):
+                self.run_shell(['has_ipv6'], f'BRANCH={branch}\n' + r'''
+ip() {
+    [[ "$2" = "$BRANCH" ]] || return 0
+    case "$2" in
+        route) printf 'default via 2001:db8::1 dev eth0\n';;
+        addr) printf 'inet6 2001:db8::2/64 scope global\n';;
+        *) return 99;;
+    esac
+    for ((i=0; i<10000; i++)); do printf '2001:db8:%s::/64 dev eth0\n' "$i"; done
+}
+has_ipv6
+''')
+        self.run_shell(['has_ipv6'], 'ip() { return 0; }\nif has_ipv6; then exit 9; fi\n')
+
+    def test_packages_install_network_inspection_dependency(self):
+        defaults = re.search(r'^INSTALL_PACKAGES=\([^\n]+\)$', SOURCE, re.M)
+        self.assertIsNotNone(defaults)
+        assert defaults is not None
+        self.run_shell(['install_packages', 'has_ipv6', 'valid_ssh_port', 'ssh_listening_ports',
+                        'ssh_socket_rows', 'ssh_remote_endpoints', 'ssh_bindings_present'], defaults[0] + r'''
+APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=600)
+apt-get() {
+    printf 'apt %s\n' "$*" >> "$ROOT/calls"
+    if [[ " $* " = *' iproute2 '* ]]; then touch "$ROOT/iproute2-installed"; fi
+}
+ip() {
+    [[ -e "$ROOT/iproute2-installed" ]] || return 127
+    printf 'default via 2001:db8::1 dev eth0\n'
+}
+ss() {
+    [[ -e "$ROOT/iproute2-installed" ]] || return 127
+    printf 'LISTEN 0 128 0.0.0.0:22 *:* ino:100\n'
+}
+systemctl() {
+    case "$*" in
+        *ActiveState*ssh.service) printf 'active\n';;
+        *ActiveState*) printf 'inactive\n';;
+        *MainPID*) printf '123\n';;
+        *) return 99;;
+    esac
+}
+if has_ipv6; then exit 9; fi
+if ssh_listening_ports; then exit 9; fi
+install_packages
+has_ipv6
+[[ $(ssh_listening_ports) = 22 ]]
+grep -Fx 'apt -o DPkg::Lock::Timeout=600 update -qq' "$ROOT/calls"
+''')
+
+    def test_package_failures_stop_conditional_callers_without_success(self):
+        for failure in ('update', 'install', 'full-upgrade', 'autoremove', 'clean'):
+            with self.subTest(failure=failure):
+                names = ['install_packages'] if failure in ('update', 'install') else ['system_update']
+                output = self.run_shell(names, f'FAILURE={failure}\n' + r'''
+INSTALL_PACKAGES=(sudo curl wget ca-certificates iproute2)
+UPGRADE_SYSTEM=true CLEAN_SYSTEM=true
+APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=600)
+: > "$ROOT/calls"
+apt-get() {
+    printf '%s\n' "$*" >> "$ROOT/calls"
+    [[ " $* " != *" $FAILURE "* ]]
+}
+''' + ('if install_packages; then exit 9; fi\n' if names == ['install_packages'] else 'if system_update; then exit 9; fi\n'))
+                if failure in ('update', 'install'):
+                    self.assertNotIn('OK 基础软件包安装完成', output)
+                elif failure == 'full-upgrade':
+                    self.assertNotIn('OK 系统升级完成', output)
+                else:
+                    self.assertNotIn('OK 系统清理完成', output)
+                calls = (self.root / 'calls').read_text().splitlines()
+                self.assertIn(failure, calls[-1].split())
+
+    def test_hostname_failure_does_not_edit_hosts_or_report_success(self):
+        hosts = self.root / 'etc/hosts'
+        hosts.write_text('127.0.1.1 old-host\n')
+        output = self.run_shell(['configure_hostname'], r'''
+non_interactive=true NEW_HOSTNAME=new-host
+hostname() { printf 'old-host\n'; }
+hostnamectl() { printf 'attempted\n' >> "$ROOT/calls"; return 1; }
+if configure_hostname; then exit 9; fi
+''')
+        self.assertEqual((self.root / 'calls').read_text(), 'attempted\n')
+        self.assertEqual(hosts.read_text(), '127.0.1.1 old-host\n')
+        self.assertNotIn('OK 主机名设为', output)
+
     def test_dns_default_order_and_help(self):
         path = self.root / 'etc/resolv.conf'
         path.write_text('# local\n')
@@ -679,6 +767,188 @@ configure_time_sync
         assert version_match is not None
         self.assertIn('# 版本: ' + version_match[1], SOURCE)
         self.assertNotIn('其余为 4 GiB', readme)
+
+    def main_defaults_and_mocks(self):
+        # Only reviewed scalar/array declarations, never source top-level code.
+        preamble = SOURCE.split('\nlog() {', 1)[0]
+        declarations = '\n'.join(re.findall(
+            r'^[A-Za-z_][A-Za-z_0-9]*=(?:"[^"\n]*"|true|false|\([^\n]*\))$', preamble, re.M))
+        steps = ['pre_flight_checks', 'install_packages', 'configure_hostname', 'configure_timezone',
+                 'configure_time_sync', 'configure_bbr', 'configure_swap', 'configure_dns',
+                 'configure_ssh', 'configure_fail2ban', 'system_update']
+        mocks = '\n'.join(name + '() { printf "' + name + '\\n" >> "$ROOT/calls"; }' for name in steps)
+        return declarations + '\n' + mocks + '\nhas_ipv6() { return 1; }\nreboot() { return 99; }\n'
+
+    def test_interactive_eof_is_failure_for_conditional_helpers(self):
+        for name in ('configure_hostname', 'configure_ssh'):
+            with self.subTest(name=name):
+                self.run_shell(['valid_ssh_port', name], r'''
+non_interactive=false NEW_HOSTNAME='' NEW_SSH_PORT='' NEW_SSH_PASSWORD=''
+hostname() { printf 'current\n'; }
+''' + 'if ' + name + '; then exit 9; fi\n', interactive_input='')
+                self.assertEqual((self.root / 'calls').read_text(), '')
+
+    def test_output_helpers_preserve_operator_information(self):
+        output = self.run_shell(['log', 'section_header', 'step_info', 'print_summary_row',
+                                 'result_ok', 'result_warn'], r'''
+log '保留原连接'
+section_header 7 'DNS 配置'
+step_info '静态接管，不重启网络'
+print_summary_row '配置文件' '/fixture/resolv.conf'
+result_ok 'IPv4 1.1.1.1 / 8.8.8.8'
+result_warn '恢复不完整，保留备份' 2>&1
+''')
+        for text in ('保留原连接', '7. DNS 配置', '静态接管，不重启网络',
+                     '配置文件：/fixture/resolv.conf', 'IPv4 1.1.1.1 / 8.8.8.8', '恢复不完整，保留备份'):
+            self.assertIn(text, output)
+
+    def test_helpers_disk_kernel_duration_and_address_boundaries(self):
+        self.run_shell(['check_disk_space', 'is_kernel_version_ge', 'format_duration', 'valid_ipv4',
+                        'valid_ipv6', 'valid_ssh_port', 'append_line_break'], r'''
+df() { printf 'Filesystem 1M-blocks Used Available Use%% Mounted\nfixture 1000M 100M 900M 10%% /\n'; }
+check_disk_space 900
+if check_disk_space 901; then exit 9; fi
+df() { return 1; }
+if check_disk_space 1; then exit 9; fi
+uname() { printf '6.12.1-fixture\n'; }
+is_kernel_version_ge 4.9
+if is_kernel_version_ge 6.13; then exit 9; fi
+uname() { printf 'unparseable\n'; }
+if is_kernel_version_ge 4.9; then exit 9; fi
+[[ $(format_duration 0) = '0 秒' && $(format_duration 59) = '59 秒' ]]
+[[ $(format_duration 60) = '1 分 0 秒' && $(format_duration 121) = '2 分 1 秒' ]]
+for value in 0.0.0.0 255.255.255.255 192.0.2.1; do valid_ipv4 "$value"; done
+for value in 256.0.0.1 01.2.3.4 1.2.3 1.2.3.4.5; do if valid_ipv4 "$value"; then exit 9; fi; done
+for value in :: ::1 2001:DB8::abcd 1:2:3:4:5:6:7:8; do valid_ipv6 "$value"; done
+for value in :1:2:3:4:5:6:7 1:2:3:4:5:6:7: 1:::2 1::2::3 1:2:3:4:5:6:7::8; do if valid_ipv6 "$value"; then exit 9; fi; done
+for value in 1 65535; do valid_ssh_port "$value"; done
+for value in 0 65536 022 999999999999; do if valid_ssh_port "$value"; then exit 9; fi; done
+: > "$ROOT/empty"
+append_line_break "$ROOT/empty"
+[[ ! -s "$ROOT/empty" ]]
+printf 'line' > "$ROOT/line"
+append_line_break "$ROOT/line"
+[[ $(wc -l < "$ROOT/line") = 1 ]]
+append_line_break "$ROOT/line"
+[[ $(wc -l < "$ROOT/line") = 1 ]]
+''')
+
+    def test_main_default_dispatch_and_explicit_skips(self):
+        names = ['main', 'parse_args', 'usage', 'require_value', 'valid_ssh_port', 'valid_ipv4',
+                 'valid_ipv6', 'format_duration', 'handle_error']
+        expected = ['pre_flight_checks', 'install_packages', 'configure_hostname', 'configure_timezone',
+                    'configure_time_sync', 'configure_bbr', 'configure_swap', 'configure_dns',
+                    'configure_ssh', 'configure_fail2ban', 'system_update']
+        for options in ('', '--no-fail2ban --no-bbr --swap 0 --upgrade --cleanup'):
+            with self.subTest(options=options):
+                (self.root / 'calls').write_text('')
+                output = self.run_shell(names, self.main_defaults_and_mocks() +
+                                        'main --non-interactive ' + options + '\n')
+                wanted = expected if not options else [x for x in expected if x != 'configure_fail2ban']
+                self.assertEqual((self.root / 'calls').read_text().splitlines(), wanted)
+                self.assertIn('VPS 初始化配置全部完成', output)
+                if options:
+                    for message in ('跳过配置（保持已有服务）', '切换为 cubic（保留 qdisc）', '禁用全部（含分区）'):
+                        self.assertIn(message, output)
+
+    def test_main_help_errors_no_tty_and_failure_abort_before_later_steps(self):
+        names = ['main', 'parse_args', 'usage', 'require_value', 'valid_ssh_port', 'valid_ipv4',
+                 'valid_ipv6', 'format_duration', 'handle_error']
+        for args, status in (('--help', 0), ('--unknown', 2), ('--swap', 2), ('', 2)):
+            with self.subTest(args=args):
+                output = self.run_shell(names, self.main_defaults_and_mocks() + 'main ' + args + '\n',
+                                        expected_returncode=status)
+                self.assertEqual((self.root / 'calls').read_text(), '')
+                self.assertFalse(list((self.root / 'var/log').glob('*')))
+                if not args:
+                    self.assertIn('没有可用终端', output)
+        output = self.run_shell(names, self.main_defaults_and_mocks() + r'''
+configure_bbr() { printf 'failed-bbr\n' >> "$ROOT/calls"; return 37; }
+main --non-interactive
+''', expected_returncode=37)
+        calls = (self.root / 'calls').read_text().splitlines()
+        self.assertEqual(calls[-1], 'failed-bbr')
+        self.assertNotIn('configure_swap', calls)
+        self.assertIn('退出码: 37', output)
+        self.assertNotIn('全部完成', output)
+        log = next((self.root / 'var/log').glob('*')).read_text()
+        self.assertIn('退出码：37', log)
+
+    def test_main_interactive_decline_and_keep_existing_settings(self):
+        names = ['main', 'parse_args', 'usage', 'require_value', 'format_duration', 'handle_error']
+        self.run_shell(names, self.main_defaults_and_mocks() + 'main\n', interactive_input='n\n')
+        self.assertEqual((self.root / 'calls').read_text(), '')
+        self.assertFalse(list((self.root / 'var/log').glob('*')))
+        for name in ('configure_hostname', 'configure_ssh'):
+            output = self.run_shell(['valid_ssh_port', name], r'''
+non_interactive=false NEW_HOSTNAME='' NEW_SSH_PORT='' NEW_SSH_PASSWORD=''
+hostname() { printf 'current\n'; }
+hostnamectl() { return 99; }
+''' + name + '\n', interactive_input='\n\n')
+            self.assertNotIn('OK', output)
+            self.assertEqual((self.root / 'calls').read_text(), '')
+
+    def test_preflight_supported_versions_and_rejected_environments(self):
+        names = ['pre_flight_checks']
+        path = self.root / 'etc/os-release'
+        for distro, versions in [('debian', ['10', '11', '12', '13']),
+                                 ('ubuntu', ['20.04', '22.04', '24.04', '26.04'])]:
+            for version in versions:
+                with self.subTest(distro=distro, version=version):
+                    path.write_text(f'ID={distro}\nVERSION_ID={version}\n')
+                    self.run_shell(names, 'non_interactive=true\nis_container() { return 1; }\npre_flight_checks\n')
+        path.write_text('ID=other\nVERSION_ID=1\n')
+        output = self.run_shell(names, 'non_interactive=true\nis_container() { return 1; }\npre_flight_checks\n', expected_returncode=1)
+        self.assertIn('不支持当前系统', output)
+        output = self.run_shell(names, 'non_interactive=true\nis_container() { return 0; }\npre_flight_checks\n', expected_returncode=1)
+        self.assertIn('不支持在容器环境', output)
+        path.unlink()
+        output = self.run_shell(names, 'non_interactive=true\nis_container() { return 1; }\npre_flight_checks\n', expected_returncode=1)
+        self.assertIn('系统信息缺失', output)
+
+    def test_update_and_cleanup_explicit_selection_and_skip(self):
+        for upgrade, cleanup in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(upgrade=upgrade, cleanup=cleanup):
+                (self.root / 'calls').write_text('')
+                output = self.run_shell(['system_update'], f'UPGRADE_SYSTEM={str(upgrade).lower()} CLEAN_SYSTEM={str(cleanup).lower()}\n' + r'''
+APT_LOCK_WAIT=(-o DPkg::Lock::Timeout=600)
+system_update
+''')
+                calls = (self.root / 'calls').read_text().splitlines()
+                self.assertEqual(len(calls), int(upgrade) + 2 * int(cleanup))
+                if not upgrade and not cleanup:
+                    self.assertIn('跳过', output)
+                if upgrade:
+                    self.assertIn('apt -o DPkg::Lock::Timeout=600 full-upgrade -y -o Dpkg::Options::=--force-confold', calls)
+
+    def test_time_sync_missing_provider_fallback_and_failure_warning(self):
+        for success in (True, False):
+            with self.subTest(success=success):
+                output = self.run_shell(['configure_time_sync'], f'SUCCESS={str(success).lower()}\n' + r'''
+systemctl() {
+    printf '%s\n' "$*" >> "$ROOT/calls"
+    case "$1" in
+        cat|is-active) return 1;;
+        unmask) return 0;;
+        enable) [[ "$SUCCESS" = true ]] && touch "$ROOT/ntp-started"; return;;
+        *) return 99;;
+    esac
+}
+timedatectl() {
+    case "$1" in
+        status) [[ ! -f "$ROOT/ntp-started" ]] || printf 'NTP service: active\n';;
+        set-ntp) return 1;;
+        *) return 99;;
+    esac
+}
+configure_time_sync
+''')
+                if success:
+                    self.assertIn('OK 时间同步服务已启用', output)
+                else:
+                    self.assertIn('WARN 时间同步服务未确认激活', output)
+                    self.assertNotIn('OK 时间同步服务已启用', output)
+                (self.root / 'ntp-started').unlink(missing_ok=True)
 
     def test_swap_probe_failure_is_not_identity(self):
         (self.root / 'swapfile').write_text('precious')

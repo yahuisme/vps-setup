@@ -2,16 +2,16 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.11.19
+# 版本: v26.11.22
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.11.19"
+SCRIPT_VERSION="v26.11.22"
 TIMEZONE=""
 SWAP_SIZE_MB="auto"
-INSTALL_PACKAGES=(sudo curl wget ca-certificates)
+INSTALL_PACKAGES=(sudo curl wget ca-certificates iproute2)
 PRIMARY_DNS_V4="1.1.1.1"
 SECONDARY_DNS_V4="8.8.8.8"
 PRIMARY_DNS_V6="2606:4700:4700::1111"
@@ -85,8 +85,8 @@ handle_error() {
 
 
 has_ipv6() {
-    ip -6 route show default 2>/dev/null | grep -q 'default' ||
-        ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
+    ip -6 route show default 2>/dev/null | grep 'default' >/dev/null ||
+        ip -6 addr show scope global 2>/dev/null | grep 'inet6' >/dev/null
 }
 
 check_disk_space() {
@@ -320,29 +320,29 @@ pre_flight_checks() {
 install_packages() {
     section_header "1" "软件包安装"
     step_info "更新软件包列表..."
-    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" update -qq >> "$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" update -qq >> "$LOG_FILE" 2>&1 || return 1
     step_info "安装基础软件包..."
-    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" install -y "${INSTALL_PACKAGES[@]}" >> "$LOG_FILE" 2>&1 || return 1
     result_ok "基础软件包安装完成：${INSTALL_PACKAGES[*]}"
 }
 
 configure_hostname() {
     section_header "2" "主机名配置"
     local current_hostname
-    current_hostname=$(hostname)
+    current_hostname=$(hostname) || return 1
     log "  当前主机名：${current_hostname}${NC}"
     local final_hostname="$current_hostname"
     if [[ -n "$NEW_HOSTNAME" ]]; then
         if [[ "$NEW_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
-            hostnamectl set-hostname "$NEW_HOSTNAME" >> "$LOG_FILE" 2>&1
+            hostnamectl set-hostname "$NEW_HOSTNAME" >> "$LOG_FILE" 2>&1 || return 1
             final_hostname="$NEW_HOSTNAME"
         fi
     elif [[ "$non_interactive" = false ]]; then
-        read -p "修改主机名? [y/N] " -r < /dev/tty
+        read -p "修改主机名? [y/N] " -r < /dev/tty || return 1
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            read -r -p "新主机名（留空保持当前）: " new_name < /dev/tty
+            read -r -p "新主机名（留空保持当前）: " new_name < /dev/tty || return 1
             if [[ -n "$new_name" && "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
-                hostnamectl set-hostname "$new_name" >> "$LOG_FILE" 2>&1
+                hostnamectl set-hostname "$new_name" >> "$LOG_FILE" 2>&1 || return 1
                 final_hostname="$new_name"
                 NEW_HOSTNAME="$new_name"
             elif [[ -n "$new_name" ]]; then
@@ -355,10 +355,10 @@ configure_hostname() {
             sed -i -E "/^[[:space:]]*127\.0\.1\.1([[:space:]]|$)/ {
                 s/^([[:space:]]*127\.0\.1\.1)[[:space:]]+[^[:space:]#]+/\\1\\t${final_hostname}/; t
                 s/^([[:space:]]*127\.0\.1\.1)/\\1\\t${final_hostname}/
-            }" /etc/hosts
+            }" /etc/hosts || return 1
         else
             append_line_break /etc/hosts || return 1
-            printf '%b\n' "127.0.1.1\t${final_hostname}" >> /etc/hosts
+            printf '%b\n' "127.0.1.1\t${final_hostname}" >> /etc/hosts || return 1
         fi
         result_ok "主机名设为: ${final_hostname}"
     else
@@ -504,6 +504,7 @@ configure_bbr() {
     }
     bbr_apply() {
         for i in "${!files[@]}"; do
+            [[ "$signal_rc" -eq 0 ]] || return 1
             file=${files[$i]}
             tmp=$(mktemp "${file}.XXXXXX") || return 1
             if [[ -f "$backup/old.$i" ]]; then
@@ -516,6 +517,7 @@ configure_bbr() {
             changed+=("$i")
             mv -fT -- "$tmp" "$file" || return 1
             tmp=""
+            [[ "$signal_rc" -eq 0 ]] || return 1
         done
         for i in "${!files[@]}"; do
             cmp -s -- "$backup/new.$i" "${files[$i]}" || return 1
@@ -523,14 +525,26 @@ configure_bbr() {
         runtime_started=true
         # Apply only generated assignments, never unrelated settings in another file.
         sysctl -p "$backup/target" >> "$LOG_FILE" 2>&1 || return 1
+        [[ "$signal_rc" -eq 0 ]] || return 1
         while IFS='=' read -r key value; do
             key=${key// /}; value=${value// /}
             local actual
             actual=$(sysctl -n "$key") || return 1
             [[ "$actual" = "$value" ]] || return 1
         done < "$backup/target"
+        [[ "$signal_rc" -eq 0 ]]
     }
-    if ! bbr_prepare || ! bbr_apply; then
+    local signal_rc=0 saved_int saved_term
+    saved_int=$(trap -p INT); saved_term=$(trap -p TERM)
+    trap 'signal_rc=130' INT
+    trap 'signal_rc=143' TERM
+    bbr_restore_traps() {
+        trap - INT TERM
+        [[ -z "$saved_int" ]] || eval "$saved_int"
+        [[ -z "$saved_term" ]] || eval "$saved_term"
+        return 0
+    }
+    if ! bbr_prepare || [[ "$signal_rc" -ne 0 ]] || ! bbr_apply || [[ "$signal_rc" -ne 0 ]]; then
         local restore_failed=false
         [[ -z "$tmp" ]] || rm -f -- "$tmp" || restore_failed=true
         for i in "${changed[@]}"; do
@@ -556,8 +570,11 @@ configure_bbr() {
             rm -rf -- "$backup"
             result_warn "拥塞控制变更失败，未提交或已恢复本次配置及运行参数"
         fi
+        bbr_restore_traps
+        [[ "$signal_rc" -eq 0 ]] || return "$signal_rc"
         return 1
     fi
+    bbr_restore_traps
     if [[ "$retain_backup" = true ]]; then
         print_summary_row "原配置备份" "$backup"
     else
@@ -1040,14 +1057,16 @@ ssh_bindings_present() {
 configure_ssh() {
     section_header "8" "SSH 配置"
 
-    [[ -z "$NEW_SSH_PORT" ]] && [[ "$non_interactive" = false ]] && { read -p "SSH端口 (留空保持当前): " -r NEW_SSH_PORT < /dev/tty; }
+    if [[ -z "$NEW_SSH_PORT" && "$non_interactive" = false ]]; then
+        read -p "SSH端口 (留空保持当前): " -r NEW_SSH_PORT < /dev/tty || return 1
+    fi
     
     if [[ -n "$NEW_SSH_PORT" ]] && ! valid_ssh_port "$NEW_SSH_PORT"; then
         result_warn "SSH 端口必须是 1-65535 的十进制整数（无前导零）"
         return 1
     fi
     if [[ -z "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = false ]]; then
-        read -r -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty
+        read -r -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty || return 1
         echo
     fi
     if [[ "$NEW_SSH_PASSWORD" = *$'\n'* || "$NEW_SSH_PASSWORD" = *$'\r'* ]]; then
@@ -1385,13 +1404,13 @@ system_update() {
     section_header "10" "系统更新与清理"
     if [[ "$UPGRADE_SYSTEM" = true ]]; then
         step_info "系统升级..."
-        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK_WAIT[@]}" full-upgrade -y -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1 || return 1
         result_ok "系统升级完成"
     fi
     if [[ "$CLEAN_SYSTEM" = true ]]; then
         step_info "清理缓存..."
-        apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y >> "$LOG_FILE" 2>&1
-        apt-get clean >> "$LOG_FILE" 2>&1
+        apt-get "${APT_LOCK_WAIT[@]}" autoremove --purge -y >> "$LOG_FILE" 2>&1 || return 1
+        apt-get clean >> "$LOG_FILE" 2>&1 || return 1
         result_ok "系统清理完成"
     fi
     if [[ "$UPGRADE_SYSTEM" = false && "$CLEAN_SYSTEM" = false ]]; then
