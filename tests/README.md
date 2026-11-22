@@ -12,7 +12,7 @@ systemd-run --quiet --pipe --wait --collect \
   --working-directory="$PWD" \
   --setenv=TMPDIR=/root/.hermes/cache/scratch \
   --setenv=PYTHONDONTWRITEBYTECODE=1 \
-  /bin/bash -c 'set -e; bash -n install.sh tests/bbr-transaction.sh; shellcheck -S warning install.sh tests/bbr-transaction.sh; python3 tests/regression.py; python3 tests/test_transactions.py; bash tests/bbr-transaction.sh'
+  /bin/bash -ec 'for file in install.sh tests/bbr-transaction.sh; do bash -n "$file"; done; shellcheck -S warning install.sh tests/bbr-transaction.sh; python3 tests/regression.py; python3 tests/test_transactions.py; bash tests/bbr-transaction.sh'
 ```
 
 先确认 `hermes-vps-audit.slice` 的共同祖先上限 ≤4 GiB、MemorySwapMax=0，每项任务实际位于该 slice，最多两个并行测试任务。`TMPDIR` 必须显式传给 transient service，不能仅依赖调用终端 export。
