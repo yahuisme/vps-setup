@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: v26.11.22
+# 版本: v26.11.28
 # ==============================================================================
 set -Eeuo pipefail
 
 # --- 默认配置 ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="v26.11.22"
+SCRIPT_VERSION="v26.11.28"
 TIMEZONE=""
 SWAP_SIZE_MB="auto"
 INSTALL_PACKAGES=(sudo curl wget ca-certificates iproute2)
@@ -132,7 +132,7 @@ ${YELLOW}▸ 安全${NC}
   --fail2ban               启用 Fail2ban，保护 SSH
   --no-fail2ban            跳过 Fail2ban 配置（不停止已有服务）
   --ssh-port <port>        设置 SSH 端口（1-65535，无前导零）
-  --ssh-password <pass>    设置 root 密码（单行，建议交互输入）
+  --ssh-password <pass>    设置 root 密码（单行，建议交互输入；以 -- 开头或为 -h 时用 --ssh-password=值）
   --upgrade                执行系统 full-upgrade
   --cleanup                执行 autoremove 和 apt clean
 
@@ -226,7 +226,7 @@ valid_ssh_port() {
 }
 
 parse_args() {
-
+    local password
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) [[ $# -eq 1 ]] || usage 2; usage 0 ;;
@@ -279,10 +279,21 @@ parse_args() {
                 require_value "$@"
                 valid_ssh_port "$2" || { printf '%b\n' "${RED}--ssh-port 必须是 1-65535 的端口${NC}" >&2; exit 2; }
                 NEW_SSH_PORT="$2"; shift 2 ;;
-            --ssh-password)
-                [[ $# -ge 2 && -n "$2" ]] || { result_warn "选项 --ssh-password 需要一个参数"; exit 2; }
-                [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || { result_warn "root 密码必须为单行（不含换行或回车）"; exit 2; }
-                NEW_SSH_PASSWORD="$2"; shift 2 ;;
+            --ssh-password|--ssh-password=*)
+                if [[ "$1" = --ssh-password ]]; then
+                    [[ -n "${2:-}" && "$2" != --* && "$2" != -h ]] || {
+                        result_warn "选项 --ssh-password 需要一个参数；以 -- 开头或为 -h 时请用 --ssh-password=值"
+                        exit 2
+                    }
+                    password=$2; shift 2
+                else
+                    password=${1#*=}; shift
+                fi
+                [[ -n "$password" && "$password" != *$'\n'* && "$password" != *$'\r'* ]] || {
+                    result_warn "root 密码必须为非空单行（不含换行或回车）"
+                    exit 2
+                }
+                NEW_SSH_PASSWORD=$password ;;
             --upgrade) UPGRADE_SYSTEM=true; shift ;;
             --cleanup) CLEAN_SYSTEM=true; shift ;;
             --non-interactive) non_interactive=true; shift ;;
@@ -1066,7 +1077,7 @@ configure_ssh() {
         return 1
     fi
     if [[ -z "$NEW_SSH_PASSWORD" ]] && [[ "$non_interactive" = false ]]; then
-        read -r -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty || return 1
+        IFS= read -r -s -p "root密码 (输入时不可见, 留空跳过): " NEW_SSH_PASSWORD < /dev/tty || return 1
         echo
     fi
     if [[ "$NEW_SSH_PASSWORD" = *$'\n'* || "$NEW_SSH_PASSWORD" = *$'\r'* ]]; then
@@ -1477,9 +1488,10 @@ main() {
     print_summary_row "日志文件" "$LOG_FILE"
     
     log "\n建议重启以确保所有配置生效${NC}"
-    if [[ "$non_interactive" = false ]]; then
-        read -p "立即重启? [y/N] " -r < /dev/tty
-        [[ "$REPLY" =~ ^[Yy]$ ]] && { log "重启中...${NC}"; sleep 2; reboot; }
+    if [[ "$non_interactive" = false ]] && read -p "立即重启? [y/N] " -r < /dev/tty && [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        log "重启中...${NC}"
+        sleep 2
+        reboot
     fi
     
     exit 0

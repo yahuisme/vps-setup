@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Extracted system transactions; all mutators private/mocked, real signals.
-Run under hermes-vps-audit.slice with PYTHONDONTWRITEBYTECODE=1.
+Run under a bounded test slice with PYTHONDONTWRITEBYTECODE=1.
 TRANSACTION_EVIDENCE optionally retains fixtures and process output.
 """
 import importlib.util
@@ -62,7 +62,17 @@ elif cmd == 'swapon':
 
 class Transactions(unittest.TestCase):
     def setUp(self):
-        self.assertIn('hermes-vps-audit.slice/', Path('/proc/self/cgroup').read_text())
+        cgroup = next(line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines()
+                      if line.startswith('0::'))
+        group = Path('/sys/fs/cgroup') / cgroup.lstrip('/')
+        for ancestor in group.parents:
+            if ancestor.name in ('hermes-tests.slice', 'hermes-vps-audit.slice'):
+                limit = (ancestor / 'memory.max').read_text().strip()
+                swap = (ancestor / 'memory.swap.max').read_text().strip()
+                if limit != 'max' and int(limit) <= 4 * 1024**3 and swap == '0':
+                    break
+        else:
+            self.fail('Run inside a shared test slice capped at 4 GiB with swap disabled')
         evidence = os.environ.get('TRANSACTION_EVIDENCE')
         if evidence:
             self.root = Path(evidence) / self.id().split('.')[-1]

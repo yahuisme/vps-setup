@@ -308,6 +308,30 @@ parse_args --ssh-password '-single-line:with\\slash'
 if (parse_args --ssh-password); then exit 9; else [[ $? = 2 ]]; fi
 ''')
 
+    def test_password_missing_value_cannot_consume_an_option(self):
+        names = ['parse_args', 'usage']
+        for flag in ('--no-fail2ban', '--help', '-h'):
+            with self.subTest(flag=flag):
+                self.run_shell(names, f'parse_args --ssh-password {flag}\n',
+                               expected_returncode=2)
+        self.run_shell(names, r'''
+parse_args '--ssh-password=--sample' --no-fail2ban
+[[ "$NEW_SSH_PASSWORD" = --sample && "$ENABLE_FAIL2BAN" = false ]]
+''')
+        for value in ("--ssh-password=", "$'--ssh-password=sample\\nother'"):
+            with self.subTest(value=value):
+                self.run_shell(names, f'parse_args {value}\n', expected_returncode=2)
+
+    def test_interactive_password_preserves_whitespace(self):
+        (self.root / 'etc/ssh/sshd_config').touch()
+        self.run_shell(['valid_ssh_port', 'configure_ssh'], r'''
+non_interactive=false NEW_SSH_PORT='' NEW_SSH_PASSWORD=''
+sshd() { return 0; }
+chpasswd() { command cat > "$ROOT/password-input"; }
+configure_ssh
+''', interactive_input='\n \tsample pass  \n')
+        self.assertEqual((self.root / 'password-input').read_bytes(), b'root: \tsample pass  \n')
+
     def test_password_cli_rejects_multiline_without_disclosing_secret(self):
         for value in ["$'secret\\nother:injected'", "$'secret\\rnext'"]:
             with self.subTest(value=value):
@@ -760,12 +784,13 @@ configure_time_sync
 
     def test_readme_scope_and_defaults(self):
         readme = (REPO / 'README.md').read_text()
-        for required in ['≤512 MiB', '≤1024 MiB', '2048 MiB', '局部回滚', '不会撤销整轮已完成步骤', 'search/options', 'ignoreip', '密码登录开关']:
+        for required in ['≤512 MiB', '513–1024 MiB', '2048 MiB', '尝试恢复该步骤', '不撤销已完成的步骤', 'search/options', 'ignoreip', '密码登录开关']:
             self.assertIn(required, readme)
         version_match = re.search(r'^SCRIPT_VERSION="([^"]+)"$', SOURCE, re.M)
         self.assertIsNotNone(version_match)
         assert version_match is not None
         self.assertIn('# 版本: ' + version_match[1], SOURCE)
+        self.assertIn('版本：`' + version_match[1] + '`', readme)
         self.assertNotIn('其余为 4 GiB', readme)
 
     def main_defaults_and_mocks(self):
@@ -887,6 +912,13 @@ hostnamectl() { return 99; }
 ''' + name + '\n', interactive_input='\n\n')
             self.assertNotIn('OK', output)
             self.assertEqual((self.root / 'calls').read_text(), '')
+
+    def test_interactive_eof_after_completion_skips_optional_reboot(self):
+        names = ['main', 'parse_args', 'usage', 'format_duration', 'handle_error']
+        output = self.run_shell(names, self.main_defaults_and_mocks() + 'main\n',
+                                interactive_input='y\n')
+        self.assertIn('VPS 初始化配置全部完成', output)
+        self.assertNotIn('脚本在第', output)
 
     def test_preflight_supported_versions_and_rejected_environments(self):
         names = ['pre_flight_checks']

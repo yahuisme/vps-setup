@@ -4,18 +4,14 @@
 
 依赖：Bash、Python 3、ShellCheck，以及系统已有的 `openssh-server`、`fail2ban` 配置解析器。不要为运行测试在业务 VPS 上安装或重启服务。
 
-在已设置共同内存上限的测试机上执行（每个测试任务 1 GiB、禁止 Swap）：
+在仓库目录执行，使用共享测试工具限制整轮测试内存并禁止 Swap：
 
 ```bash
-systemd-run --quiet --pipe --wait --collect \
-  --slice=hermes-vps-audit.slice -p MemoryMax=1G -p MemorySwapMax=0 \
-  --working-directory="$PWD" \
-  --setenv=TMPDIR=/root/.hermes/cache/scratch \
-  --setenv=PYTHONDONTWRITEBYTECODE=1 \
+/opt/test-tools/bin/run-bounded-test /opt/test-tools/run-in-repo "$PWD" \
   /bin/bash -ec 'for file in install.sh tests/bbr-transaction.sh; do bash -n "$file"; done; shellcheck -S warning install.sh tests/bbr-transaction.sh; python3 tests/regression.py; python3 tests/test_transactions.py; bash tests/bbr-transaction.sh'
 ```
 
-先确认 `hermes-vps-audit.slice` 的共同祖先上限 ≤4 GiB、MemorySwapMax=0，每项任务实际位于该 slice，最多两个并行测试任务。`TMPDIR` 必须显式传给 transient service，不能仅依赖调用终端 export。
+也可使用 `hermes-vps-audit.slice`；须确认所有测试位于同一个有上限的 slice（≤4 GiB、Swap=0），并将私有 `TMPDIR` 显式传给 transient service。测试最多两个任务并行。
 
 - `regression.py`：CLI/主流程/前置校验、主机名与 hosts、时区/时间同步/软件包、BBR 键匹配、Swap、DNS、真实 SSH/Fail2ban 解析及故障回滚；可追加 `Regression.test_name` 只跑受影响测试。
 - `test_transactions.py`：真实 INT/TERM、操作完成后返回失败、Swap 优先级/discard 与部分失败恢复；可追加 `Transactions.test_name`。可选 `TRANSACTION_EVIDENCE` 保留该次私有 fixture 及 stdout/stderr/status，目录不可跨测试身份复用。
